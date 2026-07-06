@@ -5,6 +5,7 @@
 #include <unordered_map>
 #include <map>
 #include <list>
+#include <limits>
 #include <cstddef>
 #include <vector>
 #include <stack>
@@ -184,6 +185,20 @@ struct TextureCacheKey {
     uint8_t fmt, siz;
     uint8_t palette_index;
     uint32_t size_bytes;
+    uint32_t line_size_bytes;
+    uint32_t full_image_line_size_bytes;
+    uint16_t tile_width;
+    uint16_t tile_height;
+    uint8_t cms;
+    uint8_t cmt;
+    uint8_t masks;
+    uint8_t maskt;
+    bool force_opaque_alpha = false;
+    // Content hash of the tile's emulated-TMEM span for TMEM-decoded textures.
+    // The same source address can coexist with different TMEM contents across
+    // a frame's load ordering; keying on content prevents a stale cache hit
+    // from bypassing the TMEM decode.
+    uint32_t tmem_content_hash = 0;
 
     bool operator==(const TextureCacheKey&) const noexcept = default;
 
@@ -202,6 +217,9 @@ struct TextureCacheValue {
     uint32_t texture_id;
     uint8_t cms, cmt;
     bool linear_filter;
+    uint64_t rgba16_opaque_pixels = 0;
+    uint64_t rgba16_transparent_pixels = 0;
+    uint64_t rgba16_forced_opaque_pixels = 0;
 
     std::list<struct TextureCacheMapIter>::iterator lru_location;
 };
@@ -228,6 +246,20 @@ struct RawTexMetadata {
     Fast::TextureType type;
 };
 
+struct LoadedTexture {
+    const uint8_t* addr;
+    uint32_t orig_size_bytes;
+    uint32_t size_bytes;
+    uint32_t full_image_line_size_bytes;
+    uint32_t line_size_bytes;
+    uint32_t tex_flags;
+    struct RawTexMetadata raw_tex_metadata;
+    bool masked;
+    bool blended;
+    uint16_t tmem_start;
+    uint16_t tmem_word_count;
+};
+
 #define MAX_LIGHTS 32
 #define MAX_VERTICES 64
 
@@ -249,6 +281,9 @@ struct RSP {
     int16_t fog_mul, fog_offset;
 
     uint32_t extra_geometry_mode;
+    uintptr_t branch_z_target;
+    float viewport_z_scale;
+    float viewport_z_trans;
 
     struct {
         // U0.16
@@ -256,6 +291,14 @@ struct RSP {
     } texture_scaling_factor;
 
     struct LoadedVertex loaded_vertices[MAX_VERTICES + 4];
+
+    uint8_t dmem[4096];
+    uint16_t dma_io_dmem;
+    // True once the current RSP task has loaded data into DMEM via G_DMA_IO.
+    // DMEM does not persist across tasks, so SpReset() clears this per Run().
+    bool dma_io_loaded;
+    float f3dflx_alpha_light[3];
+    bool f3dflx_alpha_light_valid;
 };
 
 struct RDP {
@@ -274,27 +317,28 @@ struct RDP {
         uint32_t tex_flags;
         struct RawTexMetadata raw_tex_metadata;
     } texture_to_load;
-    struct {
-        const uint8_t* addr;
-        uint32_t orig_size_bytes;
-        uint32_t size_bytes;
-        uint32_t full_image_line_size_bytes;
-        uint32_t line_size_bytes;
-        uint32_t tex_flags;
-        struct RawTexMetadata raw_tex_metadata;
-        bool masked;
-        bool blended;
-    } loaded_texture[2];
+    // One entry per 64-bit TMEM word address. Multiple render tiles can point
+    // at independent texture loads within the same 4 KiB TMEM image.
+    LoadedTexture loaded_texture[512];
+    // Emulated 4 KiB TMEM. Load commands copy source bytes here; texture
+    // import decodes from this buffer using only tile-descriptor state
+    // (tmem address, line, fmt/siz, masks), exactly like hardware. This makes
+    // slot-reuse-heavy games (F-Zero X: course pass -> machines -> course
+    // pass per frame) immune to stale per-slot load bookkeeping.
+    uint8_t tmem[4096];
+    // Bumped on every TMEM write so the texture cache can key on content.
+    uint32_t tmem_generation;
     struct {
         uint8_t fmt;
         uint8_t siz;
         uint8_t cms, cmt;
+        uint8_t masks, maskt;
         uint8_t shifts, shiftt;
         float uls, ult, lrs, lrt;
         uint16_t tmem; // 0-511, in 64-bit word units
         uint32_t line_size_bytes;
         uint8_t palette;
-        uint8_t tmem_index; // 0 or 1 for offset 0 kB or offset 2 kB, respectively
+        uint16_t tmem_index; // Exact TMEM base in 64-bit word units (0-511)
     } texture_tile[8];
     bool textures_changed[2];
 
@@ -354,6 +398,10 @@ struct RenderingState {
     struct XYWidthHeight viewport, scissor;
     struct ShaderProgram* mShaderProgram;
     TextureCacheNode* mTextures[SHADER_MAX_TEXTURES];
+    bool sampler_valid[SHADER_MAX_TEXTURES];
+    bool sampler_linear_filter[SHADER_MAX_TEXTURES];
+    uint8_t sampler_cms[SHADER_MAX_TEXTURES];
+    uint8_t sampler_cmt[SHADER_MAX_TEXTURES];
 };
 
 struct FBInfo {
@@ -368,6 +416,122 @@ struct MaskedTextureEntry {
     uint8_t* mask;
     uint8_t* replacementData;
 };
+
+struct GeometryDiagnostics {
+    uint64_t verticesLoaded = 0;
+    uint64_t invalidVertices = 0;
+    uint64_t verticesNonPositiveW = 0;
+    uint64_t verticesOutsideNear = 0;
+    uint64_t verticesOutsideFar = 0;
+    float minNdcX = 0.0f;
+    float maxNdcX = 0.0f;
+    float minNdcY = 0.0f;
+    float maxNdcY = 0.0f;
+    float minNdcZ = 0.0f;
+    float maxNdcZ = 0.0f;
+    uint64_t trianglesSubmitted = 0;
+    uint64_t trianglesClipRejected = 0;
+    uint64_t trianglesCullRejected = 0;
+    uint64_t trianglesInvisible = 0;
+    uint64_t trianglesEmitted = 0;
+    // Oversized triangles that survived Reject-variant screening (screen extent
+    // beyond ~0.9 NDC). The first one per frame is captured for diagnostics.
+    uint64_t bigTriangles = 0;
+    float bigTriX[3] = {};
+    float bigTriY[3] = {};
+    float bigTriZ[3] = {};
+    float bigTriW[3] = {};
+    uint32_t bigTriGeometryMode = 0;
+    uint64_t bigTriCombine = 0;
+    const uint8_t* bigTriTexture = nullptr;
+    uint8_t bigTriTile = 0;
+    float bigTriViewportX = 0.0f;
+    float bigTriViewportY = 0.0f;
+    float bigTriViewportW = 0.0f;
+    float bigTriViewportH = 0.0f;
+    uint64_t dmaIoLoads = 0;
+    uint64_t f3dflxAlphaVertices = 0;
+    uint64_t gpuDrawCalls = 0;
+    uint64_t gpuTriangles = 0;
+    uint64_t variantSwitches = 0;
+    uint64_t preFlxVertices = 0;
+    uint64_t preFlxTrianglesSubmitted = 0;
+    uint64_t preFlxTrianglesEmitted = 0;
+    uint64_t preFlxGpuDrawCalls = 0;
+    uint64_t preFlxGpuTriangles = 0;
+    uint64_t rgba16OpaquePixels = 0;
+    uint64_t rgba16TransparentPixels = 0;
+    uint64_t rgba16ForcedOpaquePixels = 0;
+    uint64_t preFlxRgba16OpaquePixels = 0;
+    uint64_t preFlxRgba16TransparentPixels = 0;
+    uint64_t preFlxRgba16ForcedOpaquePixels = 0;
+    uint64_t depthBypassTriangles = 0;
+    uint64_t preFlxDepthBypassTriangles = 0;
+    uint64_t texturedTriangles = 0;
+    uint64_t texture0BoundTriangles = 0;
+    uint64_t texture0MissingTriangles = 0;
+    uint64_t forcedSimpleMaterialTriangles = 0;
+    uint64_t preFlxTexturedTriangles = 0;
+    uint64_t preFlxTexture0BoundTriangles = 0;
+    uint64_t preFlxTexture0MissingTriangles = 0;
+    uint64_t preFlxForcedSimpleMaterialTriangles = 0;
+    uint64_t lastShaderId0 = 0;
+    uint64_t lastShaderId1 = 0;
+    uint64_t preFlxShaderId0 = 0;
+    uint64_t preFlxShaderId1 = 0;
+    uint32_t textureWidth = 0;
+    uint32_t textureHeight = 0;
+    uint32_t textureLineBytes = 0;
+    uint32_t textureSizeBytes = 0;
+    uint16_t textureTmem = 0;
+    uint8_t textureTile = 0;
+    uint8_t textureMaskS = 0;
+    uint8_t textureMaskT = 0;
+    uint16_t textureScaleS = 0;
+    uint16_t textureScaleT = 0;
+    uint32_t preFlxTextureWidth = 0;
+    uint32_t preFlxTextureHeight = 0;
+    uint32_t preFlxTextureLineBytes = 0;
+    uint32_t preFlxTextureSizeBytes = 0;
+    uint16_t preFlxTextureTmem = 0;
+    uint8_t preFlxTextureTile = 0;
+    uint8_t preFlxTextureMaskS = 0;
+    uint8_t preFlxTextureMaskT = 0;
+    uint16_t preFlxTextureScaleS = 0;
+    uint16_t preFlxTextureScaleT = 0;
+    uint64_t fogTriangles = 0;
+    uint64_t fogBypassTriangles = 0;
+    uint64_t preFlxFogTriangles = 0;
+    uint64_t preFlxFogBypassTriangles = 0;
+    float minFogFactor = std::numeric_limits<float>::infinity();
+    float maxFogFactor = -std::numeric_limits<float>::infinity();
+    float preFlxMinFogFactor = std::numeric_limits<float>::infinity();
+    float preFlxMaxFogFactor = -std::numeric_limits<float>::infinity();
+    int16_t preFlxFogMul = 0;
+    int16_t preFlxFogOffset = 0;
+    float minTextureU = std::numeric_limits<float>::infinity();
+    float maxTextureU = -std::numeric_limits<float>::infinity();
+    float minTextureV = std::numeric_limits<float>::infinity();
+    float maxTextureV = -std::numeric_limits<float>::infinity();
+    float preFlxMinTextureU = std::numeric_limits<float>::infinity();
+    float preFlxMaxTextureU = -std::numeric_limits<float>::infinity();
+    float preFlxMinTextureV = std::numeric_limits<float>::infinity();
+    float preFlxMaxTextureV = -std::numeric_limits<float>::infinity();
+    uint32_t preFlxOtherModeH = 0;
+    uint32_t preFlxOtherModeL = 0;
+    uint64_t preFlxCombineMode = 0;
+    const uint8_t* preFlxTexture = nullptr;
+};
+
+enum class F3dex2Variant : uint8_t {
+    Standard,
+    Reject,
+    FZeroFlxReject,
+};
+
+// Host-side payload used with F3DEX2_G_LOAD_UCODE after the port translates
+// physical N64 microcode addresses into a semantic variant switch.
+constexpr uintptr_t F3DEX2_VARIANT_SWITCH_MARKER = 0x47445800u;
 
 class Interpreter {
   public:
@@ -412,6 +576,9 @@ class Interpreter {
     void SetResolutionMultiplier(float multiplier);
     void SetMsaaLevel(uint32_t level);
     void GetCurDimensions(uint32_t* width, uint32_t* height);
+    void ResetGeometryDiagnostics();
+    const GeometryDiagnostics& GetGeometryDiagnostics() const;
+    void SetF3dex2Variant(F3dex2Variant variant);
 
     // private: TODO make these private
     void Flush();
@@ -421,7 +588,7 @@ class Interpreter {
     void TextureCacheClear();
     bool TextureCacheLookup(int i, const TextureCacheKey& key);
     void TextureCacheDelete(const uint8_t* origAddr);
-    void ImportTextureRgba16(int tile, bool importReplacement);
+    void ImportTextureRgba16(int textureUnit, int tile, bool importReplacement, bool forceOpaqueAlpha);
     void ImportTextureRgba32(int tile, bool importReplacement);
     void ImportTextureIA4(int tile, bool importReplacement);
     void ImportTextureIA8(int tile, bool importReplacement);
@@ -444,6 +611,7 @@ class Interpreter {
     void GfxSpGeometryMode(uint32_t clear, uint32_t set);
     void GfxSpExtraGeometryMode(uint32_t clear, uint32_t set);
     void GfxSpMovememF3dex2(uint8_t index, uint8_t offset, const void* data);
+    void GfxSpDmaIo(bool write, uint16_t dmem, void* data, size_t size);
     void GfxSpMovememF3d(uint8_t index, uint8_t offset, const void* data);
     void GfxSpMovewordF3dex2(uint8_t index, uint16_t offset, uintptr_t data);
     void GfxSpMovewordF3d(uint8_t index, uint16_t offset, uintptr_t data);
@@ -457,6 +625,7 @@ class Interpreter {
     void GfxDpLoadTlut(uint8_t tile, uint32_t high_index);
     void GfxDpLoadBlock(uint8_t tile, uint32_t uls, uint32_t ult, uint32_t lrs, uint32_t dxt);
     void GfxDpLoadTile(uint8_t tile, uint32_t uls, uint32_t ult, uint32_t lrs, uint32_t lrt);
+    void StoreLoadedTexture(uint16_t tmemStart, const LoadedTexture& texture);
     void GfxDpSetCombineMode(uint32_t rgb, uint32_t alpha, uint32_t rgb_cyc2, uint32_t alpha_cyc2);
     void GfxDpSetGrayscaleColor(uint8_t r, uint8_t g, uint8_t b, uint8_t a);
     void GfxDpSetEnvColor(uint8_t r, uint8_t g, uint8_t b, uint8_t a);
@@ -542,6 +711,8 @@ class Interpreter {
     const std::unordered_map<Mtx*, MtxF>* mCurMtxReplacements;
     bool mMarkerOn; // This was originally a debug feature. Now it seems to control s2dex?
     std::unordered_map<size_t, const char*> mShaders;
+    GeometryDiagnostics mGeometryDiagnostics{};
+    F3dex2Variant mF3dex2Variant = F3dex2Variant::Standard;
 
     typedef size_t ShaderId;
     std::stack<ShaderId> mShaderStack;

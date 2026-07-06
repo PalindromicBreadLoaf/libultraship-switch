@@ -330,6 +330,12 @@ void Fast3dGui::CalculateGameViewport() {
     mainPos.x -= mTemporaryWindowPos.x;
     mainPos.y -= mTemporaryWindowPos.y;
     ImVec2 size = ImGui::GetContentRegionAvail();
+    { static bool sDiag = false; if (!sDiag) { sDiag = true;
+        if (FILE* f = fopen("gdx_diag.txt", "a")) {
+            fprintf(f, "[diag-viewport] imgui content region: %dx%d win pos=(%d,%d)\n",
+                    (int)size.x, (int)size.y, (int)mainPos.x, (int)mainPos.y);
+            fclose(f);
+        } } }
     mInterpreter.lock()->mCurDimensions.width = (uint32_t)(size.x * mInterpreter.lock()->mCurDimensions.internal_mul);
     mInterpreter.lock()->mCurDimensions.height = (uint32_t)(size.y * mInterpreter.lock()->mCurDimensions.internal_mul);
     mInterpreter.lock()->mGameWindowViewport.x = (int16_t)mainPos.x;

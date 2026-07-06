@@ -55,7 +55,7 @@ std::shared_ptr<File> FolderArchive::LoadFileRaw(const std::string& filePath) {
         auto data = Ship::FileHelper::ReadAllBytes(mArchiveBasePath + filePath);
         auto fileToLoad = std::make_shared<File>();
 
-        fileToLoad->Buffer = std::make_shared<std::vector<char>>(data.size());
+        fileToLoad->Buffer = std::make_shared<std::vector<char>>(data.size() + 4096);
         memcpy(fileToLoad->Buffer->data(), data.data(), data.size());
 
         fileToLoad->IsLoaded = true;

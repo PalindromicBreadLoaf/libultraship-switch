@@ -13,10 +13,21 @@ typedef union {
     void* ptr;
 } OSMesg;
 
+#ifdef __cplusplus
+inline OSMesg _osMesg8(u8 x) { OSMesg m; m.data8 = x; return m; }
+inline OSMesg _osMesg16(u16 x) { OSMesg m; m.data16 = x; return m; }
+inline OSMesg _osMesg32(u32 x) { OSMesg m; m.data32 = x; return m; }
+inline OSMesg _osMesgPtr(void* x) { OSMesg m; m.ptr = x; return m; }
+#define OS_MESG_8(x) _osMesg8(x)
+#define OS_MESG_16(x) _osMesg16(x)
+#define OS_MESG_32(x) _osMesg32(x)
+#define OS_MESG_PTR(x) _osMesgPtr((void*)(x))
+#else
 #define OS_MESG_8(x) ((OSMesg){ .data8 = (x) })
 #define OS_MESG_16(x) ((OSMesg){ .data16 = (x) })
 #define OS_MESG_32(x) ((OSMesg){ .data32 = (x) })
 #define OS_MESG_PTR(x) ((OSMesg){ .ptr = (x) })
+#endif
 
 #define osSendMesg8(queue, msg, flag) osSendMesg(queue, OS_MESG_8(msg), flag)
 #define osSendMesg16(queue, msg, flag) osSendMesg(queue, OS_MESG_16(msg), flag)

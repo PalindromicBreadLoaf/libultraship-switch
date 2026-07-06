@@ -550,9 +550,12 @@ void GfxRenderingAPIDX11::SelectTexture(int tile, uint32_t texture_id) {
 }
 
 static D3D11_TEXTURE_ADDRESS_MODE gfx_cm_to_d3d11(uint32_t val) {
-    // TODO: handle G_TX_MIRROR | G_TX_CLAMP
     if (val & G_TX_CLAMP) {
-        return D3D11_TEXTURE_ADDRESS_CLAMP;
+        // N64 MIRROR|CLAMP mirrors the coordinate once and then clamps
+        // (D3D11 MIRROR_ONCE), which selects the far edge row for
+        // out-of-range coordinates instead of row/column zero. Track
+        // guardrail strips rely on this to show their edge color.
+        return (val & G_TX_MIRROR) ? D3D11_TEXTURE_ADDRESS_MIRROR_ONCE : D3D11_TEXTURE_ADDRESS_CLAMP;
     }
     return (val & G_TX_MIRROR) ? D3D11_TEXTURE_ADDRESS_MIRROR : D3D11_TEXTURE_ADDRESS_WRAP;
 }
@@ -577,7 +580,7 @@ void GfxRenderingAPIDX11::UploadTexture(const uint8_t* rgba32_buf, uint32_t widt
     texture_desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
     texture_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
     texture_desc.CPUAccessFlags = 0;
-    texture_desc.MiscFlags = 0; // D3D11_RESOURCE_MISC_GENERATE_MIPS ?
+    texture_desc.MiscFlags = 0;
     texture_desc.ArraySize = 1;
     texture_desc.MipLevels = 1;
     texture_desc.SampleDesc.Count = 1;

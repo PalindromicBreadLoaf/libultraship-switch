@@ -1,4 +1,5 @@
 #include <spdlog/spdlog.h>
+#include <cstdio>
 #include "ship/utils/StringHelper.h"
 #include "ship/debug/CrashHandler.h"
 #include "ship/Context.h"
@@ -191,7 +192,7 @@ static void ErrorHandler(int sig, siginfo_t* sigInfo, void* data) {
     }
     SDL_ShowSimpleMessageBox(
         SDL_MESSAGEBOX_ERROR, (Context::GetInstance()->GetName() + " has crashed").c_str(),
-        (Context::GetInstance()->GetName() + " has crashed. Please upload the logs to the support channel in discord.")
+        (Context::GetInstance()->GetName() + " has crashed. Please open an issue with the logs on the GitHub repository.")
             .c_str(),
         nullptr);
     free(symbols);
@@ -396,6 +397,28 @@ void CrashHandler::PrintStack(CONTEXT* ctx) {
 }
 
 extern "C" LONG WINAPI seh_filter(PEXCEPTION_POINTERS ex) {
+    // Record the raw fault before touching Context or any shared_ptr: if the
+    // crash corrupted the heap, the fancy path below can itself fault and the
+    // original address is lost (observed as _Incref on the CrashHandler ptr).
+    {
+        HMODULE mainModule = GetModuleHandleA(nullptr);
+        const uintptr_t pc = ex->ContextRecord != nullptr ? ex->ContextRecord->Rip : 0;
+        const uintptr_t rva = pc - reinterpret_cast<uintptr_t>(mainModule);
+        char rawLine[160];
+        snprintf(rawLine, sizeof(rawLine),
+                 "[crash] code=0x%08lX pc=%p exe_base=%p rva=0x%zX\n",
+                 ex->ExceptionRecord != nullptr ? ex->ExceptionRecord->ExceptionCode : 0ul,
+                 reinterpret_cast<void*>(pc), reinterpret_cast<void*>(mainModule),
+                 static_cast<size_t>(rva));
+        fputs(rawLine, stderr);
+        fflush(stderr);
+        FILE* rawFile = fopen("crash-address.txt", "a");
+        if (rawFile != nullptr) {
+            fputs(rawLine, rawFile);
+            fclose(rawFile);
+        }
+    }
+
     char exceptionString[20];
     std::shared_ptr<CrashHandler> crashHandler = Context::GetInstance()->GetCrashHandler();
 
@@ -405,7 +428,7 @@ extern "C" LONG WINAPI seh_filter(PEXCEPTION_POINTERS ex) {
     crashHandler->PrintStack(ex->ContextRecord);
     MessageBoxA(
         nullptr,
-        (Context::GetInstance()->GetName() + " has crashed. Please upload the logs to the support channel in discord.")
+        (Context::GetInstance()->GetName() + " has crashed. Please open an issue with the logs on the GitHub repository.")
             .c_str(),
         "Crash", MB_OK | MB_ICONERROR);
 

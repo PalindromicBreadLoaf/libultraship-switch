@@ -19,11 +19,16 @@ int32_t osPiStartDma(OSIoMesg* mb, int32_t priority, int32_t direction, uintptr_
     // On N64, DMA reads from ROM which has no bounds — the last chunk of
     // an audio sample can extend past the data. On PC, clamp to the blob size
     // and zero-fill the remainder so ADPCM decoding sees silence.
-    size_t safeBytes = AudioDma_Clamp(devAddr, nbytes);
-    if (safeBytes < nbytes) {
+    size_t safeBytes = (direction == OS_READ) ? AudioDma_Clamp(devAddr, nbytes) : 0;
+    if (direction == OS_READ && vAddr != nullptr && nbytes != 0) {
         memset(vAddr, 0, nbytes);
+        if (safeBytes != 0) {
+            memcpy(vAddr, (const void*)devAddr, safeBytes);
+        }
     }
-    memcpy(vAddr, (const void*)devAddr, safeBytes);
+    if (mq != nullptr) {
+        osSendMesg(mq, OS_MESG_PTR(mb), OS_MESG_NOBLOCK);
+    }
     return 0;
 }
 }

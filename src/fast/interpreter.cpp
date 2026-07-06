@@ -9,6 +9,8 @@
 #include <stdio.h>
 
 #include <any>
+#include <algorithm>
+#include <cmath>
 #include <map>
 #include <set>
 #include <unordered_map>
@@ -133,11 +135,78 @@ static constexpr float N64_PRIM_DEPTH_MAX = 32767.0f;
 
 void Interpreter::Flush() {
     if (mBufVboLen > 0) {
+        mGeometryDiagnostics.gpuDrawCalls++;
+        mGeometryDiagnostics.gpuTriangles += mBufVboNumTris;
         mRapi->SetCurrentPrimDepth((float)mRdp->prim_depth / N64_PRIM_DEPTH_MAX);
         mRapi->DrawTriangles(mBufVbo, mBufVboLen, mBufVboNumTris);
         mBufVboLen = 0;
         mBufVboNumTris = 0;
     }
+}
+
+void Interpreter::ResetGeometryDiagnostics() {
+    mGeometryDiagnostics = {};
+    mGeometryDiagnostics.minNdcX = std::numeric_limits<float>::infinity();
+    mGeometryDiagnostics.minNdcY = std::numeric_limits<float>::infinity();
+    mGeometryDiagnostics.minNdcZ = std::numeric_limits<float>::infinity();
+    mGeometryDiagnostics.maxNdcX = -std::numeric_limits<float>::infinity();
+    mGeometryDiagnostics.maxNdcY = -std::numeric_limits<float>::infinity();
+    mGeometryDiagnostics.maxNdcZ = -std::numeric_limits<float>::infinity();
+}
+
+const GeometryDiagnostics& Interpreter::GetGeometryDiagnostics() const {
+    return mGeometryDiagnostics;
+}
+
+void Interpreter::SetF3dex2Variant(F3dex2Variant variant) {
+    if (mF3dex2Variant != variant) {
+        mGeometryDiagnostics.variantSwitches++;
+        if (variant == F3dex2Variant::FZeroFlxReject) {
+            mGeometryDiagnostics.preFlxVertices = mGeometryDiagnostics.verticesLoaded;
+            mGeometryDiagnostics.preFlxTrianglesSubmitted = mGeometryDiagnostics.trianglesSubmitted;
+            mGeometryDiagnostics.preFlxTrianglesEmitted = mGeometryDiagnostics.trianglesEmitted;
+            mGeometryDiagnostics.preFlxGpuDrawCalls = mGeometryDiagnostics.gpuDrawCalls;
+            mGeometryDiagnostics.preFlxGpuTriangles = mGeometryDiagnostics.gpuTriangles;
+            mGeometryDiagnostics.preFlxRgba16OpaquePixels = mGeometryDiagnostics.rgba16OpaquePixels;
+            mGeometryDiagnostics.preFlxRgba16TransparentPixels = mGeometryDiagnostics.rgba16TransparentPixels;
+            mGeometryDiagnostics.preFlxRgba16ForcedOpaquePixels =
+                mGeometryDiagnostics.rgba16ForcedOpaquePixels;
+            mGeometryDiagnostics.preFlxDepthBypassTriangles = mGeometryDiagnostics.depthBypassTriangles;
+            mGeometryDiagnostics.preFlxTexturedTriangles = mGeometryDiagnostics.texturedTriangles;
+            mGeometryDiagnostics.preFlxTexture0BoundTriangles = mGeometryDiagnostics.texture0BoundTriangles;
+            mGeometryDiagnostics.preFlxTexture0MissingTriangles = mGeometryDiagnostics.texture0MissingTriangles;
+            mGeometryDiagnostics.preFlxForcedSimpleMaterialTriangles =
+                mGeometryDiagnostics.forcedSimpleMaterialTriangles;
+            mGeometryDiagnostics.preFlxShaderId0 = mGeometryDiagnostics.lastShaderId0;
+            mGeometryDiagnostics.preFlxShaderId1 = mGeometryDiagnostics.lastShaderId1;
+            mGeometryDiagnostics.preFlxTextureWidth = mGeometryDiagnostics.textureWidth;
+            mGeometryDiagnostics.preFlxTextureHeight = mGeometryDiagnostics.textureHeight;
+            mGeometryDiagnostics.preFlxTextureLineBytes = mGeometryDiagnostics.textureLineBytes;
+            mGeometryDiagnostics.preFlxTextureSizeBytes = mGeometryDiagnostics.textureSizeBytes;
+            mGeometryDiagnostics.preFlxTextureTmem = mGeometryDiagnostics.textureTmem;
+            mGeometryDiagnostics.preFlxTextureTile = mGeometryDiagnostics.textureTile;
+            mGeometryDiagnostics.preFlxTextureMaskS = mGeometryDiagnostics.textureMaskS;
+            mGeometryDiagnostics.preFlxTextureMaskT = mGeometryDiagnostics.textureMaskT;
+            mGeometryDiagnostics.preFlxTextureScaleS = mGeometryDiagnostics.textureScaleS;
+            mGeometryDiagnostics.preFlxTextureScaleT = mGeometryDiagnostics.textureScaleT;
+            mGeometryDiagnostics.preFlxFogTriangles = mGeometryDiagnostics.fogTriangles;
+            mGeometryDiagnostics.preFlxFogBypassTriangles = mGeometryDiagnostics.fogBypassTriangles;
+            mGeometryDiagnostics.preFlxMinFogFactor = mGeometryDiagnostics.minFogFactor;
+            mGeometryDiagnostics.preFlxMaxFogFactor = mGeometryDiagnostics.maxFogFactor;
+            mGeometryDiagnostics.preFlxFogMul = mRsp->fog_mul;
+            mGeometryDiagnostics.preFlxFogOffset = mRsp->fog_offset;
+            mGeometryDiagnostics.preFlxMinTextureU = mGeometryDiagnostics.minTextureU;
+            mGeometryDiagnostics.preFlxMaxTextureU = mGeometryDiagnostics.maxTextureU;
+            mGeometryDiagnostics.preFlxMinTextureV = mGeometryDiagnostics.minTextureV;
+            mGeometryDiagnostics.preFlxMaxTextureV = mGeometryDiagnostics.maxTextureV;
+            mGeometryDiagnostics.preFlxOtherModeH = mRdp->other_mode_h;
+            mGeometryDiagnostics.preFlxOtherModeL = mRdp->other_mode_l;
+            mGeometryDiagnostics.preFlxCombineMode = mRdp->combine_mode;
+            mGeometryDiagnostics.preFlxTexture = mRdp->loaded_texture[0].addr;
+        }
+        mRsp->f3dflx_alpha_light_valid = false;
+    }
+    mF3dex2Variant = variant;
 }
 
 ShaderProgram* Interpreter::LookupOrCreateShaderProgram(uint64_t id0, uint64_t id1) {
@@ -465,6 +534,9 @@ bool Interpreter::TextureCacheLookup(int i, const TextureCacheKey& key) {
     if (it != mTextureCache.map.end()) {
         mRapi->SelectTexture(i, it->second.texture_id);
         *n = &*it;
+        mGeometryDiagnostics.rgba16OpaquePixels += it->second.rgba16_opaque_pixels;
+        mGeometryDiagnostics.rgba16TransparentPixels += it->second.rgba16_transparent_pixels;
+        mGeometryDiagnostics.rgba16ForcedOpaquePixels += it->second.rgba16_forced_opaque_pixels;
         mTextureCache.lru.splice(mTextureCache.lru.end(), mTextureCache.lru,
                                  it->second.lru_location); // move to back
         return true;
@@ -497,6 +569,10 @@ bool Interpreter::TextureCacheLookup(int i, const TextureCacheKey& key) {
 
     mRapi->SelectTexture(i, texture_id);
     mRapi->SetSamplerParameters(i, false, 0, 0);
+    mRenderingState.sampler_valid[i] = true;
+    mRenderingState.sampler_linear_filter[i] = false;
+    mRenderingState.sampler_cms[i] = 0;
+    mRenderingState.sampler_cmt[i] = 0;
     *n = node;
     return false;
 }
@@ -533,6 +609,24 @@ void Interpreter::TextureCacheDelete(const uint8_t* origAddr) {
     }
 }
 
+// Shared ordering counter for the GDX_DIAG_SETTILE / GDX_DIAG_UVPROBE traces so
+// tile-descriptor writes and draw markers interleave in one timeline.
+int gGdxTraceSeq = 0;
+// Set to 1 by the port bridge when a race venue segment is loaded, so the
+// diagnostics above can be restricted to in-race rendering (menu screens
+// otherwise exhaust the probe caps before the race is ever reached).
+extern "C" int gGdxRaceActive = 0;
+// Ring buffer of recent tile writes; flushed to disk only when a suspect draw
+// fires, so the trace shows exactly the SETTILE history leading to that draw.
+#include <deque>
+std::deque<std::string> gGdxTileTraceRing;
+void GdxTileTracePush(const char* line) {
+    gGdxTileTraceRing.emplace_back(line);
+    if (gGdxTileTraceRing.size() > 512) {
+        gGdxTileTraceRing.pop_front();
+    }
+}
+
 // Pick the per-line byte width for texture decode. Prefer the DRAM stride from
 // loaded_texture when it looks like real per-line info (differs from total size).
 // Fall back to the TMEM tile stride when loaded sizes match total (LoadBlock with
@@ -545,7 +639,57 @@ static uint32_t GetEffectiveLineSize(uint32_t lineSizeBytes, uint32_t fullImageL
     return tileLineSizeBytes;
 }
 
-void Interpreter::ImportTextureRgba16(int tile, bool importReplacement) {
+// Readable-extent probe for TMEM mirror copies: bounds a source read to the
+// committed memory region so a lying transfer size can never fault.
+static size_t TmemSourceReadableLimit(const uint8_t* addr) {
+#ifdef _WIN32
+    MEMORY_BASIC_INFORMATION mbi;
+    if (VirtualQuery(addr, &mbi, sizeof(mbi)) == sizeof(mbi)) {
+        const bool readable = (mbi.State == MEM_COMMIT) &&
+                              (mbi.Protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READ |
+                                              PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) != 0;
+        if (!readable) {
+            return 0;
+        }
+        const uintptr_t regionEnd = reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
+        return static_cast<size_t>(regionEnd - reinterpret_cast<uintptr_t>(addr));
+    }
+#endif
+    return SIZE_MAX;
+}
+
+// N64 tile masks define the coordinate wrap period independently from the
+// amount of source data loaded into TMEM. Uploading the whole backing image
+// makes modern samplers wrap at the wrong boundary, which selects adjacent
+// mip levels/atlas regions for repeated track and vehicle materials.
+static void ApplyTileMaskExtent(const RDP* rdp, int tile, uint32_t& width, uint32_t& height,
+                                bool maskAuthoritative = false) {
+    const uint8_t masks = rdp->texture_tile[tile].masks;
+    const uint8_t maskt = rdp->texture_tile[tile].maskt;
+    const uint8_t cms = rdp->texture_tile[tile].cms;
+    const uint8_t cmt = rdp->texture_tile[tile].cmt;
+    if (masks != G_TX_NOMASK && masks < 31) {
+        // On hardware a wrapping axis samples with a period of exactly 1<<mask;
+        // TMEM load bookkeeping never affects it. When the caller can honor it
+        // (memory-safe decode or pure coordinate math), the mask is authoritative
+        // even if the recorded load size computed a smaller extent (e.g. a small
+        // unrelated load reused the TMEM slot between passes).
+        if (maskAuthoritative && (cms & G_TX_CLAMP) == 0) {
+            width = 1u << masks;
+        } else {
+            width = std::min(width, 1u << masks);
+        }
+    }
+    if (maskt != G_TX_NOMASK && maskt < 31) {
+        if (maskAuthoritative && (cmt & G_TX_CLAMP) == 0) {
+            height = 1u << maskt;
+        } else {
+            height = std::min(height, 1u << maskt);
+        }
+    }
+}
+
+void Interpreter::ImportTextureRgba16(int textureUnit, int tile, bool importReplacement, bool forceOpaqueAlpha) {
     const RawTexMetadata* metadata = &mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].raw_tex_metadata;
     const uint8_t* addr =
         importReplacement && (metadata->resource != nullptr)
@@ -557,6 +701,131 @@ void Interpreter::ImportTextureRgba16(int tile, bool importReplacement) {
         return;
     }
 
+    // TMEM-emulation decode path (disable with GDX_NO_TMEM=1): decode texels
+    // from the emulated TMEM using only tile-descriptor state — tmem address,
+    // line stride, and mask/clamp extents — exactly like hardware. This makes
+    // the result independent of per-slot load bookkeeping, which goes stale
+    // under F-Zero X's heavy per-frame TMEM reuse. OTR resources and HD
+    // replacements keep the legacy path (their data never enters TMEM).
+    static const bool sTmemDisabled = std::getenv("GDX_NO_TMEM") != nullptr;
+    const auto& tmemTile = mRdp->texture_tile[tile];
+    if (!sTmemDisabled && !importReplacement && metadata->resource == nullptr && tmemTile.siz == G_IM_SIZ_16b) {
+        const uint32_t tmemByteOffset = static_cast<uint32_t>(tmemTile.tmem_index) * 8u;
+        uint32_t lineBytes = tmemTile.line_size_bytes;
+        if (tmemByteOffset < sizeof(mRdp->tmem) && lineBytes >= 2) {
+            uint32_t width = lineBytes / 2;
+            uint32_t height = (sizeof(mRdp->tmem) - tmemByteOffset) / lineBytes;
+            ApplyTileMaskExtent(mRdp, tile, width, height, /*maskAuthoritative=*/true);
+            // Clamp axes bound to the declared tile window, like the hardware.
+            const uint32_t tileW = static_cast<uint32_t>((tmemTile.lrs - tmemTile.uls + 4) / 4);
+            const uint32_t tileH = static_cast<uint32_t>((tmemTile.lrt - tmemTile.ult + 4) / 4);
+            if ((tmemTile.cms & G_TX_CLAMP) != 0 && tileW > 0 && tileW < width) {
+                width = tileW;
+            }
+            if ((tmemTile.cmt & G_TX_CLAMP) != 0 && tileH > 0 && tileH < height) {
+                height = tileH;
+            }
+            if (width == 0) {
+                width = 1;
+            }
+            if (height == 0) {
+                height = 1;
+            }
+            if (lineBytes * height > sizeof(mRdp->tmem) - tmemByteOffset) {
+                height = (sizeof(mRdp->tmem) - tmemByteOffset) / lineBytes;
+            }
+            if (width > 0 && height > 0) {
+                const uint8_t* tmemSrc = mRdp->tmem + tmemByteOffset;
+                uint32_t px = 0;
+                uint64_t opaqueCount = 0;
+                uint64_t transparentCount = 0;
+                uint64_t forcedOpaqueCount = 0;
+                for (uint32_t y = 0; y < height; y++) {
+                    const uint8_t* row = tmemSrc + static_cast<size_t>(y) * lineBytes;
+                    for (uint32_t x = 0; x < width; x++) {
+                        const uint16_t col16 = (row[2 * x] << 8) | row[2 * x + 1];
+                        uint8_t a = col16 & 1;
+                        if (a != 0) {
+                            opaqueCount++;
+                        } else {
+                            transparentCount++;
+                            if (forceOpaqueAlpha) {
+                                a = 1;
+                                forcedOpaqueCount++;
+                            }
+                        }
+                        mTexUploadBuffer[4 * px + 0] = SCALE_5_8(col16 >> 11);
+                        mTexUploadBuffer[4 * px + 1] = SCALE_5_8((col16 >> 6) & 0x1f);
+                        mTexUploadBuffer[4 * px + 2] = SCALE_5_8((col16 >> 1) & 0x1f);
+                        mTexUploadBuffer[4 * px + 3] = a ? 255 : 0;
+                        px++;
+                    }
+                }
+                mGeometryDiagnostics.rgba16OpaquePixels += opaqueCount;
+                mGeometryDiagnostics.rgba16TransparentPixels += transparentCount;
+                mGeometryDiagnostics.rgba16ForcedOpaquePixels += forcedOpaqueCount;
+                if (textureUnit >= 0 && textureUnit < SHADER_MAX_TEXTURES &&
+                    mRenderingState.mTextures[textureUnit] != nullptr) {
+                    TextureCacheValue& cacheValue = mRenderingState.mTextures[textureUnit]->second;
+                    cacheValue.rgba16_opaque_pixels = opaqueCount;
+                    cacheValue.rgba16_transparent_pixels = transparentCount;
+                    cacheValue.rgba16_forced_opaque_pixels = forcedOpaqueCount;
+                }
+                // A/B: flatten wrapping road-sized textures to gray (also honored
+                // here so the diagnostic keeps working on the TMEM decode path).
+                static const bool sTmemSolidRoad = std::getenv("GDX_DIAG_SOLIDROAD") != nullptr;
+                if (sTmemSolidRoad && width >= 16 && height >= 16 && tmemTile.masks > 0 && tmemTile.maskt > 0) {
+                    for (uint32_t p2 = 0; p2 < width * height; ++p2) {
+                        mTexUploadBuffer[4 * p2 + 0] = 128;
+                        mTexUploadBuffer[4 * p2 + 1] = 128;
+                        mTexUploadBuffer[4 * p2 + 2] = 128;
+                        mTexUploadBuffer[4 * p2 + 3] = 255;
+                    }
+                }
+                // Decode-parameter audit (GDX_DIAG_TMEMCHK=1): logs the final
+                // decode geometry after all mask/clamp adjustments plus a
+                // TMEM-vs-DRAM comparison for the slot's last recorded load.
+                // The SETTIMG-side trace proves the source bytes are correct;
+                // this shows whether the load mirror or this decode geometry
+                // is what scrambles them.
+                static const bool sTmemChk = std::getenv("GDX_DIAG_TMEMCHK") != nullptr;
+                if (sTmemChk && gGdxRaceActive != 0) {
+                    static int sTmemChkCount = 0;
+                    if (sTmemChkCount < 400) {
+                        const auto& slot = mRdp->loaded_texture[tmemTile.tmem_index];
+                        uint32_t tmemRowSum = 0;
+                        for (uint32_t b = 0; b < lineBytes && b < 256; b++) {
+                            tmemRowSum = tmemRowSum * 31u + tmemSrc[b];
+                        }
+                        int srcCmp = -1; /* -1 = source unavailable */
+                        const uint8_t* dram = reinterpret_cast<const uint8_t*>(slot.addr);
+                        if (dram != nullptr && slot.size_bytes != 0) {
+                            const size_t span = std::min<size_t>(
+                                slot.size_bytes, sizeof(mRdp->tmem) - tmemByteOffset);
+                            srcCmp = (std::memcmp(tmemSrc, dram, span) == 0) ? 1 : 0;
+                        }
+                        ++sTmemChkCount;
+                        FILE* tf = fopen("tmemchk-trace.txt", sTmemChkCount == 1 ? "w" : "a");
+                        if (tf != nullptr) {
+                            fprintf(tf,
+                                    "D tile=%u tmem=%u line=%u w=%u h=%u masks=%u maskt=%u "
+                                    "cms=%u cmt=%u tw=%u th=%u slotsz=%u slotline=%u slotfull=%u "
+                                    "rowsum=%08X tmem_eq_dram=%d gen=%u\n",
+                                    tile, tmemTile.tmem_index, lineBytes, width, height,
+                                    tmemTile.masks, tmemTile.maskt, tmemTile.cms, tmemTile.cmt,
+                                    tileW, tileH, slot.size_bytes, slot.line_size_bytes,
+                                    slot.full_image_line_size_bytes, tmemRowSum, srcCmp,
+                                    mRdp->tmem_generation);
+                            fclose(tf);
+                        }
+                    }
+                }
+                mRapi->UploadTexture(mTexUploadBuffer, width, height);
+                return;
+            }
+        }
+    }
+
     uint32_t sizeBytes = mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].size_bytes;
     uint32_t fullImageLineSizeBytes =
         mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].full_image_line_size_bytes;
@@ -566,6 +835,11 @@ void Interpreter::ImportTextureRgba16(int tile, bool importReplacement) {
                                                mRdp->texture_tile[tile].line_size_bytes);
     uint32_t width = widthBytes / 2;
     uint32_t height = widthBytes > 0 ? sizeBytes / widthBytes : 0;
+
+    // Preserve the source row stride before reducing the logical upload extent.
+    if (fullImageLineSizeBytes == 0 || fullImageLineSizeBytes == sizeBytes) {
+        fullImageLineSizeBytes = width * 2;
+    }
 
     // Clamp to the rendered region only when the loaded buffer is ~1.33x of it (mipmap
     // pyramid signature). Window-scrolling tiles have loaded ≈ rendered or loaded >> rendered;
@@ -584,20 +858,64 @@ void Interpreter::ImportTextureRgba16(int tile, bool importReplacement) {
     if ((pyramidLike || clampT) && tile_h > 0 && tile_h < height) {
         height = tile_h;
     }
+    ApplyTileMaskExtent(mRdp, tile, width, height, /*maskAuthoritative=*/true);
 
-    // A single line of pixels should not equal the entire image (height == 1 non-withstanding)
-    if (fullImageLineSizeBytes == sizeBytes) {
-        fullImageLineSizeBytes = width * 2;
+    // Bound the decode by memory actually readable at `addr` rather than by the
+    // recorded load size: TMEM-slot bookkeeping can understate a load (a small
+    // unrelated load reusing the slot between passes) while the DRAM source still
+    // holds the full wrap period the hardware would sample. Reading the mask
+    // extent from readable memory reproduces hardware sampling; the VirtualQuery
+    // clamp below still prevents any fault at region boundaries.
+    const uint32_t rowStrideBytes = (fullImageLineSizeBytes > 0) ? fullImageLineSizeBytes : (width * 2);
+    uint32_t readableBytes = (rowStrideBytes > 0 && height > 0) ? rowStrideBytes * height : sizeBytes;
+#ifdef _WIN32
+    {
+        MEMORY_BASIC_INFORMATION mbi;
+        if (VirtualQuery(addr, &mbi, sizeof(mbi)) == sizeof(mbi)) {
+            const bool readable = (mbi.State == MEM_COMMIT) &&
+                                  (mbi.Protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY |
+                                                  PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE |
+                                                  PAGE_EXECUTE_WRITECOPY)) != 0;
+            if (!readable) {
+                readableBytes = 0;
+            } else {
+                const uintptr_t regionEnd = reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
+                const uintptr_t avail = regionEnd - reinterpret_cast<uintptr_t>(addr);
+                if (avail < readableBytes) {
+                    readableBytes = static_cast<uint32_t>(avail);
+                }
+            }
+        }
     }
+#endif
+    if (rowStrideBytes > 0) {
+        const uint32_t maxRows = readableBytes / rowStrideBytes;
+        if (height > maxRows) {
+            height = maxRows;
+        }
+    }
+    const uint32_t maxTexel = readableBytes / 2;
 
     uint32_t i = 0;
+    uint64_t opaquePixels = 0;
+    uint64_t transparentPixels = 0;
+    uint64_t forcedOpaquePixels = 0;
 
     for (uint32_t y = 0; y < height; y++) {
         for (uint32_t x = 0; x < width; x++) {
             uint32_t clrIdx = (y * (fullImageLineSizeBytes / 2)) + (x);
 
-            uint16_t col16 = (addr[2 * clrIdx] << 8) | addr[2 * clrIdx + 1];
+            uint16_t col16 = (clrIdx < maxTexel) ? ((addr[2 * clrIdx] << 8) | addr[2 * clrIdx + 1]) : 0;
             uint8_t a = col16 & 1;
+            if (a != 0) {
+                opaquePixels++;
+            } else {
+                transparentPixels++;
+                if (forceOpaqueAlpha) {
+                    a = 1;
+                    forcedOpaquePixels++;
+                }
+            }
             uint8_t r = col16 >> 11;
             uint8_t g = (col16 >> 6) & 0x1f;
             uint8_t b = (col16 >> 1) & 0x1f;
@@ -607,6 +925,73 @@ void Interpreter::ImportTextureRgba16(int tile, bool importReplacement) {
             mTexUploadBuffer[4 * i + 3] = a ? 255 : 0;
 
             i++;
+        }
+    }
+
+    mGeometryDiagnostics.rgba16OpaquePixels += opaquePixels;
+    mGeometryDiagnostics.rgba16TransparentPixels += transparentPixels;
+    mGeometryDiagnostics.rgba16ForcedOpaquePixels += forcedOpaquePixels;
+    if (textureUnit >= 0 && textureUnit < SHADER_MAX_TEXTURES &&
+        mRenderingState.mTextures[textureUnit] != nullptr) {
+        TextureCacheValue& cacheValue = mRenderingState.mTextures[textureUnit]->second;
+        cacheValue.rgba16_opaque_pixels = opaquePixels;
+        cacheValue.rgba16_transparent_pixels = transparentPixels;
+        cacheValue.rgba16_forced_opaque_pixels = forcedOpaquePixels;
+    }
+
+    // A/B: replace wrapping road-sized textures with flat gray to decide whether
+    // the track "stripes" come from the texture (would vanish) or the geometry/UV
+    // (would remain). Env-gated, off in normal play.
+    static const bool diagSolidRoad = std::getenv("GDX_DIAG_SOLIDROAD") != nullptr;
+    if (diagSolidRoad && width >= 16 && height >= 16 &&
+        mRdp->texture_tile[tile].masks > 0 && mRdp->texture_tile[tile].maskt > 0) {
+        for (uint32_t p = 0; p < width * height; ++p) {
+            mTexUploadBuffer[4 * p + 0] = 128;
+            mTexUploadBuffer[4 * p + 1] = 128;
+            mTexUploadBuffer[4 * p + 2] = 128;
+            mTexUploadBuffer[4 * p + 3] = 255;
+        }
+    }
+
+    // Dump road-like RGBA16 uploads as PPM images so the actual decoded texture
+    // can be inspected directly (coherent road tile vs garbage vs wrong content).
+    static const bool diagRgba16 = std::getenv("GDX_DIAG_RGBA16") != nullptr;
+    if (diagRgba16 && width > 0 && height > 0) {
+        const bool isRoadLike = (height >= 1 && height <= 64 && width >= 16 && width <= 96) &&
+                                mRdp->texture_tile[tile].masks > 0 && mRdp->texture_tile[tile].maskt > 0;
+        static int sRgba16DumpCount = 0;
+        if (isRoadLike && sRgba16DumpCount < 48) {
+            char name[128];
+            snprintf(name, sizeof(name), "roadtex_%02d_t%u_%ux%u.ppm", sRgba16DumpCount, tile, width, height);
+            ++sRgba16DumpCount;
+            FILE* f = fopen(name, "wb");
+            if (f != nullptr) {
+                fprintf(f, "P6\n%u %u\n255\n", width, height);
+                for (uint32_t p = 0; p < width * height; ++p) {
+                    fputc(mTexUploadBuffer[4 * p + 0], f);
+                    fputc(mTexUploadBuffer[4 * p + 1], f);
+                    fputc(mTexUploadBuffer[4 * p + 2], f);
+                }
+                fclose(f);
+            }
+            FILE* idx = fopen("roadtex-index.txt", "a");
+            if (idx != nullptr) {
+                const auto& loadedEntry = mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index];
+                fprintf(idx,
+                        "%s fullLine=%u expLine=%u strideOK=%d cms=%u cmt=%u masks=%u maskt=%u scaleS=%04X "
+                        "ldLine=%u ldFull=%u ldSize=%u ldOrig=%u tileLine=%u tmemIdx=%u addr=%p\n",
+                        name, fullImageLineSizeBytes, width * 2,
+                        (fullImageLineSizeBytes == width * 2) ? 1 : 0,
+                        mRdp->texture_tile[tile].cms, mRdp->texture_tile[tile].cmt,
+                        mRdp->texture_tile[tile].masks, mRdp->texture_tile[tile].maskt,
+                        (unsigned)mRsp->texture_scaling_factor.s,
+                        loadedEntry.line_size_bytes, loadedEntry.full_image_line_size_bytes,
+                        loadedEntry.size_bytes, loadedEntry.orig_size_bytes,
+                        mRdp->texture_tile[tile].line_size_bytes,
+                        (unsigned)mRdp->texture_tile[tile].tmem_index,
+                        (const void*)addr);
+                fclose(idx);
+            }
         }
     }
 
@@ -635,6 +1020,10 @@ void Interpreter::ImportTextureRgba32(int tile, bool importReplacement) {
     uint32_t width = widthBytes / 4;
     uint32_t height = widthBytes > 0 ? size_bytes / widthBytes : 0;
 
+    if (full_image_line_size_bytes == 0 || full_image_line_size_bytes == size_bytes) {
+        full_image_line_size_bytes = width * 4;
+    }
+
     // Clamp to the rendered region only when the loaded buffer is ~1.33x of it (mipmap
     // pyramid signature). Window-scrolling tiles have loaded ≈ rendered or loaded >> rendered;
     // skip both. CLAMP wrap mode always opts in.
@@ -651,10 +1040,7 @@ void Interpreter::ImportTextureRgba32(int tile, bool importReplacement) {
     if ((pyramidLike || clampT) && tile_h > 0 && tile_h < height) {
         height = tile_h;
     }
-
-    if (full_image_line_size_bytes == size_bytes) {
-        full_image_line_size_bytes = width * 4;
-    }
+    ApplyTileMaskExtent(mRdp, tile, width, height);
 
     // Copy pixel by pixel, respecting full image stride (handles sub-tile loads)
     uint32_t fullImageStridePixels = full_image_line_size_bytes / 4;
@@ -694,9 +1080,10 @@ void Interpreter::ImportTextureIA4(int tile, bool importReplacement) {
     uint32_t width = widthBytes * 2;
     uint32_t height = widthBytes > 0 ? sizeBytes / widthBytes : 0;
 
-    if (fullImageLineSizeBytes == sizeBytes) {
+    if (fullImageLineSizeBytes == 0 || fullImageLineSizeBytes == sizeBytes) {
         fullImageLineSizeBytes = widthBytes;
     }
+    ApplyTileMaskExtent(mRdp, tile, width, height);
 
     uint32_t i = 0;
     for (uint32_t y = 0; y < height; y++) {
@@ -738,9 +1125,10 @@ void Interpreter::ImportTextureIA8(int tile, bool importReplacement) {
                                           mRdp->texture_tile[tile].line_size_bytes);
     uint32_t height = width > 0 ? sizeBytes / width : 0;
 
-    if (fullImageLineSizeBytes == sizeBytes) {
+    if (fullImageLineSizeBytes == 0 || fullImageLineSizeBytes == sizeBytes) {
         fullImageLineSizeBytes = width;
     }
+    ApplyTileMaskExtent(mRdp, tile, width, height);
 
     uint32_t i = 0;
     for (uint32_t y = 0; y < height; y++) {
@@ -782,9 +1170,10 @@ void Interpreter::ImportTextureIA16(int tile, bool importReplacement) {
     uint32_t height = widthBytes > 0 ? size_bytes / widthBytes : 0;
 
     // A single line of pixels should not equal the entire image (height == 1 non-withstanding)
-    if (full_image_line_size_bytes == size_bytes) {
+    if (full_image_line_size_bytes == 0 || full_image_line_size_bytes == size_bytes) {
         full_image_line_size_bytes = width * 2;
     }
+    ApplyTileMaskExtent(mRdp, tile, width, height);
 
     uint32_t i = 0;
 
@@ -832,9 +1221,29 @@ void Interpreter::ImportTextureI4(int tile, bool importReplacement) {
     uint32_t height = widthBytes > 0 ? sizeBytes / widthBytes : 0;
 
     // A single line of pixels should not equal the entire image (height == 1 non-withstanding)
-    if (fullImageLineSizeBytes == sizeBytes) {
+    if (fullImageLineSizeBytes == 0 || fullImageLineSizeBytes == sizeBytes) {
         fullImageLineSizeBytes = width / 2;
     }
+
+    // FONT_SET_4 and other padded I4 assets can have a wider source row than
+    // the logical render tile. Preserve the source stride above, but crop the
+    // uploaded image to the tile when clamp semantics request that visible
+    // region. Otherwise UV normalization stretches the padding across the
+    // glyph and makes the text look narrow and over-spaced.
+    const uint32_t tileWidth =
+        static_cast<uint32_t>((mRdp->texture_tile[tile].lrs - mRdp->texture_tile[tile].uls + 4) / 4);
+    const uint32_t tileHeight =
+        static_cast<uint32_t>((mRdp->texture_tile[tile].lrt - mRdp->texture_tile[tile].ult + 4) / 4);
+    // TextureUtils uses WRAP even for FONT_SET_4, so clamp bits cannot be
+    // used to identify the visible sub-image. The tile bounds are the
+    // authoritative upload extent; cache identity includes them separately.
+    if (tileWidth > 0 && tileWidth < width) {
+        width = tileWidth;
+    }
+    if (tileHeight > 0 && tileHeight < height) {
+        height = tileHeight;
+    }
+    ApplyTileMaskExtent(mRdp, tile, width, height);
 
     uint32_t i = 0;
 
@@ -882,9 +1291,10 @@ void Interpreter::ImportTextureI8(int tile, bool importReplacement) {
                                           mRdp->texture_tile[tile].line_size_bytes);
     uint32_t height = width > 0 ? sizeBytes / width : 0;
 
-    if (fullImageLineSizeBytes == sizeBytes) {
+    if (fullImageLineSizeBytes == 0 || fullImageLineSizeBytes == sizeBytes) {
         fullImageLineSizeBytes = width;
     }
+    ApplyTileMaskExtent(mRdp, tile, width, height);
 
     uint32_t i = 0;
     for (uint32_t y = 0; y < height; y++) {
@@ -939,6 +1349,10 @@ void Interpreter::ImportTextureCi4(int tile, bool importReplacement) {
     uint32_t width = resultLineSizeBytes * 2;
     uint32_t height = resultLineSizeBytes > 0 ? sizeBytes / resultLineSizeBytes : 0;
 
+    if (fullImageLineSizeBytes == 0 || fullImageLineSizeBytes == sizeBytes) {
+        fullImageLineSizeBytes = resultLineSizeBytes;
+    }
+
     // Clamp to the rendered region only when the loaded buffer is ~1.33x of it (mipmap
     // pyramid signature). Window-scrolling tiles have loaded ≈ rendered or loaded >> rendered;
     // skip both. CLAMP wrap mode always opts in.
@@ -955,10 +1369,7 @@ void Interpreter::ImportTextureCi4(int tile, bool importReplacement) {
     if ((pyramidLike || clampT) && tile_h > 0 && tile_h < height) {
         height = tile_h;
     }
-
-    if (fullImageLineSizeBytes == sizeBytes) {
-        fullImageLineSizeBytes = resultLineSizeBytes;
-    }
+    ApplyTileMaskExtent(mRdp, tile, width, height);
 
     uint32_t i = 0;
     for (uint32_t y = 0; y < height; y++) {
@@ -1005,24 +1416,18 @@ void Interpreter::ImportTextureCi8(int tile, bool importReplacement) {
         return;
     }
 
-    for (uint32_t i = 0, j = 0; i < sizeBytes; j += fullImageLineSizeBytes - lineSizeBytes) {
-        for (uint32_t k = 0; k < lineSizeBytes; i++, k++, j++) {
-            uint8_t idx = addr[j];
-            uint16_t col16 = (mRdp->palettes[idx / 128][(idx % 128) * 2] << 8) |
-                             mRdp->palettes[idx / 128][(idx % 128) * 2 + 1]; // Big endian load
-            uint8_t a = col16 & 1;
-            uint8_t r = col16 >> 11;
-            uint8_t g = (col16 >> 6) & 0x1f;
-            uint8_t b = (col16 >> 1) & 0x1f;
-            mTexUploadBuffer[4 * i + 0] = SCALE_5_8(r);
-            mTexUploadBuffer[4 * i + 1] = SCALE_5_8(g);
-            mTexUploadBuffer[4 * i + 2] = SCALE_5_8(b);
-            mTexUploadBuffer[4 * i + 3] = a ? 255 : 0;
-        }
-    }
-
     uint32_t baseLineSizeBytes = GetEffectiveLineSize(lineSizeBytes, fullImageLineSizeBytes, sizeBytes,
                                                       mRdp->texture_tile[tile].line_size_bytes);
+    lineSizeBytes = baseLineSizeBytes;
+    if (fullImageLineSizeBytes == 0 || fullImageLineSizeBytes == sizeBytes ||
+        fullImageLineSizeBytes < lineSizeBytes) {
+        fullImageLineSizeBytes = lineSizeBytes;
+    }
+    if (lineSizeBytes == 0) {
+        SPDLOG_WARN("CI8: zero line size for tile {}", tile);
+        return;
+    }
+
     uint32_t resultLineSizeBytes = baseLineSizeBytes;
     if (metadata->h_byte_scale != 1) {
         resultLineSizeBytes *= metadata->h_byte_scale;
@@ -1046,6 +1451,25 @@ void Interpreter::ImportTextureCi8(int tile, bool importReplacement) {
     }
     if ((pyramidLike || clampT) && tile_h > 0 && tile_h < height) {
         height = tile_h;
+    }
+    ApplyTileMaskExtent(mRdp, tile, width, height);
+
+    uint32_t out = 0;
+    for (uint32_t y = 0; y < height; ++y) {
+        for (uint32_t x = 0; x < width; ++x) {
+            uint8_t idx = addr[y * fullImageLineSizeBytes + x];
+            uint16_t col16 = (mRdp->palettes[idx / 128][(idx % 128) * 2] << 8) |
+                             mRdp->palettes[idx / 128][(idx % 128) * 2 + 1]; // Big endian load
+            uint8_t a = col16 & 1;
+            uint8_t r = col16 >> 11;
+            uint8_t g = (col16 >> 6) & 0x1f;
+            uint8_t b = (col16 >> 1) & 0x1f;
+            mTexUploadBuffer[4 * out + 0] = SCALE_5_8(r);
+            mTexUploadBuffer[4 * out + 1] = SCALE_5_8(g);
+            mTexUploadBuffer[4 * out + 2] = SCALE_5_8(b);
+            mTexUploadBuffer[4 * out + 3] = a ? 255 : 0;
+            ++out;
+        }
     }
 
     mRapi->UploadTexture(mTexUploadBuffer, width, height);
@@ -1175,18 +1599,8 @@ void Interpreter::ImportTexture(int i, int tile, bool importReplacement) {
     }
 
     if (origAddr == nullptr) {
-        // Try the other TMEM slot -- some multi-tile setups only load one slot
-        // and expect both tiles to reference it.
-        uint32_t otherTmem = tmemIdex ^ 1;
-        origAddr = mRdp->loaded_texture[otherTmem].addr;
-        if (origAddr == nullptr) {
-            SPDLOG_WARN("ImportTexture: null texture address for tile {} (both TMEM slots empty)", tile);
-            return;
-        }
-        SPDLOG_WARN("ImportTexture: tile {} TMEM slot {} empty, falling back to slot {}", tile, tmemIdex, otherTmem);
-        tmemIdex = otherTmem;
-        origSizeBytes = mRdp->loaded_texture[otherTmem].orig_size_bytes;
-        texFlags = mRdp->loaded_texture[otherTmem].tex_flags;
+        SPDLOG_WARN("ImportTexture: null texture address for tile {} at TMEM word {}", tile, tmemIdex);
+        return;
     }
 
     // Use palette_dram_addr (the original DRAM source) instead of palettes[]
@@ -1210,6 +1624,47 @@ void Interpreter::ImportTexture(int i, int tile, bool importReplacement) {
         }
     } else {
         key = { origAddr, {}, fmt, siz, paletteIndex, origSizeBytes };
+    }
+    key.line_size_bytes = mRdp->loaded_texture[tmemIdex].line_size_bytes;
+    key.full_image_line_size_bytes = mRdp->loaded_texture[tmemIdex].full_image_line_size_bytes;
+    const uint32_t cacheTileWidth =
+        mRdp->texture_tile[tile].lrs >= mRdp->texture_tile[tile].uls
+            ? (mRdp->texture_tile[tile].lrs - mRdp->texture_tile[tile].uls + 4u) / 4u
+            : 0u;
+    const uint32_t cacheTileHeight =
+        mRdp->texture_tile[tile].lrt >= mRdp->texture_tile[tile].ult
+            ? (mRdp->texture_tile[tile].lrt - mRdp->texture_tile[tile].ult + 4u) / 4u
+            : 0u;
+    key.tile_width = static_cast<uint16_t>(std::min(cacheTileWidth, 0xFFFFu));
+    key.tile_height = static_cast<uint16_t>(std::min(cacheTileHeight, 0xFFFFu));
+    key.cms = mRdp->texture_tile[tile].cms;
+    key.cmt = mRdp->texture_tile[tile].cmt;
+    key.masks = mRdp->texture_tile[tile].masks;
+    key.maskt = mRdp->texture_tile[tile].maskt;
+    static const bool diagnosticForcePreFlxOpaqueAlpha =
+        std::getenv("GDX_DIAG_FORCE_PREFLX_OPAQUE_ALPHA") != nullptr;
+    const bool forceOpaqueAlpha =
+        diagnosticForcePreFlxOpaqueAlpha && mF3dex2Variant != F3dex2Variant::FZeroFlxReject;
+    key.force_opaque_alpha = forceOpaqueAlpha;
+
+    // TMEM-decoded textures (raw RGBA16) are cached by CONTENT: hash the
+    // tile's emulated-TMEM span so a repeat of the same source address with
+    // different TMEM contents cannot hit a stale entry and bypass the decode.
+    static const bool sTmemCacheDisabled = std::getenv("GDX_NO_TMEM") != nullptr;
+    if (!sTmemCacheDisabled && !importReplacement && metadata->resource == nullptr && fmt == G_IM_FMT_RGBA &&
+        siz == G_IM_SIZ_16b) {
+        const uint32_t tmemByteOffset = static_cast<uint32_t>(tmemIdex) * 8u;
+        const uint32_t lineBytes = mRdp->texture_tile[tile].line_size_bytes;
+        if (tmemByteOffset < sizeof(mRdp->tmem) && lineBytes >= 2) {
+            const uint32_t span =
+                std::min<uint32_t>(sizeof(mRdp->tmem) - tmemByteOffset, lineBytes * 64u);
+            uint32_t contentHash = 2166136261u;
+            const uint8_t* tmemBytes = mRdp->tmem + tmemByteOffset;
+            for (uint32_t b = 0; b < span; b++) {
+                contentHash = (contentHash ^ tmemBytes[b]) * 16777619u;
+            }
+            key.tmem_content_hash = contentHash;
+        }
     }
 
     if (TextureCacheLookup(i, key)) {
@@ -1237,7 +1692,7 @@ void Interpreter::ImportTexture(int i, int tile, bool importReplacement) {
     switch (fmt) {
         case G_IM_FMT_RGBA:
             if (siz == G_IM_SIZ_16b) {
-                ImportTextureRgba16(tile, importReplacement);
+                ImportTextureRgba16(i, tile, importReplacement, forceOpaqueAlpha);
             } else if (siz == G_IM_SIZ_32b) {
                 ImportTextureRgba32(tile, importReplacement);
             } else {
@@ -1266,7 +1721,7 @@ void Interpreter::ImportTexture(int i, int tile, bool importReplacement) {
             } else if (siz == G_IM_SIZ_16b) {
                 // CI+16b is hardware-invalid on N64. The tile's fmt is likely
                 // stale from a prior draw. Decode as RGBA16 instead.
-                ImportTextureRgba16(tile, importReplacement);
+                ImportTextureRgba16(i, tile, importReplacement, forceOpaqueAlpha);
             } else if (siz == G_IM_SIZ_32b) {
                 ImportTextureRgba32(tile, importReplacement);
             } else {
@@ -1496,6 +1951,31 @@ void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx
                   v->ob[2] * mRsp->MP_matrix[2][2] + mRsp->MP_matrix[3][2];
         float w = v->ob[0] * mRsp->MP_matrix[0][3] + v->ob[1] * mRsp->MP_matrix[1][3] +
                   v->ob[2] * mRsp->MP_matrix[2][3] + mRsp->MP_matrix[3][3];
+        mGeometryDiagnostics.verticesLoaded++;
+        if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z) || !std::isfinite(w)) {
+            mGeometryDiagnostics.invalidVertices++;
+        } else {
+            if (w <= 0.0f) {
+                mGeometryDiagnostics.verticesNonPositiveW++;
+            }
+            if (z < -w) {
+                mGeometryDiagnostics.verticesOutsideNear++;
+            }
+            if (z > w) {
+                mGeometryDiagnostics.verticesOutsideFar++;
+            }
+            if (fabsf(w) >= 0.000001f) {
+                const float ndcX = x / w;
+                const float ndcY = y / w;
+                const float ndcZ = z / w;
+                mGeometryDiagnostics.minNdcX = std::min(mGeometryDiagnostics.minNdcX, ndcX);
+                mGeometryDiagnostics.maxNdcX = std::max(mGeometryDiagnostics.maxNdcX, ndcX);
+                mGeometryDiagnostics.minNdcY = std::min(mGeometryDiagnostics.minNdcY, ndcY);
+                mGeometryDiagnostics.maxNdcY = std::max(mGeometryDiagnostics.maxNdcY, ndcY);
+                mGeometryDiagnostics.minNdcZ = std::min(mGeometryDiagnostics.minNdcZ, ndcZ);
+                mGeometryDiagnostics.maxNdcZ = std::max(mGeometryDiagnostics.maxNdcZ, ndcZ);
+            }
+        }
 
         float world_pos[3] = { 0.0 };
         if (mRsp->geometry_mode & G_LIGHTING_POSITIONAL) {
@@ -1509,6 +1989,8 @@ void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx
 
         short U = v->tc[0] * mRsp->texture_scaling_factor.s >> 16;
         short V = v->tc[1] * mRsp->texture_scaling_factor.t >> 16;
+        bool hasF3dflxAlpha = false;
+        uint8_t f3dflxAlpha = 0;
 
         if (mRsp->geometry_mode & G_LIGHTING) {
             if (mRsp->lights_changed) {
@@ -1583,35 +2065,47 @@ void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx
             d->color.b = b > 255 ? 255 : b;
 
             if (mRsp->geometry_mode & G_TEXTURE_GEN) {
-                float dotx = 0, doty = 0;
-                dotx += vn->n[0] * mRsp->current_lookat_coeffs[0][0];
-                dotx += vn->n[1] * mRsp->current_lookat_coeffs[0][1];
-                dotx += vn->n[2] * mRsp->current_lookat_coeffs[0][2];
-                doty += vn->n[0] * mRsp->current_lookat_coeffs[1][0];
-                doty += vn->n[1] * mRsp->current_lookat_coeffs[1][1];
-                doty += vn->n[2] * mRsp->current_lookat_coeffs[1][2];
-
-                dotx /= 127.0f;
-                doty /= 127.0f;
-
-                dotx = Ship::Math::clamp(dotx, -1.0f, 1.0f);
-                doty = Ship::Math::clamp(doty, -1.0f, 1.0f);
-
-                if (mRsp->geometry_mode & G_TEXTURE_GEN_LINEAR) {
-                    // Not sure exactly what formula we should use to get accurate values
-                    /*dotx = (2.906921f * dotx * dotx + 1.36114f) * dotx;
-                    doty = (2.906921f * doty * doty + 1.36114f) * doty;
-                    dotx = (dotx + 1.0f) / 4.0f;
-                    doty = (doty + 1.0f) / 4.0f;*/
-                    dotx = acosf(-dotx) /* M_PI */ * 0.159155f;
-                    doty = acosf(-doty) /* M_PI */ * 0.159155f;
+                if (mF3dex2Variant == F3dex2Variant::FZeroFlxReject &&
+                    mRsp->f3dflx_alpha_light_valid) {
+                    float alphaLight[3];
+                    TransposedMatrixMul(alphaLight, mRsp->f3dflx_alpha_light,
+                                        mRsp->modelview_matrix_stack[mRsp->modelview_matrix_stack_size - 1]);
+                    NormalizeVector(alphaLight);
+                    const float intensity = alphaLight[0] * vn->n[0] + alphaLight[1] * vn->n[1] +
+                                            alphaLight[2] * vn->n[2];
+                    const int lutIndex = std::clamp(static_cast<int>(intensity), -128, 127);
+                    const int dmemIndex = static_cast<int>(mRsp->dma_io_dmem) + 128 + lutIndex;
+                    if (dmemIndex >= 0 && dmemIndex < static_cast<int>(sizeof(mRsp->dmem))) {
+                        f3dflxAlpha = mRsp->dmem[dmemIndex];
+                        hasF3dflxAlpha = true;
+                        mGeometryDiagnostics.f3dflxAlphaVertices++;
+                    }
                 } else {
-                    dotx = (dotx + 1.0f) / 4.0f;
-                    doty = (doty + 1.0f) / 4.0f;
-                }
+                    float dotx = 0, doty = 0;
+                    dotx += vn->n[0] * mRsp->current_lookat_coeffs[0][0];
+                    dotx += vn->n[1] * mRsp->current_lookat_coeffs[0][1];
+                    dotx += vn->n[2] * mRsp->current_lookat_coeffs[0][2];
+                    doty += vn->n[0] * mRsp->current_lookat_coeffs[1][0];
+                    doty += vn->n[1] * mRsp->current_lookat_coeffs[1][1];
+                    doty += vn->n[2] * mRsp->current_lookat_coeffs[1][2];
 
-                U = (int32_t)(dotx * mRsp->texture_scaling_factor.s);
-                V = (int32_t)(doty * mRsp->texture_scaling_factor.t);
+                    dotx /= 127.0f;
+                    doty /= 127.0f;
+
+                    dotx = Ship::Math::clamp(dotx, -1.0f, 1.0f);
+                    doty = Ship::Math::clamp(doty, -1.0f, 1.0f);
+
+                    if (mRsp->geometry_mode & G_TEXTURE_GEN_LINEAR) {
+                        dotx = acosf(-dotx) /* M_PI */ * 0.159155f;
+                        doty = acosf(-doty) /* M_PI */ * 0.159155f;
+                    } else {
+                        dotx = (dotx + 1.0f) / 4.0f;
+                        doty = (doty + 1.0f) / 4.0f;
+                    }
+
+                    U = (int32_t)(dotx * mRsp->texture_scaling_factor.s);
+                    V = (int32_t)(doty * mRsp->texture_scaling_factor.t);
+                }
             }
         } else {
             d->color.r = v->cn[0];
@@ -1647,19 +2141,45 @@ void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx
         d->w = w;
 
         if (mRsp->geometry_mode & G_FOG) {
-            if (fabsf(w) < 0.001f) {
-                // To avoid division by zero
-                w = 0.001f;
+            /* The RSP computes fog from the post-divide depth ratio z/w, which
+               on hardware is always inside [-1, 1]: geometry beyond the far
+               plane is clipped and near-plane geometry is clipped/rejected
+               before fog is evaluated. This interpreter renders unclipped
+               near/behind-camera vertices (near clip is disabled above to match
+               the reject microcodes), where z/w blows past that domain — and a
+               steep fog curve (F-Zero X courses use gSPFogPosition(990,1000),
+               fog_mul=12800) then saturates the whole surface to the fog color.
+               Clamp to the hardware domain; a vertex at or behind the camera
+               plane has ~zero eye distance, so it takes the near (fog=0) end. */
+            float fogRatio;
+            if (w <= 0.001f) {
+                fogRatio = -1.0f;
+            } else {
+                fogRatio = Ship::Math::clamp(z / w, -1.0f, 1.0f);
             }
 
-            float winv = 1.0f / w;
-            if (winv < 0.0f) {
-                winv = std::numeric_limits<int16_t>::max();
-            }
-
-            float fog_z = z * winv * mRsp->fog_mul + mRsp->fog_offset;
+            float fog_z = fogRatio * mRsp->fog_mul + mRsp->fog_offset;
             fog_z = Ship::Math::clamp(fog_z, 0.0f, 255.0f);
             d->color.a = fog_z; // Use alpha variable to store fog factor
+
+            // Fog ground-truth probe (GDX_DIAG_FOG=1): logs the fog inputs and
+            // result per vertex during a race so a saturated/void fog band is
+            // directly visible in the numbers rather than inferred from pixels.
+            static const bool sDiagFog = std::getenv("GDX_DIAG_FOG") != nullptr;
+            if (sDiagFog && gGdxRaceActive != 0) {
+                static int sFogTraceCount = 0;
+                if (sFogTraceCount < 2000) {
+                    ++sFogTraceCount;
+                    FILE* tf = fopen("fog-trace.txt", sFogTraceCount == 1 ? "w" : "a");
+                    if (tf != nullptr) {
+                        fprintf(tf, "F fm=%d fo=%d z=%.1f w=%.1f r=%.4f fog=%.1f\n", mRsp->fog_mul,
+                                mRsp->fog_offset, z, w, fogRatio, fog_z);
+                        fclose(tf);
+                    }
+                }
+            }
+        } else if (hasF3dflxAlpha) {
+            d->color.a = f3dflxAlpha;
         } else {
             d->color.a = v->cn[3];
         }
@@ -1677,7 +2197,62 @@ void Interpreter::GfxSpModifyVertex(uint16_t vtx_idx, uint8_t where, uint32_t va
     v->v = t;
 }
 
+static inline uint32_t color_comb(uint32_t a, uint32_t b, uint32_t c, uint32_t d);
+static inline uint32_t alpha_comb(uint32_t a, uint32_t b, uint32_t c, uint32_t d);
+
+static LoadedVertex InterpolateLoadedVertex(const LoadedVertex& a, const LoadedVertex& b, float t) {
+    LoadedVertex result{};
+    result.x = a.x + (b.x - a.x) * t;
+    result.y = a.y + (b.y - a.y) * t;
+    result.z = a.z + (b.z - a.z) * t;
+    result.w = a.w + (b.w - a.w) * t;
+    result.u = a.u + (b.u - a.u) * t;
+    result.v = a.v + (b.v - a.v) * t;
+    result.color.r = static_cast<uint8_t>(std::clamp(a.color.r + (b.color.r - a.color.r) * t, 0.0f, 255.0f));
+    result.color.g = static_cast<uint8_t>(std::clamp(a.color.g + (b.color.g - a.color.g) * t, 0.0f, 255.0f));
+    result.color.b = static_cast<uint8_t>(std::clamp(a.color.b + (b.color.b - a.color.b) * t, 0.0f, 255.0f));
+    result.color.a = static_cast<uint8_t>(std::clamp(a.color.a + (b.color.a - a.color.a) * t, 0.0f, 255.0f));
+    return result;
+}
+
+static void UpdateLoadedVertexClipFlags(LoadedVertex& vertex) {
+    vertex.clip_rej = 0;
+    if (vertex.x < -vertex.w) {
+        vertex.clip_rej |= 1;
+    }
+    if (vertex.x > vertex.w) {
+        vertex.clip_rej |= 2;
+    }
+    if (vertex.y < -vertex.w) {
+        vertex.clip_rej |= 4;
+    }
+    if (vertex.y > vertex.w) {
+        vertex.clip_rej |= 8;
+    }
+    if (vertex.z < -vertex.w) {
+        vertex.clip_rej |= 16;
+    }
+    if (vertex.z > vertex.w) {
+        vertex.clip_rej |= 32;
+    }
+}
+
 void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx, bool is_rect) {
+    // A/B isolation: skip every triangle drawn with the combine mode given in
+    // GDX_DIAG_SKIP_COMBINE (hex). Whatever vanishes from the frame identifies
+    // the mesh that owns that material.
+    static const uint64_t sSkipCombine = [] {
+        const char* env = std::getenv("GDX_DIAG_SKIP_COMBINE");
+        return (env != nullptr) ? strtoull(env, nullptr, 16) : 0ULL;
+    }();
+    if (sSkipCombine != 0 && !is_rect && mRdp->combine_mode == sSkipCombine) {
+        return;
+    }
+    // Clipped polygons are triangulated by recursively submitting a fan through
+    // this function. Do not clip those generated triangles a second time:
+    // floating-point intersections can land infinitesimally outside a plane
+    // and otherwise recurse until the stack overflows.
+    static thread_local uint32_t sClipFanDepth = 0;
     struct LoadedVertex* v1 = &mRsp->loaded_vertices[vtx1_idx];
     struct LoadedVertex* v2 = &mRsp->loaded_vertices[vtx2_idx];
     struct LoadedVertex* v3 = &mRsp->loaded_vertices[vtx3_idx];
@@ -1685,8 +2260,132 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
 
     // if (rand()%2) return;
 
+    if (!is_rect) {
+        mGeometryDiagnostics.trianglesSubmitted++;
+    }
+
+    // The F3DEX2.Rej ucode family (F3DLX2.Rej, F3DFLX2.Rej) does not clip.
+    // It drops any triangle with a vertex outside the reject box — twice the
+    // viewport extent in X/Y — or behind the eye. F-Zero X relies on this on
+    // the machine-select/settings screens and for FLX vehicles; rasterizing
+    // those triangles instead paints giant wedges across the frame.
+    if (!is_rect && sClipFanDepth == 0 &&
+        (mF3dex2Variant == F3dex2Variant::Reject || mF3dex2Variant == F3dex2Variant::FZeroFlxReject)) {
+        for (const LoadedVertex* vertex : v_arr) {
+            const float w2 = 2.0f * vertex->w;
+            if (vertex->w <= 0.0f || vertex->x < -w2 || vertex->x > w2 || vertex->y < -w2 ||
+                vertex->y > w2 || vertex->z < -vertex->w) {
+                mGeometryDiagnostics.trianglesClipRejected++;
+                return;
+            }
+        }
+    }
+
+    // Clip triangles in homogeneous space before culling or perspective
+    // division. F3DEX/F3DFLX display lists routinely straddle the eye and
+    // frustum planes; sending those triangles directly to a modern backend
+    // produces giant wedges instead of the RSP-clipped polygons.
+    constexpr float kMinClipW = 1.0e-5f;
+    const auto clipDistance = [=](const LoadedVertex& vertex, uint32_t plane) {
+        switch (plane) {
+            case 0:
+                return vertex.w - kMinClipW;
+            case 1:
+                return vertex.x + vertex.w;
+            case 2:
+                return vertex.w - vertex.x;
+            case 3:
+                return vertex.y + vertex.w;
+            case 4:
+                return vertex.w - vertex.y;
+            case 5:
+                return vertex.z + vertex.w;
+            default:
+                return vertex.w - vertex.z;
+        }
+    };
+    bool requiresClipping = false;
+    if (!is_rect && sClipFanDepth == 0) {
+        for (const LoadedVertex* vertex : v_arr) {
+            for (uint32_t plane = 0; plane < 7; ++plane) {
+                if (clipDistance(*vertex, plane) < 0.0f) {
+                    requiresClipping = true;
+                    break;
+                }
+            }
+            if (requiresClipping) {
+                break;
+            }
+        }
+    }
+    if (requiresClipping) {
+        LoadedVertex polygonA[16] = { *v1, *v2, *v3 };
+        LoadedVertex polygonB[16]{};
+        LoadedVertex* input = polygonA;
+        LoadedVertex* output = polygonB;
+        size_t inputCount = 3;
+
+        for (uint32_t plane = 0; plane < 7 && inputCount >= 3; ++plane) {
+            size_t outputCount = 0;
+            for (size_t i = 0; i < inputCount; ++i) {
+                const LoadedVertex& current = input[i];
+                const LoadedVertex& next = input[(i + 1) % inputCount];
+                const float currentDistance = clipDistance(current, plane);
+                const float nextDistance = clipDistance(next, plane);
+                const bool currentInside = currentDistance >= 0.0f;
+                const bool nextInside = nextDistance >= 0.0f;
+
+                if (currentInside && outputCount < 16) {
+                    output[outputCount++] = current;
+                }
+                if (currentInside != nextInside && outputCount < 16) {
+                    const float denominator = currentDistance - nextDistance;
+                    const float t = denominator != 0.0f ? currentDistance / denominator : 0.0f;
+                    output[outputCount++] = InterpolateLoadedVertex(current, next, std::clamp(t, 0.0f, 1.0f));
+                }
+            }
+            inputCount = outputCount;
+            std::swap(input, output);
+        }
+
+        if (inputCount < 3) {
+            mGeometryDiagnostics.trianglesClipRejected++;
+            return;
+        }
+
+        LoadedVertex saved[3];
+        for (size_t i = 0; i < 3; ++i) {
+            saved[i] = mRsp->loaded_vertices[MAX_VERTICES + i];
+        }
+
+        // Replace the original submission with a triangle fan. Only three
+        // reserved vertex slots are needed regardless of polygon size.
+        mGeometryDiagnostics.trianglesSubmitted--;
+        ++sClipFanDepth;
+        for (size_t i = 1; i + 1 < inputCount; ++i) {
+            mRsp->loaded_vertices[MAX_VERTICES] = input[0];
+            mRsp->loaded_vertices[MAX_VERTICES + 1] = input[i];
+            mRsp->loaded_vertices[MAX_VERTICES + 2] = input[i + 1];
+            for (size_t j = 0; j < 3; ++j) {
+                mRsp->loaded_vertices[MAX_VERTICES + j].w =
+                    std::max(mRsp->loaded_vertices[MAX_VERTICES + j].w, kMinClipW);
+                UpdateLoadedVertexClipFlags(mRsp->loaded_vertices[MAX_VERTICES + j]);
+            }
+            GfxSpTri1(MAX_VERTICES, MAX_VERTICES + 1, MAX_VERTICES + 2, false);
+        }
+        --sClipFanDepth;
+
+        for (size_t i = 0; i < 3; ++i) {
+            mRsp->loaded_vertices[MAX_VERTICES + i] = saved[i];
+        }
+        return;
+    }
+
     if (v1->clip_rej & v2->clip_rej & v3->clip_rej) {
         // The whole triangle lies outside the visible area
+        if (!is_rect) {
+            mGeometryDiagnostics.trianglesClipRejected++;
+        }
         return;
     }
 
@@ -1717,15 +2416,58 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
 
         if (cull_type == cull_front) {
             if (cross <= 0) {
+                if (!is_rect) {
+                    mGeometryDiagnostics.trianglesCullRejected++;
+                }
                 return;
             }
         } else if (cull_type == cull_back) {
             if (cross >= 0) {
+                if (!is_rect) {
+                    mGeometryDiagnostics.trianglesCullRejected++;
+                }
                 return;
             }
         } else if (cull_type == cull_both) {
             // Why is this even an option?
+            if (!is_rect) {
+                mGeometryDiagnostics.trianglesCullRejected++;
+            }
             return;
+        }
+    }
+
+    // Diagnostics: capture the first oversized triangle that survives
+    // Reject-variant screening each frame. Legit machine-select geometry stays
+    // under ~0.2 NDC extent; anything near the reject-box limit is a defect
+    // candidate (wrong matrix or stray pass) worth identifying by material.
+    if (!is_rect &&
+        (mF3dex2Variant == F3dex2Variant::Reject || mF3dex2Variant == F3dex2Variant::FZeroFlxReject)) {
+        float extent = 0.0f;
+        for (const LoadedVertex* vertex : v_arr) {
+            if (vertex->w > 1.0e-6f) {
+                extent = std::max(extent, std::max(fabsf(vertex->x), fabsf(vertex->y)) / vertex->w);
+            }
+        }
+        if (extent > 0.9f) {
+            if (mGeometryDiagnostics.bigTriangles++ == 0) {
+                for (int i = 0; i < 3; i++) {
+                    mGeometryDiagnostics.bigTriX[i] = v_arr[i]->x;
+                    mGeometryDiagnostics.bigTriY[i] = v_arr[i]->y;
+                    mGeometryDiagnostics.bigTriZ[i] = v_arr[i]->z;
+                    mGeometryDiagnostics.bigTriW[i] = v_arr[i]->w;
+                }
+                mGeometryDiagnostics.bigTriGeometryMode = mRsp->geometry_mode;
+                mGeometryDiagnostics.bigTriCombine = mRdp->combine_mode;
+                const uint32_t bigTriTile = mRdp->first_tile_index;
+                mGeometryDiagnostics.bigTriTile = static_cast<uint8_t>(bigTriTile);
+                mGeometryDiagnostics.bigTriTexture =
+                    mRdp->loaded_texture[mRdp->texture_tile[bigTriTile].tmem_index].addr;
+                mGeometryDiagnostics.bigTriViewportX = mRdp->viewport.x;
+                mGeometryDiagnostics.bigTriViewportY = mRdp->viewport.y;
+                mGeometryDiagnostics.bigTriViewportW = mRdp->viewport.width;
+                mGeometryDiagnostics.bigTriViewportH = mRdp->viewport.height;
+            }
         }
     }
 
@@ -1735,6 +2477,12 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
     bool prim_depth_enabled = (mRdp->other_mode_l & G_ZS_PRIM) != 0;
     bool depth_test = (zbuffer_enabled || prim_depth_enabled) && (mRdp->other_mode_l & Z_CMP) == Z_CMP;
     bool depth_mask = (mRdp->other_mode_l & Z_UPD) == Z_UPD;
+    static const bool diagnosticDisablePreFlxDepth = std::getenv("GDX_DIAG_DISABLE_PREFLX_DEPTH") != nullptr;
+    if (diagnosticDisablePreFlxDepth && mF3dex2Variant != F3dex2Variant::FZeroFlxReject && depth_test) {
+        depth_test = false;
+        depth_mask = false;
+        mGeometryDiagnostics.depthBypassTriangles++;
+    }
     uint8_t depth_test_and_mask = (depth_test ? 1 : 0) | (depth_mask ? 2 : 0);
     if (depth_test_and_mask != mRenderingState.depth_test_and_mask) {
         Flush();
@@ -1772,20 +2520,62 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
     uint8_t blend_src = mRdp->other_mode_l >> 30;
     bool use_blend_color = blend_src == G_BL_CLR_BL;
     bool use_fog = blend_src == G_BL_CLR_FOG || use_blend_color;
+    const bool originalUseFog = use_fog;
     bool texture_edge = (mRdp->other_mode_l & CVG_X_ALPHA) == CVG_X_ALPHA;
     bool use_noise = (mRdp->other_mode_l & (3U << G_MDSFT_ALPHACOMPARE)) == G_AC_DITHER;
     bool use_2cyc = (mRdp->other_mode_h & (3U << G_MDSFT_CYCLETYPE)) == G_CYC_2CYCLE;
     bool alpha_threshold = (mRdp->other_mode_l & (3U << G_MDSFT_ALPHACOMPARE)) == G_AC_THRESHOLD;
     bool invisible =
         (mRdp->other_mode_l & (3 << 24)) == (G_BL_0 << 24) && (mRdp->other_mode_l & (3 << 20)) == (G_BL_CLR_MEM << 20);
+    if (invisible && !is_rect) {
+        mGeometryDiagnostics.trianglesInvisible++;
+    }
     bool use_grayscale = mRdp->grayscale;
     bool use_prim_depth = (mRdp->other_mode_l & G_ZS_PRIM) != 0;
+    static const bool diagnosticDisablePreFlxFog =
+        std::getenv("GDX_DIAG_DISABLE_PREFLX_FOG") != nullptr;
+    const bool bypassFog =
+        diagnosticDisablePreFlxFog && mF3dex2Variant != F3dex2Variant::FZeroFlxReject && originalUseFog && !is_rect;
+    if (bypassFog) {
+        use_fog = false;
+    }
+    static const bool diagnosticForcePreFlxSimpleMaterial =
+        std::getenv("GDX_DIAG_FORCE_PREFLX_SIMPLE_MATERIAL") != nullptr;
+    const bool forceSimpleMaterial =
+        diagnosticForcePreFlxSimpleMaterial && mF3dex2Variant != F3dex2Variant::FZeroFlxReject && !is_rect;
+
+    if (forceSimpleMaterial) {
+        // A/B diagnostic: bypass original combiner/blender interpretation while
+        // preserving geometry, texture state, UVs, and vertex shade color.
+        cc_id = color_comb(G_CCMUX_TEXEL0, G_CCMUX_0, G_CCMUX_SHADE, G_CCMUX_0) |
+                (static_cast<uint64_t>(
+                     alpha_comb(G_ACMUX_TEXEL0, G_ACMUX_0, G_ACMUX_SHADE, G_ACMUX_0))
+                 << 16);
+        use_alpha = false;
+        use_fog = false;
+        texture_edge = false;
+        use_noise = false;
+        use_2cyc = false;
+        alpha_threshold = false;
+        invisible = false;
+        use_grayscale = false;
+        use_prim_depth = false;
+    }
 
     if (texture_edge) {
         if (use_alpha) {
             alpha_threshold = true;
             texture_edge = false;
         }
+        use_alpha = true;
+    }
+
+    // Alpha compare (G_AC_THRESHOLD / G_AC_DITHER) rejects fragments by texel
+    // alpha even when the blender itself is opaque — e.g. COPY-mode HUD sprite
+    // blits (lap/time digits) whose transparent background relies purely on the
+    // compare. The shader only compiles the discard under the ALPHA option, so
+    // alpha compare must force it on, exactly as texture_edge does above.
+    if (alpha_threshold || use_noise) {
         use_alpha = true;
     }
 
@@ -1823,21 +2613,34 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
         cc_options |= -1 << SHADER_ID_SHIFT;
     }
 
-    if (mRdp->loaded_texture[0].masked) {
+    const uint32_t texel0Tile = mRdp->first_tile_index;
+    // In two-cycle mode TEXEL1 uses the next tile descriptor. F-Zero X relies
+    // on this for track and vehicle materials (for example, track tiles 5 and
+    // 6 describe different views of the same TMEM load).
+    // A/B diagnostic: GDX_DIAG_TEXEL1_FROM_BASE forces TEXEL1 to sample the
+    // base tile to isolate whether track-floor corruption comes from the
+    // adjacent-tile (tile+1) view import.
+    static const bool diagnosticTexel1FromBase = std::getenv("GDX_DIAG_TEXEL1_FROM_BASE") != nullptr;
+    const uint32_t texel1Tile =
+        diagnosticTexel1FromBase ? texel0Tile : ((mRdp->first_tile_index + 1u) & 7u);
+    const auto& texel0Loaded = mRdp->loaded_texture[mRdp->texture_tile[texel0Tile].tmem_index];
+    const auto& texel1Loaded = mRdp->loaded_texture[mRdp->texture_tile[texel1Tile].tmem_index];
+
+    if (texel0Loaded.masked) {
         cc_options |= SHADER_OPT(TEXEL0_MASK);
     }
-    if (mRdp->loaded_texture[1].masked) {
+    if (texel1Loaded.masked) {
         cc_options |= SHADER_OPT(TEXEL1_MASK);
     }
-    if (mRdp->loaded_texture[0].blended) {
+    if (texel0Loaded.blended) {
         cc_options |= SHADER_OPT(TEXEL0_BLEND);
     }
-    if (mRdp->loaded_texture[1].blended) {
+    if (texel1Loaded.blended) {
         cc_options |= SHADER_OPT(TEXEL1_BLEND);
     }
 
     ColorCombinerKey key;
-    key.combine_mode = mRdp->combine_mode;
+    key.combine_mode = cc_id;
     key.options = cc_options;
 
     ColorCombiner* comb = LookupOrCreateColorCombiner(key);
@@ -1847,22 +2650,18 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
     uint32_t effective_tile[2];
 
     for (int i = 0; i < 2; i++) {
-        uint32_t tile = mRdp->first_tile_index + i;
-
-        // No LOD support: force both slots to the base mip level.
-        if (i == 1 && mRdp->first_tile_index >= 2) {
-            tile = mRdp->first_tile_index;
-        }
+        uint32_t tile = (i == 1) ? texel1Tile : texel0Tile;
         effective_tile[i] = tile;
 
         if (comb->usedTextures[i]) {
+            const auto& activeLoaded = mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index];
             if (mRdp->textures_changed[i]) {
                 Flush();
                 ImportTexture(i, tile, false);
-                if (mRdp->loaded_texture[i].masked) {
+                if (activeLoaded.masked) {
                     ImportTextureMask(SHADER_FIRST_MASK_TEXTURE + i, tile);
                 }
-                if (mRdp->loaded_texture[i].blended) {
+                if (activeLoaded.blended) {
                     ImportTexture(SHADER_FIRST_REPLACEMENT_TEXTURE + i, tile, true);
                 }
                 mRdp->textures_changed[i] = false;
@@ -1923,6 +2722,33 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
             if ((pyrLike || (cmt & G_TX_CLAMP)) && tex_height2[i] > 0 && tex_height2[i] < tex_height[i]) {
                 tex_height[i] = tex_height2[i];
             }
+            ApplyTileMaskExtent(mRdp, tile, tex_width[i], tex_height[i], /*maskAuthoritative=*/true);
+            // Degenerate load bookkeeping (a TMEM slot whose recorded byte count is
+            // smaller than one line, e.g. after a smaller unrelated load reused the
+            // slot) yields a zero extent here, and the texcoord normalization below
+            // would divide by zero and emit infinite UVs (visible as per-pixel noise
+            // on track surfaces). The tile mask is the hardware wrap period, so use
+            // it as the authoritative extent; otherwise clamp to a single texel.
+            if (tex_width[i] == 0) {
+                const uint8_t masksFix = mRdp->texture_tile[tile].masks;
+                tex_width[i] = (masksFix != G_TX_NOMASK && masksFix < 31) ? (1u << masksFix) : 1u;
+            }
+            if (tex_height[i] == 0) {
+                const uint8_t masktFix = mRdp->texture_tile[tile].maskt;
+                tex_height[i] = (masktFix != G_TX_NOMASK && masktFix < 31) ? (1u << masktFix) : 1u;
+            }
+            if (!is_rect && i == 0) {
+                mGeometryDiagnostics.textureWidth = tex_width[i];
+                mGeometryDiagnostics.textureHeight = tex_height[i];
+                mGeometryDiagnostics.textureLineBytes = loaded_line_size;
+                mGeometryDiagnostics.textureSizeBytes = loaded_size;
+                mGeometryDiagnostics.textureTmem = mRdp->texture_tile[tile].tmem_index;
+                mGeometryDiagnostics.textureTile = static_cast<uint8_t>(tile);
+                mGeometryDiagnostics.textureMaskS = mRdp->texture_tile[tile].masks;
+                mGeometryDiagnostics.textureMaskT = mRdp->texture_tile[tile].maskt;
+                mGeometryDiagnostics.textureScaleS = mRsp->texture_scaling_factor.s;
+                mGeometryDiagnostics.textureScaleT = mRsp->texture_scaling_factor.t;
+            }
 
             uint32_t tex_width1 = tex_width[i] << (cms & G_TX_MIRROR);
             uint32_t tex_height1 = tex_height[i] << (cmt & G_TX_MIRROR);
@@ -1941,20 +2767,54 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
             }
 
             bool linear_filter = (mRdp->other_mode_h & (3U << G_MDSFT_TEXTFILT)) != G_TF_POINT;
-            if (linear_filter != mRenderingState.mTextures[i]->second.linear_filter ||
-                cms != mRenderingState.mTextures[i]->second.cms || cmt != mRenderingState.mTextures[i]->second.cmt) {
+            if (!mRenderingState.sampler_valid[i] ||
+                linear_filter != mRenderingState.sampler_linear_filter[i] ||
+                cms != mRenderingState.sampler_cms[i] || cmt != mRenderingState.sampler_cmt[i]) {
                 Flush();
 
                 // Set the same sampler params on the blended texture. Needed for opengl.
-                if (mRdp->loaded_texture[i].blended) {
+                if (activeLoaded.blended) {
                     mRapi->SetSamplerParameters(SHADER_FIRST_REPLACEMENT_TEXTURE + i, linear_filter, cms, cmt);
                 }
 
                 mRapi->SetSamplerParameters(i, linear_filter, cms, cmt);
-                mRenderingState.mTextures[i]->second.linear_filter = linear_filter;
-                mRenderingState.mTextures[i]->second.cms = cms;
-                mRenderingState.mTextures[i]->second.cmt = cmt;
+                mRenderingState.sampler_valid[i] = true;
+                mRenderingState.sampler_linear_filter[i] = linear_filter;
+                mRenderingState.sampler_cms[i] = cms;
+                mRenderingState.sampler_cmt[i] = cmt;
             }
+        }
+    }
+
+    if (!is_rect) {
+        mGeometryDiagnostics.lastShaderId0 = comb->shader_id0;
+        mGeometryDiagnostics.lastShaderId1 = comb->shader_id1;
+        if (originalUseFog) {
+            mGeometryDiagnostics.fogTriangles++;
+            for (const LoadedVertex* vertex : v_arr) {
+                const float fogFactor =
+                    use_blend_color ? mRdp->fog_color.a / 255.0f : vertex->color.a / 255.0f;
+                mGeometryDiagnostics.minFogFactor =
+                    std::min(mGeometryDiagnostics.minFogFactor, fogFactor);
+                mGeometryDiagnostics.maxFogFactor =
+                    std::max(mGeometryDiagnostics.maxFogFactor, fogFactor);
+            }
+        }
+        if (bypassFog) {
+            mGeometryDiagnostics.fogBypassTriangles++;
+        }
+        if (comb->usedTextures[0] || comb->usedTextures[1]) {
+            mGeometryDiagnostics.texturedTriangles++;
+        }
+        if (comb->usedTextures[0]) {
+            if (mRenderingState.mTextures[0] != nullptr) {
+                mGeometryDiagnostics.texture0BoundTriangles++;
+            } else {
+                mGeometryDiagnostics.texture0MissingTriangles++;
+            }
+        }
+        if (forceSimpleMaterial) {
+            mGeometryDiagnostics.forcedSimpleMaterialTriangles++;
         }
     }
 
@@ -2028,8 +2888,88 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
                 }
             }
 
-            mBufVbo[mBufVboLen++] = u / tex_width[t];
-            mBufVbo[mBufVboLen++] = v / tex_height[t];
+            const float normalizedU = u / tex_width[t];
+            const float normalizedV = v / tex_height[t];
+            // Anomaly-targeted probe: an axis with CLAMP enabled should never
+            // receive coordinates several repeats outside its tile window —
+            // wrap-masked tiles (the road) legitimately do, so they no longer
+            // trigger. Fires exactly on the broken ground/rail draws.
+            static const bool diagUvProbe = std::getenv("GDX_DIAG_UVPROBE") != nullptr;
+            const uint8_t probeCms = mRdp->texture_tile[uv_tile].cms;
+            const uint8_t probeCmt = mRdp->texture_tile[uv_tile].cmt;
+            const bool clampAnomaly =
+                (((probeCmt & G_TX_CLAMP) != 0) && (normalizedV < -2.0f || normalizedV > 2.0f)) ||
+                (((probeCms & G_TX_CLAMP) != 0) && (normalizedU < -2.0f || normalizedU > 2.0f));
+            if (diagUvProbe && gGdxRaceActive != 0 && !is_rect && t == 0 && clampAnomaly) {
+                static int sUvProbe = 0;
+                if (sUvProbe < 96) {
+                    ++sUvProbe;
+                    FILE* uf = fopen("uvprobe.txt", "a");
+                    if (uf != nullptr) {
+                        fprintf(uf,
+                                "uv_tile=%u rawS=%d rawT=%d shifts=%d shiftt=%d "
+                                "texW=%u texH=%u tileW2=%u tileH2=%u u=%.2f v=%.2f normU=%.2f normV=%.2f "
+                                "cms=%u cmt=%u masks=%u maskt=%u size=[%u,%u..%u,%u] "
+                                "scale=%04X/%04X line=%u tmem=0x%X fmt=%u siz=%u "
+                                "addr=%p combine=%016llX geom=%08X othermodeH=%08X\n",
+                                uv_tile, (int)v_arr[i]->u, (int)v_arr[i]->v, shifts, shiftt,
+                                tex_width[t], tex_height[t], tex_width2[t], tex_height2[t],
+                                u, v, normalizedU, normalizedV,
+                                mRdp->texture_tile[uv_tile].cms, mRdp->texture_tile[uv_tile].cmt,
+                                mRdp->texture_tile[uv_tile].masks, mRdp->texture_tile[uv_tile].maskt,
+                                mRdp->texture_tile[uv_tile].uls, mRdp->texture_tile[uv_tile].ult,
+                                mRdp->texture_tile[uv_tile].lrs, mRdp->texture_tile[uv_tile].lrt,
+                                (unsigned)mRsp->texture_scaling_factor.s,
+                                (unsigned)mRsp->texture_scaling_factor.t,
+                                mRdp->texture_tile[uv_tile].line_size_bytes,
+                                (unsigned)mRdp->texture_tile[uv_tile].tmem,
+                                (unsigned)mRdp->texture_tile[uv_tile].fmt,
+                                (unsigned)mRdp->texture_tile[uv_tile].siz,
+                                (const void*)mRdp->loaded_texture[mRdp->texture_tile[uv_tile].tmem_index].addr,
+                                (unsigned long long)mRdp->combine_mode,
+                                (unsigned)mRsp->geometry_mode,
+                                (unsigned)mRdp->other_mode_h);
+                        fclose(uf);
+                    }
+                    // Dump the SETTILE ring plus a draw marker so the tile-write
+                    // history immediately preceding this suspect draw is visible.
+                    if (std::getenv("GDX_DIAG_SETTILE") != nullptr) {
+                        extern int gGdxTraceSeq;
+                        extern std::deque<std::string> gGdxTileTraceRing;
+                        static int sTraceDumps = 0;
+                        if (sTraceDumps < 16) {
+                            ++sTraceDumps;
+                            FILE* tf = fopen("settile-trace.txt", "a");
+                            if (tf != nullptr) {
+                                fprintf(tf, "==== dump %d ====\n", sTraceDumps);
+                                for (const std::string& lineStr : gGdxTileTraceRing) {
+                                    fprintf(tf, "%s\n", lineStr.c_str());
+                                }
+                                fprintf(tf,
+                                        "D %06d tile=%u normV=%.2f cms=%u cmt=%u masks=%u maskt=%u addr=%p "
+                                        "size=[%u,%u..%u,%u] pos=(%.0f,%.0f,%.0f,%.0f)\n",
+                                        ++gGdxTraceSeq, uv_tile, normalizedV,
+                                        mRdp->texture_tile[uv_tile].cms, mRdp->texture_tile[uv_tile].cmt,
+                                        mRdp->texture_tile[uv_tile].masks, mRdp->texture_tile[uv_tile].maskt,
+                                        (const void*)mRdp->loaded_texture[mRdp->texture_tile[uv_tile].tmem_index].addr,
+                                        mRdp->texture_tile[uv_tile].uls, mRdp->texture_tile[uv_tile].ult,
+                                        mRdp->texture_tile[uv_tile].lrs, mRdp->texture_tile[uv_tile].lrt,
+                                        v_arr[i]->x, v_arr[i]->y, v_arr[i]->z, v_arr[i]->w);
+                                fclose(tf);
+                            }
+                            gGdxTileTraceRing.clear();
+                        }
+                    }
+                }
+            }
+            mBufVbo[mBufVboLen++] = normalizedU;
+            mBufVbo[mBufVboLen++] = normalizedV;
+            if (!is_rect && t == 0 && std::isfinite(normalizedU) && std::isfinite(normalizedV)) {
+                mGeometryDiagnostics.minTextureU = std::min(mGeometryDiagnostics.minTextureU, normalizedU);
+                mGeometryDiagnostics.maxTextureU = std::max(mGeometryDiagnostics.maxTextureU, normalizedU);
+                mGeometryDiagnostics.minTextureV = std::min(mGeometryDiagnostics.minTextureV, normalizedV);
+                mGeometryDiagnostics.maxTextureV = std::max(mGeometryDiagnostics.maxTextureV, normalizedV);
+            }
 
             bool clampS = tm & (1 << 2 * t);
             bool clampT = tm & (1 << 2 * t + 1);
@@ -2161,6 +3101,9 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
         // mBufVbo[mBufVboLen++] = color->a / 255.0f;
     }
 
+    if (!is_rect) {
+        mGeometryDiagnostics.trianglesEmitted++;
+    }
     if (++mBufVboNumTris == MAX_TRI_BUFFER) {
         // if (++mBufVbo_num_tris == 1) {
         Flush();
@@ -2220,6 +3163,8 @@ void Interpreter::CalcAndSetViewport(const F3DVp_t* viewport) {
     mRdp->viewport.y = y;
     mRdp->viewport.width = width;
     mRdp->viewport.height = height;
+    mRsp->viewport_z_scale = viewport->vscale[2];
+    mRsp->viewport_z_trans = viewport->vtrans[2];
 
     AdjustVIewportOrScissor(&mRdp->viewport);
 
@@ -2232,6 +3177,27 @@ void Interpreter::GfxSpMovememF3dex2(uint8_t index, uint8_t offset, const void* 
             CalcAndSetViewport((const F3DVp_t*)data);
             break;
         case F3DEX2_G_MV_LIGHT: {
+            // F3DFLX2.Rej repurposes the LOOKATY slot (offset 24) as its
+            // reflection-alpha light, but only after the game DMAs the alpha
+            // LUT into DMEM via G_DMA_IO. Menu tasks run the FLX variant too
+            // and upload a genuine LookAt Y there — without the LUT gate that
+            // upload was consumed and lookat[1] never updated, breaking
+            // texture-gen reflections on the machine screens.
+            if (mF3dex2Variant == F3dex2Variant::FZeroFlxReject && offset == 24 && data != nullptr &&
+                mRsp->dma_io_loaded) {
+                // The alpha light is host-written GfxPool data (racer.c),
+                // so its s16 direction fields are native-endian, not the
+                // big-endian layout ROM data would have.
+                const uint8_t* bytes = static_cast<const uint8_t*>(data);
+                int16_t dir[3];
+                memcpy(dir, bytes + 8, sizeof(dir));
+                mRsp->f3dflx_alpha_light[0] = dir[0] / 256.0f;
+                mRsp->f3dflx_alpha_light[1] = dir[1] / 256.0f;
+                mRsp->f3dflx_alpha_light[2] = dir[2] / 256.0f;
+                NormalizeVector(mRsp->f3dflx_alpha_light);
+                mRsp->f3dflx_alpha_light_valid = true;
+                break;
+            }
             int lightidx = offset / 24 - 2;
             if (lightidx >= 0 && lightidx <= MAX_LIGHTS) { // skip lookat
                 // NOTE: reads out of bounds if it is an ambient light
@@ -2241,6 +3207,21 @@ void Interpreter::GfxSpMovememF3dex2(uint8_t index, uint8_t offset, const void* 
             }
             break;
         }
+    }
+}
+
+void Interpreter::GfxSpDmaIo(bool write, uint16_t dmem, void* data, size_t size) {
+    if (data == nullptr || dmem >= sizeof(mRsp->dmem)) {
+        return;
+    }
+    const size_t copySize = std::min(size, sizeof(mRsp->dmem) - static_cast<size_t>(dmem));
+    if (write) {
+        memcpy(data, mRsp->dmem + dmem, copySize);
+    } else {
+        memcpy(mRsp->dmem + dmem, data, copySize);
+        mRsp->dma_io_dmem = dmem;
+        mRsp->dma_io_loaded = true;
+        mGeometryDiagnostics.dmaIoLoads++;
     }
 }
 
@@ -2361,6 +3342,31 @@ void Interpreter::GfxDpSetTile(uint8_t fmt, uint32_t siz, uint32_t line, uint32_
     // OTRTODO:
     // SUPPORT_CHECK(tmem == 0 || tmem == 256);
 
+    // Trace tile-descriptor writes so stale-state bugs (a draw inheriting another
+    // object's SETTILE) can be correlated against draw markers in the same file.
+    static const bool diagSetTile = std::getenv("GDX_DIAG_SETTILE") != nullptr;
+    if (diagSetTile) {
+        extern int gGdxTraceSeq;
+        extern void GdxTileTracePush(const char* line);
+        char buf[160];
+        snprintf(buf, sizeof(buf), "S %06d tile=%u fmt=%u siz=%u line=%u tmem=0x%X cms=%u masks=%u cmt=%u maskt=%u",
+                 ++gGdxTraceSeq, tile, fmt, siz, line, tmem, cms, masks, cmt, maskt);
+        GdxTileTracePush(buf);
+        // The course setup DL is the only source of masks==7 tile writes; log those
+        // executions directly (bypassing the ring) to prove whether they ever run.
+        if (masks == 7 && gGdxRaceActive != 0) {
+            static int sWideTileCount = 0;
+            if (sWideTileCount < 64) {
+                ++sWideTileCount;
+                FILE* wf = fopen("settile-trace.txt", "a");
+                if (wf != nullptr) {
+                    fprintf(wf, "W %06d %s\n", gGdxTraceSeq, buf);
+                    fclose(wf);
+                }
+            }
+        }
+    }
+
     if (cms == G_TX_WRAP && masks == G_TX_NOMASK) {
         cms = G_TX_CLAMP;
     }
@@ -2373,15 +3379,14 @@ void Interpreter::GfxDpSetTile(uint8_t fmt, uint32_t siz, uint32_t line, uint32_
     mRdp->texture_tile[tile].siz = siz;
     mRdp->texture_tile[tile].cms = cms;
     mRdp->texture_tile[tile].cmt = cmt;
+    mRdp->texture_tile[tile].masks = masks;
+    mRdp->texture_tile[tile].maskt = maskt;
     mRdp->texture_tile[tile].shifts = shifts;
     mRdp->texture_tile[tile].shiftt = shiftt;
     mRdp->texture_tile[tile].line_size_bytes = line * 8;
 
     mRdp->texture_tile[tile].tmem = tmem;
-    // mRdp->texture_tile[tile].tmem_index = tmem / 256; // tmem is the 64-bit word offset, so 256 words means 2 kB
-
-    mRdp->texture_tile[tile].tmem_index =
-        tmem != 0; // assume one texture is loaded at address 0 and another texture at any other address
+    mRdp->texture_tile[tile].tmem_index = static_cast<uint16_t>(tmem);
 
     mRdp->textures_changed[0] = true;
     mRdp->textures_changed[1] = true;
@@ -2437,69 +3442,168 @@ void Interpreter::GfxDpLoadTlut(uint8_t tile, uint32_t high_index) {
     }
 }
 
-void Interpreter::GfxDpLoadBlock(uint8_t tile, uint32_t uls, uint32_t ult, uint32_t lrs, uint32_t dxt) {
-    SUPPORT_CHECK(uls == 0);
-    SUPPORT_CHECK(ult == 0);
-
-    // The lrs field rather seems to be number of pixels to load
-    uint32_t word_size_shift = 0;
-    switch (mRdp->texture_to_load.siz) {
-        case G_IM_SIZ_4b:
-            word_size_shift = -1;
-            break;
-        case G_IM_SIZ_8b:
-            word_size_shift = 0;
-            break;
-        case G_IM_SIZ_16b:
-            word_size_shift = 1;
-            break;
-        case G_IM_SIZ_32b:
-            word_size_shift = 2;
-            break;
+void Interpreter::StoreLoadedTexture(uint16_t tmemStart, const LoadedTexture& texture) {
+    constexpr uint32_t kTmemWordBytes = 8;
+    constexpr uint32_t kTmemWordCount = 512;
+    if (tmemStart >= kTmemWordCount) {
+        return;
     }
-    uint32_t orig_size_bytes =
-        word_size_shift > 0 ? (lrs + 1) << word_size_shift : (lrs + 1) >> (-(int64_t)word_size_shift);
+
+    const uint32_t logicalSize = texture.orig_size_bytes != 0 ? texture.orig_size_bytes : texture.size_bytes;
+    const uint32_t requestedWords = std::max(1u, (logicalSize + kTmemWordBytes - 1u) / kTmemWordBytes);
+    const uint32_t wordCount = std::min(requestedWords, kTmemWordCount - tmemStart);
+    const uint32_t newEnd = tmemStart + wordCount;
+
+    // A TMEM upload replaces bytes, not a named texture object. Discard any
+    // older metadata range touched by this upload so a later render tile can
+    // never select stale DRAM data for overwritten TMEM.
+    for (auto& existing : mRdp->loaded_texture) {
+        if (existing.tmem_word_count == 0) {
+            continue;
+        }
+        const uint32_t existingEnd = existing.tmem_start + existing.tmem_word_count;
+        if (existing.tmem_start < newEnd && tmemStart < existingEnd) {
+            existing = {};
+        }
+    }
+
+    // Materialize metadata at every covered TMEM word. Render tiles are legal
+    // at offsets inside a LOADBLOCK/LOADTILE range, not only at its base.
+    for (uint32_t word = 0; word < wordCount; ++word) {
+        const uint32_t logicalByteOffset = word * kTmemWordBytes;
+        const uint32_t hostByteOffset =
+            logicalSize != 0 ? static_cast<uint32_t>((static_cast<uint64_t>(logicalByteOffset) * texture.size_bytes) /
+                                                     logicalSize)
+                             : logicalByteOffset;
+        LoadedTexture entry = texture;
+        entry.tmem_start = tmemStart;
+        entry.tmem_word_count = static_cast<uint16_t>(wordCount);
+        if (entry.addr != nullptr) {
+            entry.addr += hostByteOffset;
+        }
+        entry.size_bytes = texture.size_bytes > hostByteOffset ? texture.size_bytes - hostByteOffset : 0;
+        entry.orig_size_bytes =
+            texture.orig_size_bytes > logicalByteOffset ? texture.orig_size_bytes - logicalByteOffset : 0;
+        if (word != 0) {
+            // An interior TMEM address starts a new render view into this
+            // upload. Its row layout comes from the render tile, not from the
+            // original load base; retaining the base stride collapses these
+            // views into one-pixel-high stripe textures.
+            entry.line_size_bytes = 0;
+            entry.full_image_line_size_bytes = 0;
+        }
+        mRdp->loaded_texture[tmemStart + word] = entry;
+    }
+}
+
+void Interpreter::GfxDpLoadBlock(uint8_t tile, uint32_t uls, uint32_t ult, uint32_t lrs, uint32_t dxt) {
+    const auto byteCountForTexels = [](uint64_t texels, uint8_t siz) -> uint32_t {
+        uint64_t bytes = 0;
+        switch (siz) {
+            case G_IM_SIZ_4b:
+                bytes = (texels + 1u) / 2u;
+                break;
+            case G_IM_SIZ_8b:
+                bytes = texels;
+                break;
+            case G_IM_SIZ_16b:
+                bytes = texels * 2u;
+                break;
+            case G_IM_SIZ_32b:
+                bytes = texels * 4u;
+                break;
+            default:
+                break;
+        }
+        return static_cast<uint32_t>(std::min<uint64_t>(bytes, UINT32_MAX));
+    };
+    const uint32_t orig_size_bytes = byteCountForTexels(static_cast<uint64_t>(lrs) + 1u,
+                                                        mRdp->texture_to_load.siz);
     uint32_t size_bytes = orig_size_bytes;
     if (mRdp->texture_to_load.raw_tex_metadata.h_byte_scale != 1 ||
         mRdp->texture_to_load.raw_tex_metadata.v_pixel_scale != 1) {
         size_bytes *= mRdp->texture_to_load.raw_tex_metadata.h_byte_scale;
         size_bytes *= mRdp->texture_to_load.raw_tex_metadata.v_pixel_scale;
     }
-    mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].orig_size_bytes = orig_size_bytes;
-    mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].size_bytes = size_bytes;
-    // Compute actual per-line DRAM stride from SetTextureImage width when available.
-    // The standard gDPLoadTextureBlock macro sets width=1, but manually-built DL
-    // commands may set the real pixel width.
-    uint32_t actual_line_bytes = size_bytes;
-    if (mRdp->texture_to_load.width > 1) {
-        uint32_t candidate;
-        switch (mRdp->texture_to_load.siz) {
-            case G_IM_SIZ_4b:
-                candidate = (mRdp->texture_to_load.width + 1) / 2;
-                break;
-            case G_IM_SIZ_8b:
-                candidate = mRdp->texture_to_load.width;
-                break;
-            case G_IM_SIZ_16b:
-                candidate = mRdp->texture_to_load.width * 2;
-                break;
-            case G_IM_SIZ_32b:
-                candidate = mRdp->texture_to_load.width * 4;
-                break;
-            default:
-                candidate = mRdp->texture_to_load.width;
-                break;
+    const uint16_t tmemIndex = mRdp->texture_tile[tile].tmem_index;
+    LoadedTexture loaded{};
+    loaded.orig_size_bytes = orig_size_bytes;
+    loaded.size_bytes = size_bytes;
+
+    // G_LOADBLOCK's SETTIMG size is a transfer size, not necessarily the
+    // texture's logical size. I4/I8 macros deliberately transfer as 16-bit.
+    // When a render tile for the same TMEM slot already describes this image,
+    // use its logical line layout for DRAM row stepping and texture import.
+    uint32_t logical_line_bytes = 0;
+    for (uint32_t renderTile = 0; renderTile < 8; ++renderTile) {
+        const auto& candidateTile = mRdp->texture_tile[renderTile];
+        if (renderTile == tile || candidateTile.tmem_index != tmemIndex ||
+            candidateTile.line_size_bytes == 0 || mRdp->texture_to_load.width <= 1) {
+            continue;
         }
-        if (candidate > 0 && candidate < size_bytes && size_bytes % candidate == 0) {
-            actual_line_bytes = candidate;
+        uint32_t candidateTmemLineBytes = candidateTile.line_size_bytes;
+        if (candidateTile.siz == G_IM_SIZ_32b) {
+            candidateTmemLineBytes *= 2u;
+        }
+
+        // LOADBLOCK's DXT encodes the number of 64-bit TMEM words per source
+        // row. This is authoritative when the transfer size differs from the
+        // logical render size (for example FONT_SET_4 I4 data transferred as
+        // 16-bit words). In that case the descriptor width can describe only
+        // the visible glyph region, while DXT still preserves the real 8-byte
+        // source stride.
+        if (dxt != 0 && mRdp->texture_to_load.siz != candidateTile.siz) {
+            constexpr uint32_t kDxtOne = 1u << 11;
+            const uint32_t dxtWordsPerLine = (kDxtOne + dxt - 1u) / dxt;
+            const uint32_t dxtLineBytes = dxtWordsPerLine * 8u;
+            if (dxtLineBytes == candidateTmemLineBytes &&
+                dxtLineBytes <= size_bytes && size_bytes % dxtLineBytes == 0) {
+                logical_line_bytes = dxtLineBytes;
+                break;
+            }
+        }
+
+        // SETTIMG may deliberately use a wider transfer format than the
+        // render tile (notably I4 loaded through a 16-bit LOADBLOCK). The
+        // render tile's line field describes padded TMEM storage, while DRAM
+        // rows remain tightly packed. Derive the source stride from the image
+        // width and logical render size, then only accept it when its 8-byte
+        // TMEM-aligned size matches the configured tile line.
+        const uint32_t candidateSourceLineBytes =
+            byteCountForTexels(mRdp->texture_to_load.width, candidateTile.siz);
+        const uint32_t candidateAlignedTmemLineBytes =
+            (candidateSourceLineBytes + 7u) & ~7u;
+        if (candidateSourceLineBytes != 0 &&
+            candidateTmemLineBytes == candidateAlignedTmemLineBytes &&
+            candidateSourceLineBytes <= size_bytes &&
+            size_bytes % candidateSourceLineBytes == 0) {
+            logical_line_bytes = candidateSourceLineBytes;
+            break;
         }
     }
-    mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].line_size_bytes = actual_line_bytes;
-    mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].full_image_line_size_bytes = actual_line_bytes;
+
+    // Fall back to the SETTIMG transfer layout when no logical render tile is
+    // available yet. Width 1 is the standard block-load sentinel and means the
+    // entire transfer is one contiguous line until SETTILE supplies the layout.
+    uint32_t source_line_bytes = logical_line_bytes != 0 ? logical_line_bytes : size_bytes;
+    if (mRdp->texture_to_load.width > 1) {
+        const uint32_t transferLineBytes =
+            byteCountForTexels(mRdp->texture_to_load.width, mRdp->texture_to_load.siz);
+        if (logical_line_bytes == 0 && transferLineBytes > 0 &&
+            transferLineBytes <= size_bytes && size_bytes % transferLineBytes == 0) {
+            source_line_bytes = transferLineBytes;
+        }
+    }
+    loaded.line_size_bytes = source_line_bytes;
+    loaded.full_image_line_size_bytes = source_line_bytes;
     // assert(size_bytes <= 4096 && "bug: too big texture");
-    mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].tex_flags = mRdp->texture_to_load.tex_flags;
-    mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].raw_tex_metadata = mRdp->texture_to_load.raw_tex_metadata;
-    mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].addr = mRdp->texture_to_load.addr;
+    loaded.tex_flags = mRdp->texture_to_load.tex_flags;
+    loaded.raw_tex_metadata = mRdp->texture_to_load.raw_tex_metadata;
+    const size_t rowOffset = static_cast<size_t>(ult) * source_line_bytes;
+    const size_t columnOffset = byteCountForTexels(uls, mRdp->texture_to_load.siz);
+    loaded.addr = mRdp->texture_to_load.addr != nullptr
+                      ? mRdp->texture_to_load.addr + rowOffset + columnOffset
+                      : nullptr;
     // fprintf(stderr, "GfxDpLoadBlock: line_size = 0x%x; orig = 0x%x; bpp=%d; lrs=%d\n", size_bytes,
     // orig_size_bytes,
     //         mRdp->texture_to_load.siz, lrs);
@@ -2510,15 +3614,36 @@ void Interpreter::GfxDpLoadBlock(uint8_t tile, uint32_t uls, uint32_t ult, uint3
             : std::string_view{};
     auto maskedTextureIter = mMaskedTextures.find(texPath);
     if (maskedTextureIter != mMaskedTextures.end()) {
-        mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].masked = true;
-        mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].blended =
-            maskedTextureIter->second.replacementData != nullptr;
+        loaded.masked = true;
+        loaded.blended = maskedTextureIter->second.replacementData != nullptr;
     } else {
-        mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].masked = false;
-        mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].blended = false;
+        loaded.masked = false;
+        loaded.blended = false;
     }
 
-    mRdp->textures_changed[mRdp->texture_tile[tile].tmem_index] = true;
+    // TMEM emulation: mirror the block transfer into the emulated 4 KiB TMEM
+    // so texture import can decode content purely from tile-descriptor state
+    // in hardware execution order. A straight byte copy is correct here: the
+    // block load's DXT interleave cancels between a linear write at load time
+    // and a linear read at import time.
+    if (loaded.addr != nullptr) {
+        const uint32_t tmemByteOffset = static_cast<uint32_t>(tmemIndex) * 8u;
+        if (tmemByteOffset < sizeof(mRdp->tmem)) {
+            uint32_t copyBytes = std::min<uint32_t>(size_bytes, sizeof(mRdp->tmem) - tmemByteOffset);
+            const size_t readable = TmemSourceReadableLimit(loaded.addr);
+            if (readable < copyBytes) {
+                copyBytes = static_cast<uint32_t>(readable);
+            }
+            if (copyBytes != 0) {
+                memcpy(mRdp->tmem + tmemByteOffset, loaded.addr, copyBytes);
+                mRdp->tmem_generation++;
+            }
+        }
+    }
+
+    StoreLoadedTexture(tmemIndex, loaded);
+    mRdp->textures_changed[0] = true;
+    mRdp->textures_changed[1] = true;
 }
 
 void Interpreter::GfxDpLoadTile(uint8_t tile, uint32_t uls, uint32_t ult, uint32_t lrs, uint32_t lrt) {
@@ -2564,15 +3689,17 @@ void Interpreter::GfxDpLoadTile(uint8_t tile, uint32_t uls, uint32_t ult, uint32
         tile_line_size_bytes *= h_byte_scale;
     }
 
-    mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].orig_size_bytes = orig_size_bytes;
-    mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].size_bytes = size_bytes;
-    mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].full_image_line_size_bytes = full_image_line_size_bytes;
-    mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].line_size_bytes = tile_line_size_bytes;
+    const uint16_t tmemIndex = mRdp->texture_tile[tile].tmem_index;
+    LoadedTexture loaded{};
+    loaded.orig_size_bytes = orig_size_bytes;
+    loaded.size_bytes = size_bytes;
+    loaded.full_image_line_size_bytes = full_image_line_size_bytes;
+    loaded.line_size_bytes = tile_line_size_bytes;
 
     //    assert(size_bytes <= 4096 && "bug: too big texture");
-    mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].tex_flags = mRdp->texture_to_load.tex_flags;
-    mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].raw_tex_metadata = mRdp->texture_to_load.raw_tex_metadata;
-    mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].addr = mRdp->texture_to_load.addr + start_offset_bytes;
+    loaded.tex_flags = mRdp->texture_to_load.tex_flags;
+    loaded.raw_tex_metadata = mRdp->texture_to_load.raw_tex_metadata;
+    loaded.addr = mRdp->texture_to_load.addr != nullptr ? mRdp->texture_to_load.addr + start_offset_bytes : nullptr;
 
     const std::string_view texPath =
         mRdp->texture_to_load.raw_tex_metadata.resource != nullptr
@@ -2580,20 +3707,47 @@ void Interpreter::GfxDpLoadTile(uint8_t tile, uint32_t uls, uint32_t ult, uint32
             : std::string_view{};
     auto maskedTextureIter = mMaskedTextures.find(texPath);
     if (maskedTextureIter != mMaskedTextures.end()) {
-        mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].masked = true;
-        mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].blended =
-            maskedTextureIter->second.replacementData != nullptr;
+        loaded.masked = true;
+        loaded.blended = maskedTextureIter->second.replacementData != nullptr;
     } else {
-        mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].masked = false;
-        mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].blended = false;
+        loaded.masked = false;
+        loaded.blended = false;
     }
 
+    // TMEM emulation: mirror the tile sub-rectangle into emulated TMEM row by
+    // row. Destination rows advance at the 8-byte-aligned tile line stride,
+    // matching how the hardware packs LoadTile rows.
+    if (loaded.addr != nullptr) {
+        const uint32_t tmemByteOffset = static_cast<uint32_t>(tmemIndex) * 8u;
+        const uint32_t destStride = (tile_line_size_bytes + 7u) & ~7u;
+        if (tmemByteOffset < sizeof(mRdp->tmem) && destStride != 0) {
+            size_t readable = TmemSourceReadableLimit(loaded.addr);
+            bool wrote = false;
+            for (uint32_t y = 0; y < tile_height; y++) {
+                const uint32_t destOff = tmemByteOffset + y * destStride;
+                const size_t srcOff = static_cast<size_t>(y) * full_image_line_size_bytes;
+                if (destOff >= sizeof(mRdp->tmem) || srcOff + tile_line_size_bytes > readable) {
+                    break;
+                }
+                const uint32_t rowBytes =
+                    std::min<uint32_t>(tile_line_size_bytes, sizeof(mRdp->tmem) - destOff);
+                memcpy(mRdp->tmem + destOff, loaded.addr + srcOff, rowBytes);
+                wrote = true;
+            }
+            if (wrote) {
+                mRdp->tmem_generation++;
+            }
+        }
+    }
+
+    StoreLoadedTexture(tmemIndex, loaded);
     mRdp->texture_tile[tile].uls = uls;
     mRdp->texture_tile[tile].ult = ult;
     mRdp->texture_tile[tile].lrs = lrs;
     mRdp->texture_tile[tile].lrt = lrt;
 
-    mRdp->textures_changed[mRdp->texture_tile[tile].tmem_index] = true;
+    mRdp->textures_changed[0] = true;
+    mRdp->textures_changed[1] = true;
 }
 
 /*static uint8_t color_comb_component(uint32_t v) {
@@ -2776,8 +3930,13 @@ void Interpreter::GfxDpTextureRectangle(int32_t ulx, int32_t uly, int32_t lrx, i
     uint64_t saved_combine_mode = mRdp->combine_mode;
     if ((mRdp->other_mode_h & (3U << G_MDSFT_CYCLETYPE)) == G_CYC_COPY) {
         // Per RDP Command Summary Set Tile's shift s and this dsdx should be set to 4 texels
-        // Divide by 4 to get 1 instead
-        dsdx >>= 2;
+        // Divide by 4 to get 1 instead — but only when the game followed the 4x convention.
+        // F-Zero X emits dsdx=0x0400 (already 1.0 texel/pixel) in copy mode, so dividing
+        // would produce 0.25 texels/pixel and a 4x zoom. Guard: skip the shift when the
+        // magnitude is already at or below 1.0 (0x0400 in S5.10).
+        if (dsdx > 0x0400 || dsdx < -0x0400) {
+            dsdx >>= 2;
+        }
 
         // Color combiner is turned off in copy mode
         GfxDpSetCombineMode(color_comb(0, 0, 0, G_CCMUX_TEXEL0), alpha_comb(0, 0, 0, G_ACMUX_TEXEL0), 0, 0);
@@ -3351,6 +4510,16 @@ bool gfx_movemem_handler_f3dex2(F3DGfx** cmd0) {
     return false;
 }
 
+bool gfx_dma_io_handler_f3dex2(F3DGfx** cmd0) {
+    Interpreter* gfx = mInstance.lock().get();
+    F3DGfx* cmd = *cmd0;
+    const bool write = C0(23, 1) != 0;
+    const uint16_t dmem = static_cast<uint16_t>(C0(13, 10) * 8);
+    const size_t size = static_cast<size_t>(C0(0, 12)) + 1;
+    gfx->GfxSpDmaIo(write, dmem, gfx->SegAddr(cmd->words.w1), size);
+    return false;
+}
+
 bool gfx_movemem_handler_f3d(F3DGfx** cmd0) {
     Interpreter* gfx = mInstance.lock().get();
     F3DGfx* cmd = *cmd0;
@@ -3672,6 +4841,39 @@ bool gfx_branch_z_otr_handler_f3dex2(F3DGfx** cmd0) {
             g_exec_stack.branch(cmd);
             return true; // shortcut cmd increment
         }
+    }
+    return false;
+}
+
+bool gfx_rdphalf_1_handler_f3dex2(F3DGfx** cmd0) {
+    Interpreter* gfx = mInstance.lock().get();
+    gfx->mRsp->branch_z_target = (*cmd0)->words.w1;
+    return false;
+}
+
+bool gfx_branch_z_handler_f3dex2(F3DGfx** cmd0) {
+    Interpreter* gfx = mInstance.lock().get();
+    F3DGfx* caller = *cmd0;
+    const uint8_t vbidx = static_cast<uint8_t>((caller->words.w0 & 0xFFFu) >> 1);
+    const uint32_t zval = static_cast<uint32_t>(caller->words.w1);
+    F3DGfx* target = reinterpret_cast<F3DGfx*>(gfx->mRsp->branch_z_target);
+    gfx->mRsp->branch_z_target = 0;
+    if (target == nullptr || vbidx >= MAX_VERTICES) {
+        return false;
+    }
+    const LoadedVertex& vertex = gfx->mRsp->loaded_vertices[vbidx];
+    const float screenZ =
+        (fabsf(vertex.w) > 0.000001f)
+            ? ((vertex.z / vertex.w) * gfx->mRsp->viewport_z_scale + gfx->mRsp->viewport_z_trans)
+            : gfx->mRsp->viewport_z_trans;
+    const uint32_t screenZFixed =
+        static_cast<uint32_t>(std::clamp(screenZ, 0.0f, 65535.0f) * 65536.0f);
+
+    if (screenZFixed <= zval ||
+        (gfx->mRsp->extra_geometry_mode & G_EX_ALWAYS_EXECUTE_BRANCH) != 0) {
+        *cmd0 = target;
+        g_exec_stack.branch(caller);
+        return true;
     }
     return false;
 }
@@ -4581,10 +5783,13 @@ static constexpr UcodeHandler f3dex2Handlers = {
     { F3DEX2_G_MTX, { "G_MTX", gfx_mtx_handler_f3dex2 } },
     { F3DEX2_G_POPMTX, { "G_POPMTX", gfx_pop_mtx_handler_f3dex2 } },
     { F3DEX2_G_MOVEMEM, { "G_MOVEMEM", gfx_movemem_handler_f3dex2 } },
+    { F3DEX2_G_DMA_IO, { "G_DMA_IO", gfx_dma_io_handler_f3dex2 } },
     { F3DEX2_G_MOVEWORD, { "G_MOVEWORD", gfx_moveword_handler_f3dex2 } },
     { F3DEX2_G_TEXTURE, { "G_TEXTURE", gfx_texture_handler_f3dex2 } },
     { F3DEX2_G_VTX, { "G_VTX", gfx_vtx_handler_f3dex2 } },
     { F3DEX2_G_MODIFYVTX, { "G_MODIFYVTX", gfx_modify_vtx_handler_f3dex2 } },
+    { F3DEX2_G_RDPHALF_1, { "G_RDPHALF_1", gfx_rdphalf_1_handler_f3dex2 } },
+    { F3DEX2_G_BRANCH_Z, { "G_BRANCH_Z", gfx_branch_z_handler_f3dex2 } },
     { F3DEX2_G_DL, { "G_DL", gfx_dl_handler_common } },
     { F3DEX2_G_ENDDL, { "G_ENDDL", gfx_end_dl_handler_common } },
     { F3DEX2_G_GEOMETRYMODE, { "G_GEOMETRYMODE", gfx_geometry_mode_handler_f3dex2 } },
@@ -4690,7 +5895,18 @@ static void gfx_set_ucode_handler(UcodeHandlers ucode) {
     // Loaded ucode must be in range of the supported ucode_handlers
     assert(ucode < ucode_max);
     Interpreter* gfx = mInstance.lock().get();
+    const bool handlerChanged = (ucode_handler_index != ucode);
     ucode_handler_index = ucode;
+
+    // Same handler table means an in-family variant switch (F-Zero X issues
+    // G_LOAD_UCODE from F3DEX2 to F3DFLX2.Rej mid-frame, before drawing every
+    // machine). Real hardware does not clear RSP constants on such a load and
+    // the game relies on the fog position configured by Course_Draw remaining
+    // live for the car draws that follow — so only apply the quirk resets on a
+    // genuine handler-table change.
+    if (!handlerChanged) {
+        return;
+    }
 
     // Reset some RSP state values upon ucode load to deal with hardware quirks discovered by emulators
     switch (ucode) {
@@ -4727,7 +5943,16 @@ static void gfx_step() {
 #endif
 
     if (opcode == F3DEX2_G_LOAD_UCODE) {
-        gfx_set_ucode_handler((UcodeHandlers)(cmd->words.w0 & 0xFFFFFF));
+        const uintptr_t payload = static_cast<uintptr_t>(cmd->words.w1);
+        if ((payload & ~static_cast<uintptr_t>(0xFFu)) == F3DEX2_VARIANT_SWITCH_MARKER) {
+            const uint8_t rawVariant = static_cast<uint8_t>(payload & 0xFFu);
+            if (rawVariant <= static_cast<uint8_t>(F3dex2Variant::FZeroFlxReject)) {
+                gfx_set_ucode_handler(ucode_f3dex2);
+                mInstance.lock()->SetF3dex2Variant(static_cast<F3dex2Variant>(rawVariant));
+            }
+        } else {
+            gfx_set_ucode_handler((UcodeHandlers)(cmd->words.w0 & 0xFFFFFF));
+        }
         ++cmd;
         return;
         // Instead of having a handler for each ucode for switching ucode, just check for it early and return.
@@ -4777,8 +6002,15 @@ void Interpreter::SpReset() {
         mShaderStack.pop();
     }
     mRsp->modelview_matrix_stack_size = 1;
+    mRsp->branch_z_target = 0;
+    mRsp->viewport_z_scale = 511.0f;
+    mRsp->viewport_z_trans = 511.0f;
     mRsp->current_num_lights = 2;
     mRsp->lights_changed = true;
+    memset(mRsp->dmem, 0, sizeof(mRsp->dmem));
+    mRsp->dma_io_dmem = 0;
+    mRsp->dma_io_loaded = false;
+    mRsp->f3dflx_alpha_light_valid = false;
     mRsp->lookat[0].dir[0] = 0;
     mRsp->lookat[0].dir[1] = 127;
     mRsp->lookat[0].dir[2] = 0;
@@ -4845,8 +6077,9 @@ void Interpreter::Destroy() {
     // Texture cache and loaded textures store references to Resources which need to be unreferenced.
     TextureCacheClear();
     mRdp->texture_to_load.raw_tex_metadata.resource = nullptr;
-    mRdp->loaded_texture[0].raw_tex_metadata.resource = nullptr;
-    mRdp->loaded_texture[1].raw_tex_metadata.resource = nullptr;
+    for (auto& loadedTexture : mRdp->loaded_texture) {
+        loadedTexture.raw_tex_metadata.resource = nullptr;
+    }
 }
 
 GfxRenderingAPI* Interpreter::GetCurrentRenderingAPI() {
@@ -5187,6 +6420,19 @@ int32_t gfx_check_image_signature(const char* imgData) {
     // user-space layouts (x86_64 47-bit canonical, ARM64 48-bit VA, etc.).
     if (i > 0x0000FFFFFFFFFFFFull) {
         return 0;
+    }
+#endif
+
+#ifdef _WIN32
+    // Plausible-looking but unmapped pointers still reach here (stale SETTIMG
+    // addresses during screen transitions crashed OtrSignatureCheck's strncmp).
+    // Verify the memory is actually committed and readable first.
+    {
+        MEMORY_BASIC_INFORMATION mbi;
+        if (VirtualQuery(reinterpret_cast<const void*>(imgData), &mbi, sizeof(mbi)) == 0 ||
+            mbi.State != MEM_COMMIT || (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) != 0) {
+            return 0;
+        }
     }
 #endif
 

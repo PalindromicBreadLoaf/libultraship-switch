@@ -256,9 +256,9 @@ PSOutput PSMain(PSInput input, float4 screenSpace : SV_Position) {
     @end
 
     @if(o_alpha) 
-        float4 texel;
+        float4 texel = float4(0.0, 0.0, 0.0, 1.0);
     @else
-        float3 texel;
+        float3 texel = float3(0.0, 0.0, 0.0);
     @end
 
     @if(o_2cyc)

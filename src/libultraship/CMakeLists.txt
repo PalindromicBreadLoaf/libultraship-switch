@@ -25,6 +25,12 @@ source_group("libultra")
 
 file(GLOB Source_Files__Libultra RELATIVE ${CMAKE_CURRENT_SOURCE_DIR} "libultra/*.cpp")
 
+# G-Diffuser (F-Zero X port) R6: the port runs the decomp's OWN N64 cooperative scheduler
+# (decomp/src/libultra/os/*.c). Disable libultraship's non-blocking message-queue stubs and
+# VI stubs so the decomp's real blocking osRecvMesg/osSendMesg + our VI bridge are used instead.
+list(FILTER Source_Files__Libultra EXCLUDE REGEX "libultra/os_mesg\\.cpp$")
+list(FILTER Source_Files__Libultra EXCLUDE REGEX "libultra/os_vi\\.cpp$")
+
 source_group("libultra" FILES ${Source_Files__Libultra})
 
 target_sources(libultraship PRIVATE ${Source_Files__Libultra})
