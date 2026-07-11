@@ -9,11 +9,16 @@ struct FrameUniforms {
     float noiseScale;
 };
 
+// NOTE: both fields are declared unconditionally (not gated by @if) so this
+// struct's layout always matches the fixed C++ DrawUniforms in gfx_metal.h
+// regardless of which shader variant is compiled -- setFragmentBytes() copies
+// sizeof(DrawUniforms) from that single fixed C++ layout for every variant,
+// so a conditionally-shorter struct here would read the wrong field at the
+// wrong offset whenever o_prim_depth and o_alpha_threshold don't both match.
 struct DrawUniforms {
     int textureFiltering[6];
-    @if(o_prim_depth)
     float prim_depth;
-    @end
+    float alpha_compare_threshold;
 };
 
 struct FragOut {
@@ -289,7 +294,10 @@ fragment FragOut fragmentShader(
     FragOut out;
     @if(o_alpha)
         @if(o_alpha_threshold)
-            if (texel.w < 8.0 / 256.0) discard_fragment();
+            // Real RDP G_AC_THRESHOLD rejects texels whose alpha is below the
+            // SETBLENDCOLOR alpha register (a fixed magic constant here would
+            // ignore the game's actual threshold, e.g. F-Zero X HUD cutouts).
+            if (texel.w < drawUniforms.alpha_compare_threshold) discard_fragment();
         @end
         @if(o_invisible)
             texel.w = 0.0;

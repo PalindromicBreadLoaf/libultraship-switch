@@ -411,6 +411,13 @@ void GfxRenderingAPIMetal::SetCurrentPrimDepth(float depth) {
     }
 }
 
+void GfxRenderingAPIMetal::SetCurrentAlphaCompareThreshold(float threshold) {
+    if (threshold != mCurrentAlphaCompareThreshold) {
+        mCurrentAlphaCompareThreshold = threshold;
+        mAlphaCompareThresholdDirty = true;
+    }
+}
+
 void GfxRenderingAPIMetal::SetZmodeDecal(bool zmode_decal) {
     mCurrentZmodeDecal = zmode_decal;
 }
@@ -530,10 +537,12 @@ void GfxRenderingAPIMetal::DrawTriangles(float buf_vbo[], size_t buf_vbo_len, si
         }
     }
 
-    if (textures_changed || mPrimDepthDirty) {
+    if (textures_changed || mPrimDepthDirty || mAlphaCompareThresholdDirty) {
         mDrawUniforms.prim_depth = mCurrentPrimDepth;
+        mDrawUniforms.alpha_compare_threshold = mCurrentAlphaCompareThreshold;
         current_framebuffer.mCommandEncoder->setFragmentBytes(&mDrawUniforms, sizeof(DrawUniforms), 1);
         mPrimDepthDirty = false;
+        mAlphaCompareThresholdDirty = false;
     }
 
     if (current_framebuffer.mLastShaderProgram != mShaderProgram) {

@@ -120,6 +120,7 @@ struct FrameUniforms {
 struct DrawUniforms {
     simd::int1 textureFiltering[SHADER_MAX_TEXTURES];
     simd::float1 prim_depth;
+    simd::float1 alpha_compare_threshold;
 };
 
 struct CoordUniforms {
@@ -144,6 +145,7 @@ class GfxRenderingAPIMetal final : public GfxRenderingAPI {
     void SetSamplerParameters(int sampler, bool linear_filter, uint32_t cms, uint32_t cmt) override;
     void SetDepthTestAndMask(bool depth_test, bool z_upd) override;
     void SetCurrentPrimDepth(float depth) override;
+    void SetCurrentAlphaCompareThreshold(float threshold) override;
     void SetZmodeDecal(bool decal) override;
     void SetViewport(int x, int y, int width, int height) override;
     void SetScissor(int x, int y, int width, int height) override;

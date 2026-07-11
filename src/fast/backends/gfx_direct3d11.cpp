@@ -297,6 +297,13 @@ void GfxRenderingAPIDX11::Init() {
     ThrowIfFailed(mDevice->CreateBuffer(&constant_buffer_desc, nullptr, mPerPrimDepthCb.GetAddressOf()),
                   mWindowBackend->GetWindowHandle(), "Failed to create per-prim-depth constant buffer.");
 
+    // Create per-alpha-compare-threshold constant buffer (G_AC_THRESHOLD), uploaded
+    // only when mAlphaCompareThresholdDirty. Real RDP compares texel alpha against
+    // the SETBLENDCOLOR alpha register, not a fixed constant.
+    constant_buffer_desc.ByteWidth = sizeof(PerAlphaThresholdCB);
+    ThrowIfFailed(mDevice->CreateBuffer(&constant_buffer_desc, nullptr, mPerAlphaThresholdCb.GetAddressOf()),
+                  mWindowBackend->GetWindowHandle(), "Failed to create per-alpha-threshold constant buffer.");
+
     // Create compute shader that can be used to retrieve depth buffer values
 
     const char* shader_source = R"(
@@ -636,6 +643,13 @@ void GfxRenderingAPIDX11::SetCurrentPrimDepth(float depth) {
     }
 }
 
+void GfxRenderingAPIDX11::SetCurrentAlphaCompareThreshold(float threshold) {
+    if (threshold != mCurrentAlphaCompareThreshold) {
+        mCurrentAlphaCompareThreshold = threshold;
+        mAlphaCompareThresholdDirty = true;
+    }
+}
+
 void GfxRenderingAPIDX11::SetZmodeDecal(bool zmode_decal) {
     mCurrentZmodeDecal = zmode_decal;
 }
@@ -778,6 +792,17 @@ void GfxRenderingAPIDX11::DrawTriangles(float buf_vbo[], size_t buf_vbo_len, siz
         mPrimDepthDirty = false;
     }
 
+    // G_AC_THRESHOLD: upload alpha-compare-threshold cbuffer when it changed
+    if (mAlphaCompareThresholdDirty) {
+        mPerAlphaThresholdCbData.alpha_compare_threshold = mCurrentAlphaCompareThreshold;
+        D3D11_MAPPED_SUBRESOURCE ms2;
+        ZeroMemory(&ms2, sizeof(D3D11_MAPPED_SUBRESOURCE));
+        mContext->Map(mPerAlphaThresholdCb.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &ms2);
+        memcpy(ms2.pData, &mPerAlphaThresholdCbData, sizeof(PerAlphaThresholdCB));
+        mContext->Unmap(mPerAlphaThresholdCb.Get(), 0);
+        mAlphaCompareThresholdDirty = false;
+    }
+
     // Set vertex buffer data
 
     D3D11_MAPPED_SUBRESOURCE ms;
@@ -820,8 +845,9 @@ void GfxRenderingAPIDX11::OnResize() {
 
 void GfxRenderingAPIDX11::StartFrame() {
     // Set per-frame constant buffer
-    ID3D11Buffer* buffers[3] = { mPerFrameCb.Get(), mPerDrawCb.Get(), mPerPrimDepthCb.Get() };
-    mContext->PSSetConstantBuffers(0, 3, buffers);
+    ID3D11Buffer* buffers[4] = { mPerFrameCb.Get(), mPerDrawCb.Get(), mPerPrimDepthCb.Get(),
+                                 mPerAlphaThresholdCb.Get() };
+    mContext->PSSetConstantBuffers(0, 4, buffers);
 
     mPerFrameCbData.noise_frame++;
     if (mPerFrameCbData.noise_frame > 150) {
@@ -1103,7 +1129,14 @@ void GfxRenderingAPIDX11::ReadFramebufferToCPU(int fb_id, uint32_t width, uint32
             uint8_t r = (((pixel & 0xFF) + 4) * 0x1F) / 0xFF;
             uint8_t g = ((((pixel >> 8) & 0xFF) + 4) * 0x1F) / 0xFF;
             uint8_t b = ((((pixel >> 16) & 0xFF) + 4) * 0x1F) / 0xFF;
-            uint8_t a = ((pixel >> 24) & 0xFF) ? 1 : 0;
+            // Coverage bit, not host alpha: an N64 framebuffer's low bit is
+            // coverage, and a captured full frame is fully covered. The host
+            // render target's alpha channel is whatever the combiner last
+            // wrote (frequently 0 for opaque geometry), so deriving the bit
+            // from it zeroed the alpha of most captured pixels — every
+            // alpha-dependent redraw of the capture (screen-transition wipes)
+            // then discarded its texels and drew nothing.
+            uint8_t a = 1;
 
             rgba16_buf[i + (j * width)] = (r << 11) | (g << 6) | (b << 1) | a;
         }

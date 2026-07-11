@@ -549,6 +549,15 @@ class Interpreter {
     void RunGuiOnly();
     void Run(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtx_replacements);
     void EndFrame();
+
+    // PORT (G-Diffuser): optional hook invoked inside Run() immediately after the
+    // per-frame framebuffer clear and viewport/scissor reset, BEFORE the task's
+    // commands execute. The port's graphics bridge uses it to seed the boot-logo
+    // CPU framebuffer as a background under the task's content (framebuffer
+    // coherence, campaign-soak-fix-4). Default null => a single branch per frame,
+    // zero cost when unregistered.
+    static void SetPortAfterClearHook(void (*hook)(Interpreter*));
+    static void (*sPortAfterClearHook)(Interpreter*);
     void HandleWindowEvents();
     bool IsFrameReady();
     bool ViewportMatchesRendererResolution();

@@ -138,6 +138,11 @@ void Interpreter::Flush() {
         mGeometryDiagnostics.gpuDrawCalls++;
         mGeometryDiagnostics.gpuTriangles += mBufVboNumTris;
         mRapi->SetCurrentPrimDepth((float)mRdp->prim_depth / N64_PRIM_DEPTH_MAX);
+        // Real RDP G_AC_THRESHOLD compares texel alpha against the SETBLENDCOLOR
+        // alpha register, not a fixed constant. Feed it to the backend every
+        // flush (mirroring prim_depth above); the shader only reads it when
+        // o_alpha_threshold is active for the bound shader variant.
+        mRapi->SetCurrentAlphaCompareThreshold((float)mRdp->blend_color.a / 255.0f);
         mRapi->DrawTriangles(mBufVbo, mBufVboLen, mBufVboNumTris);
         mBufVboLen = 0;
         mBufVboNumTris = 0;
@@ -616,6 +621,23 @@ int gGdxTraceSeq = 0;
 // diagnostics above can be restricted to in-race rendering (menu screens
 // otherwise exhaust the probe caps before the race is ever reached).
 extern "C" int gGdxRaceActive = 0;
+// Defined in port/n64_gfx_bridge.cpp; set to 1 by decomp's Racer_Draw right
+// when the "3,2,1,GO" countdown draw code runs (see racer.c ~6672). Used here
+// to arm a one-shot RDP render-state dump for bug #16 (invisible countdown
+// faces) -- the countdown geometry/matrix were already confirmed sane at the
+// draw, so the remaining suspects are render-state: blend/combine mode,
+// scissor/viewport, or z-occlusion.
+extern "C" int gGdxCountdownProbeArm;
+// #16 phase 3: gGdxCountdownProbeArm alone stays 1 for the rest of the process
+// once the countdown first runs, so the old edge-trigger on that flag caught
+// whatever triangle the interpreter happened to reach first afterward -- not
+// necessarily the countdown digit quad. n64_gfx_bridge.cpp publishes the
+// resolved host pointer of the digit quad's own vertex buffer here (tagged
+// decomp-side in racer.c, matched bridge-side by raw low32) the instant it
+// translates that specific G_VTX command. GfxSpVertex below compares its own
+// vertex pointer argument against this to latch precisely onto that draw.
+extern "C" uintptr_t gGdxCountdownProbeResolvedVtx;
+static bool sGdxCountdownDigitVtxLatched = false;
 // Ring buffer of recent tile writes; flushed to disk only when a suspect draw
 // fires, so the trace shows exactly the SETTILE history leading to that draw.
 #include <deque>
@@ -1245,6 +1267,36 @@ void Interpreter::ImportTextureI4(int tile, bool importReplacement) {
     }
     ApplyTileMaskExtent(mRdp, tile, width, height);
 
+    // Bounds guard (2026-07-09): the loop below reads
+    // ((height-1)*(fullImageLineSizeBytes*2)+(width-1))/2 bytes from addr. A
+    // render tile whose implied extent exceeds the recorded load walks past
+    // the backing buffer (observed as a heap access violation mid-race).
+    // Clamp the read to the loaded byte count and report the identity —
+    // bounded garbage plus evidence beats a crash.
+    if (sizeBytes != 0 && width > 0 && height > 0) {
+        const uint64_t lastIdx =
+            static_cast<uint64_t>(height - 1) * (fullImageLineSizeBytes * 2) + (width - 1);
+        const uint64_t neededBytes = lastIdx / 2 + 1;
+        if (neededBytes > sizeBytes) {
+            static int sI4ClampLogs = 0;
+            if (sI4ClampLogs < 16) {
+                ++sI4ClampLogs;
+                SPDLOG_ERROR("ImportTextureI4 CLAMP: tile {} extent {}x{} stride {} needs {}B > "
+                             "loaded {}B (tmem {} addr {})",
+                             tile, width, height, fullImageLineSizeBytes, neededBytes, sizeBytes,
+                             mRdp->texture_tile[tile].tmem_index, fmt::ptr(addr));
+            }
+            const uint32_t rowBytes = fullImageLineSizeBytes != 0 ? fullImageLineSizeBytes : 1u;
+            uint32_t maxRows = static_cast<uint32_t>(sizeBytes / rowBytes);
+            if (maxRows == 0) {
+                maxRows = 1;
+            }
+            if (height > maxRows) {
+                height = maxRows;
+            }
+        }
+    }
+
     uint32_t i = 0;
 
     for (uint32_t y = 0; y < height; y++) {
@@ -1585,6 +1637,35 @@ void Interpreter::ImportTexture(int i, int tile, bool importReplacement) {
         importReplacement && (metadata->resource != nullptr)
             ? mMaskedTextures.find(GetBaseTexturePath(metadata->resource->GetInitData()->Path))->second.replacementData
             : mRdp->loaded_texture[tmemIdex].addr;
+
+    // Lookup-side TMEM trace: pairs with StoreLoadedTexture's store log so one
+    // run shows whether this tile's tmem base selected the load that populated
+    // it (same env gate as the SETTIMG race trace).
+    {
+        const bool sTmemTrace = std::getenv("GDX_DIAG_SETTIMG") != nullptr; // live read, see store log
+        // Effect/glyph tiles (1-4) are the Phase 1 investigation targets: log them
+        // race-gated but UNGATED by the env flag and with their own budget, so the
+        // verdict "does ImportTexture ever run for these tiles" cannot be lost to
+        // env-ordering or budget accidents again.
+        if (gGdxRaceActive != 0 && tile >= 1 && tile <= 4) {
+            static int sEffectTileLogs = 0;
+            if (sEffectTileLogs < 64) {
+                ++sEffectTileLogs;
+                SPDLOG_ERROR("[tmem] EFFECT-TILE lookup tile={} tmem={} fmt={} siz={} -> addr={} sizeB={}",
+                             tile, tmemIdex, fmt, siz, fmt::ptr(origAddr),
+                             mRdp->loaded_texture[tmemIdex].size_bytes);
+            }
+        }
+        if (sTmemTrace && gGdxRaceActive != 0) { // race-gated, matching the store log
+            static int sTmemLookupLogs = 0;
+            if (sTmemLookupLogs < 400) {
+                ++sTmemLookupLogs;
+                SPDLOG_ERROR("[tmem] lookup tile={} tmem={} fmt={} siz={} -> addr={} sizeB={}", tile,
+                             tmemIdex, fmt, siz, fmt::ptr(origAddr),
+                             mRdp->loaded_texture[tmemIdex].size_bytes);
+            }
+        }
+    }
 
     // Check if this texture address is a registered GPU framebuffer mirror.
     // If so, bind the GPU FB directly — full resolution, no CPU readback needed.
@@ -1934,6 +2015,15 @@ void Interpreter::AdjustWidthHeightForScale(uint32_t& width, uint32_t& height, u
 }
 
 void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx* vertices) {
+    /* #16 phase 3: latch precisely onto the countdown digit quad's own vertex
+       load (see gGdxCountdownProbeResolvedVtx above) so the render-state dump
+       further down this file fires on the triangle(s) that actually consume
+       this buffer instead of the first triangle reached after the coarse arm
+       flag went high. */
+    if (gGdxCountdownProbeArm != 0 && gGdxCountdownProbeResolvedVtx != 0 &&
+        reinterpret_cast<uintptr_t>(vertices) == gGdxCountdownProbeResolvedVtx) {
+        sGdxCountdownDigitVtxLatched = true;
+    }
     for (size_t i = 0; i < n_vertices; i++, dest_index++) {
         const F3DVtx_t* v = &vertices[i].v;
         const F3DVtx_tn* vn = &vertices[i].n;
@@ -2471,6 +2561,63 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
         }
     }
 
+    // Countdown render-state probe (#16, phase 3): the countdown "3,2,1,GO"
+    // quad's object-space geometry and modelview matrix were already confirmed
+    // sane via the [rect]/[mtx-content] probes, so the remaining suspects for
+    // its invisibility are RDP render state -- blend/combine mistranslation,
+    // scissor/viewport placement, z-occlusion, or draw order. Phase 2 dumped
+    // on the coarse 0->armed transition of gGdxCountdownProbeArm, but that flag
+    // is set once decomp-side and never reset, so the edge trigger fired on
+    // whatever triangle the interpreter reached FIRST after the transition --
+    // not necessarily the digit quad (the captured state was an all-zero/FILL
+    // pipeline, consistent with an unrelated early-frame draw, not this HUD
+    // quad). Fire instead on sGdxCountdownDigitVtxLatched, set by GfxSpVertex
+    // only when the just-loaded vertex buffer is the digit quad's own
+    // (matched by resolved host pointer via gGdxCountdownProbeResolvedVtx), so
+    // this captures the triangle that actually consumes that buffer.
+    {
+        static int sCountdownRenderStateLogs = 0;
+        if (sGdxCountdownDigitVtxLatched) {
+            // Consume the latch on this first triangle after the digit quad's
+            // vertex load; otherwise it would stay set and mis-fire again on
+            // whatever draw happens to be next once the log cap is exhausted.
+            sGdxCountdownDigitVtxLatched = false;
+        if (sCountdownRenderStateLogs < 40) {
+            ++sCountdownRenderStateLogs;
+            FILE* tf = fopen("countdown-renderstate.txt", sCountdownRenderStateLogs == 1 ? "w" : "a");
+            if (tf != nullptr) {
+                const uint8_t tile = mRdp->first_tile_index;
+                fprintf(tf,
+                        "[countdown-rs] #%d ucode_variant=%d geo_mode=%08X other_mode_l=%08X "
+                        "other_mode_h=%08X combine=%016llX "
+                        "prim=(%u,%u,%u,%u) env=(%u,%u,%u,%u) blend=(%u,%u,%u,%u) fog=(%u,%u,%u,%u) "
+                        "scissor=(%d,%d,%u,%u) viewport=(%d,%d,%u,%u) "
+                        "tile=%u fmt=%u siz=%u cms=%u cmt=%u masks=%u maskt=%u tmem=%u "
+                        "zbuf=%p cimg=%p\n",
+                        sCountdownRenderStateLogs,
+                        static_cast<int>(mF3dex2Variant),
+                        mRsp->geometry_mode,
+                        mRdp->other_mode_l, mRdp->other_mode_h,
+                        static_cast<unsigned long long>(mRdp->combine_mode),
+                        mRdp->prim_color.r, mRdp->prim_color.g, mRdp->prim_color.b, mRdp->prim_color.a,
+                        mRdp->env_color.r, mRdp->env_color.g, mRdp->env_color.b, mRdp->env_color.a,
+                        mRdp->blend_color.r, mRdp->blend_color.g, mRdp->blend_color.b, mRdp->blend_color.a,
+                        mRdp->fog_color.r, mRdp->fog_color.g, mRdp->fog_color.b, mRdp->fog_color.a,
+                        mRdp->scissor.x, mRdp->scissor.y, mRdp->scissor.width, mRdp->scissor.height,
+                        mRdp->viewport.x, mRdp->viewport.y, mRdp->viewport.width, mRdp->viewport.height,
+                        static_cast<unsigned>(tile),
+                        mRdp->texture_tile[tile].fmt, mRdp->texture_tile[tile].siz,
+                        mRdp->texture_tile[tile].cms, mRdp->texture_tile[tile].cmt,
+                        mRdp->texture_tile[tile].masks, mRdp->texture_tile[tile].maskt,
+                        mRdp->texture_tile[tile].tmem,
+                        reinterpret_cast<void*>(mRdp->z_buf_address),
+                        reinterpret_cast<void*>(mRdp->color_image_address));
+                fclose(tf);
+            }
+        }
+        }
+    }
+
     // depth_test is set when the fragment has a depth value to compare (either from vertex Z via
     // RSP G_ZBUFFER, or from the prim-depth register via G_ZS_PRIM) and Z_CMP is requested.
     bool zbuffer_enabled = (mRsp->geometry_mode & G_ZBUFFER) == G_ZBUFFER;
@@ -2644,6 +2791,37 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
     key.options = cc_options;
 
     ColorCombiner* comb = LookupOrCreateColorCombiner(key);
+
+    // Course-effect draw-state probe (2026-07-09, defect B: PIT/HEAL strip
+    // renders as a flat tan region with dash marks). TMEM identity for these
+    // tiles is already proven correct (EFFECT-TILE probe resolves the right
+    // addr+size for tiles 1-4 of aSetupCourseEffectTextureDL), and
+    // course.c's effect enum maps 1:1 onto the tile index course_gadgets.c
+    // passes to gSPTexture (COURSE_EFFECT_PIT=1, DIRT=2, DASH=3, ICE=4). In
+    // two-cycle combine, TEXEL1 samples texel0Tile+1 (see comment above on
+    // texel1Tile) -- for PIT (tile 1) that is DIRT's tile (tile 2), which the
+    // [tmem] log shows loaded as I4/IA4 (a mask-shaped format, not a color
+    // texture). If aSetupCourseEffectTextureDL's baked combine mode is
+    // two-cycle and actually references TEXEL1 for the PIT quad, DIRT's
+    // mask would blend into every PIT draw, which reads as a flat tan tint
+    // (from whatever constant color backs the other combine input) -- this
+    // is untested; log the combine id and which texel slots the combiner
+    // actually uses so one more race run can confirm or rule this out
+    // without touching the proven TMEM store/lookup path.
+    if (gGdxRaceActive != 0 && texel0Tile >= 1 && texel0Tile <= 4) {
+        static int sEffectDrawStateLogs = 0;
+        if (sEffectDrawStateLogs < 64) {
+            ++sEffectDrawStateLogs;
+            SPDLOG_ERROR("[effect-draw-state] tile0={} tile1={} cc_id={:#x} usedTex0={} usedTex1={} "
+                         "tile0_fmt={} tile0_siz={} tile0_cms={} tile0_cmt={} tile1_fmt={} tile1_siz={} "
+                         "tile1_cms={} tile1_cmt={} 2cyc={}",
+                         texel0Tile, texel1Tile, cc_id, comb->usedTextures[0], comb->usedTextures[1],
+                         mRdp->texture_tile[texel0Tile].fmt, mRdp->texture_tile[texel0Tile].siz,
+                         mRdp->texture_tile[texel0Tile].cms, mRdp->texture_tile[texel0Tile].cmt,
+                         mRdp->texture_tile[texel1Tile].fmt, mRdp->texture_tile[texel1Tile].siz,
+                         mRdp->texture_tile[texel1Tile].cms, mRdp->texture_tile[texel1Tile].cmt, use_2cyc);
+        }
+    }
 
     uint32_t tm = 0;
     uint32_t tex_width[2], tex_height[2], tex_width2[2], tex_height2[2];
@@ -2841,6 +3019,22 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
 
     struct GfxClipParameters clip_parameters = mRapi->GetClipParameters();
 
+    // B1 probe (revamp v2 spec, 2026-07-09): pit/heal strip UV probe. Facts:
+    // the texture imports correctly and draws single-cycle TEXEL0 RGBA16 wrap,
+    // yet the strip renders as a flat tan region with dash marks. Race-gated,
+    // tiles 1-4 only (the course-effect tiles: PIT/DIRT/DASH/ICE), first 24
+    // triangles. Logs per-vertex (s,t) after texture_scaling_factor scaling
+    // (the raw values GfxSpVertex wrote into d->u/d->v) plus the tile's
+    // uls/ult/lrs/lrt window and shifts, so a tan-flat draw shows whether the
+    // UVs collapsed to a point or landed outside the tile window. Own capped
+    // budget (triangle count), independent of every other probe in this file.
+    static int sPitUvProbeTris = 0;
+    const bool pitUvProbeThisTri = gGdxRaceActive != 0 && !is_rect && sPitUvProbeTris < 24 &&
+                                    effective_tile[0] >= 1 && effective_tile[0] <= 4;
+    if (pitUvProbeThisTri) {
+        ++sPitUvProbeTris;
+    }
+
     for (int i = 0; i < 3; i++) {
         float z = v_arr[i]->z, w = v_arr[i]->w;
         if (clip_parameters.z_is_from_0_to_1) {
@@ -2862,6 +3056,15 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
             uint32_t uv_tile = effective_tile[t];
             int shifts = mRdp->texture_tile[uv_tile].shifts;
             int shiftt = mRdp->texture_tile[uv_tile].shiftt;
+
+            if (pitUvProbeThisTri && t == 0) {
+                SPDLOG_ERROR("[pit-uv-probe] tri={} vtx={} tile={} s={} t={} uls={} ult={} lrs={} lrt={} "
+                             "shifts={} shiftt={}",
+                             sPitUvProbeTris, i, uv_tile, (int)v_arr[i]->u, (int)v_arr[i]->v,
+                             mRdp->texture_tile[uv_tile].uls, mRdp->texture_tile[uv_tile].ult,
+                             mRdp->texture_tile[uv_tile].lrs, mRdp->texture_tile[uv_tile].lrt, shifts, shiftt);
+            }
+
             if (shifts != 0) {
                 if (shifts <= 10) {
                     u /= 1 << shifts;
@@ -3447,6 +3650,22 @@ void Interpreter::StoreLoadedTexture(uint16_t tmemStart, const LoadedTexture& te
     constexpr uint32_t kTmemWordCount = 512;
     if (tmemStart >= kTmemWordCount) {
         return;
+    }
+
+    // TMEM trace (gated on the same env the SETTIMG race trace uses): pairs
+    // with the lookup log in ImportTexture so one run shows whether a render
+    // tile's tmem base finds the load that populated it.
+    // Live getenv (NOT static-once): the bridge exports GDX_DIAG_SETTIMG via _putenv at the
+    // first real GFX task, but boot VI-fallback frames import textures before that — a
+    // static-once read here freezes false forever (observed: store trace fired, lookup never).
+    const bool sTmemTrace = std::getenv("GDX_DIAG_SETTIMG") != nullptr;
+    if (sTmemTrace && gGdxRaceActive != 0) { // race-gated: boot stores ate the whole budget otherwise
+        static int sTmemStoreLogs = 0;
+        if (sTmemStoreLogs < 400) {
+            ++sTmemStoreLogs;
+            SPDLOG_ERROR("[tmem] store start={} sizeB={} origB={} addr={}", tmemStart,
+                         texture.size_bytes, texture.orig_size_bytes, fmt::ptr(texture.addr));
+        }
     }
 
     const uint32_t logicalSize = texture.orig_size_bytes != 0 ? texture.orig_size_bytes : texture.size_bytes;
@@ -6208,6 +6427,12 @@ void Interpreter::RunGuiOnly() {
     }
 }
 
+void (*Interpreter::sPortAfterClearHook)(Interpreter*) = nullptr;
+
+void Interpreter::SetPortAfterClearHook(void (*hook)(Interpreter*)) {
+    sPortAfterClearHook = hook;
+}
+
 void Interpreter::Run(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtx_replacements) {
     SpReset();
 
@@ -6224,6 +6449,19 @@ void Interpreter::Run(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtx_r
     mRdp->viewport_or_scissor_changed = true;
     mRenderingState.viewport = {};
     mRenderingState.scissor = {};
+
+    // PORT (G-Diffuser): seed hook runs on the freshly-cleared canvas, before the
+    // task's commands, so its content (the boot-logo CPU framebuffer) draws as a
+    // background under whatever this task renders. No-op when unregistered.
+    if (sPortAfterClearHook != nullptr) {
+        sPortAfterClearHook(this);
+        // The seed draws a full-frame copy-mode rectangle, which dirties the
+        // tracked viewport/scissor state; reset so the task's first command
+        // re-applies its own, exactly as it would on a clean clear.
+        mRdp->viewport_or_scissor_changed = true;
+        mRenderingState.viewport = {};
+        mRenderingState.scissor = {};
+    }
 
     auto dbg = mGfxDebugger;
     g_exec_stack.start((F3DGfx*)commands);

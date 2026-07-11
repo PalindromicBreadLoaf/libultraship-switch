@@ -125,6 +125,10 @@
     uniform float prim_depth;
     @end
 
+    @if(o_alpha_threshold)
+    uniform float alpha_compare_threshold;
+    @end
+
     uniform int texture_width[2];
     uniform int texture_height[2];
     uniform int texture_filtering[2];
@@ -276,7 +280,10 @@
 
         @if(o_alpha)
             @if(o_alpha_threshold)
-                if (texel.a < 8.0 / 256.0) discard;
+                // Real RDP G_AC_THRESHOLD rejects texels whose alpha is below the
+                // SETBLENDCOLOR alpha register (a fixed magic constant here would
+                // ignore the game's actual threshold, e.g. F-Zero X HUD cutouts).
+                if (texel.a < alpha_compare_threshold) discard;
             @end
             @if(o_invisible)
                 texel.a = 0.0;

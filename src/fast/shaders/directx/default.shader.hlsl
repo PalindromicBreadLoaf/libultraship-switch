@@ -105,6 +105,13 @@ cbuffer PerPrimDepthCB : register(b2) {
 }
 @end
 
+@if(o_alpha_threshold)
+cbuffer PerAlphaThresholdCB : register(b3) {
+    float alpha_compare_threshold;
+    float3 _pad2; // pad to 16-byte cbuffer alignment
+}
+@end
+
 PSInput VSMain(
     float4 position : POSITION
 @for(i in 0..2)
@@ -326,7 +333,10 @@ PSOutput PSMain(PSInput input, float4 screenSpace : SV_Position) {
 
     @if(o_alpha)
         @if(o_alpha_threshold)
-            if (texel.a < 8.0 / 256.0) discard;
+            // Real RDP G_AC_THRESHOLD rejects texels whose alpha is below the
+            // SETBLENDCOLOR alpha register (a fixed magic constant here would
+            // ignore the game's actual threshold, e.g. F-Zero X HUD cutouts).
+            if (texel.a < alpha_compare_threshold) discard;
         @end
         @if(o_invisible)
             texel.a = 0.0;

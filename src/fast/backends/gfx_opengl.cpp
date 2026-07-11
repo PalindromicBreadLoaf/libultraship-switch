@@ -63,6 +63,7 @@ void GfxRenderingAPIOGL::SetUniforms(ShaderProgram* prg) const {
 
 void GfxRenderingAPIOGL::SetPerDrawUniforms() {
     glUniform1f(mCurrentShaderProgram->prim_depth_location, mCurrentPrimDepth);
+    glUniform1f(mCurrentShaderProgram->alpha_compare_threshold_location, mCurrentAlphaCompareThreshold);
 
     if (mCurrentShaderProgram->usedTextures[0] || mCurrentShaderProgram->usedTextures[1]) {
         GLint filtering[2] = { textures[mCurrentTextureIds[0]].filtering, textures[mCurrentTextureIds[1]].filtering };
@@ -505,6 +506,7 @@ ShaderProgram* GfxRenderingAPIOGL::CreateAndLoadNewShader(uint64_t shader_id0, u
     prg->frameCountLocation = glGetUniformLocation(shader_program, "frame_count");
     prg->noiseScaleLocation = glGetUniformLocation(shader_program, "noise_scale");
     prg->prim_depth_location = glGetUniformLocation(shader_program, "prim_depth");
+    prg->alpha_compare_threshold_location = glGetUniformLocation(shader_program, "alpha_compare_threshold");
     prg->texture_width_location = glGetUniformLocation(shader_program, "texture_width");
     prg->texture_height_location = glGetUniformLocation(shader_program, "texture_height");
     prg->texture_filtering_location = glGetUniformLocation(shader_program, "texture_filtering");
@@ -617,6 +619,13 @@ void GfxRenderingAPIOGL::SetSamplerParameters(int tile, bool linear_filter, uint
 void GfxRenderingAPIOGL::SetDepthTestAndMask(bool depth_test, bool z_upd) {
     mCurrentDepthTest = depth_test;
     mCurrentDepthMask = z_upd;
+}
+
+void GfxRenderingAPIOGL::SetCurrentAlphaCompareThreshold(float threshold) {
+    // OpenGL re-sends this uniform unconditionally every draw via
+    // SetPerDrawUniforms(), so no dirty-flag gating is needed here (unlike
+    // D3D11's cbuffer, which is only re-uploaded when it changes).
+    mCurrentAlphaCompareThreshold = threshold;
 }
 
 void GfxRenderingAPIOGL::SetCurrentPrimDepth(float depth) {

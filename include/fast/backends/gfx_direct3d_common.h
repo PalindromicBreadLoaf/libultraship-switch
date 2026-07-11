@@ -32,6 +32,11 @@ struct PerPrimDepthCB {
     float _pad[3]; // 16-byte CB alignment
 };
 
+struct PerAlphaThresholdCB {
+    float alpha_compare_threshold;
+    float _pad[3]; // 16-byte CB alignment
+};
+
 struct Coord {
     int x, y;
 };
@@ -89,6 +94,7 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     void SetSamplerParameters(int sampler, bool linear_filter, uint32_t cms, uint32_t cmt) override;
     void SetDepthTestAndMask(bool depth_test, bool z_upd) override;
     void SetCurrentPrimDepth(float depth) override;
+    void SetCurrentAlphaCompareThreshold(float threshold) override;
     void SetZmodeDecal(bool decal) override;
     void SetViewport(int x, int y, int width, int height) override;
     void SetScissor(int x, int y, int width, int height) override;
@@ -142,6 +148,7 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     Microsoft::WRL::ComPtr<ID3D11Buffer> mPerFrameCb;
     Microsoft::WRL::ComPtr<ID3D11Buffer> mPerDrawCb;
     Microsoft::WRL::ComPtr<ID3D11Buffer> mPerPrimDepthCb;
+    Microsoft::WRL::ComPtr<ID3D11Buffer> mPerAlphaThresholdCb;
     Microsoft::WRL::ComPtr<ID3D11Buffer> mCoordBuffer;
     Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> mCoordBufferSrv;
     Microsoft::WRL::ComPtr<ID3D11Buffer> mDepthValueOutputBuffer;
@@ -159,6 +166,7 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     PerFrameCB mPerFrameCbData;
     PerDrawCB mPerDrawCbData;
     PerPrimDepthCB mPerPrimDepthCbData;
+    PerAlphaThresholdCB mPerAlphaThresholdCbData;
 
     std::map<std::pair<uint64_t, uint32_t>, struct ShaderProgramD3D11> mShaderProgramPool;
 
