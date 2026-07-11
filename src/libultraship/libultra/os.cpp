@@ -1,8 +1,10 @@
 #include "libultraship/libultraship.h"
 #include <SDL2/SDL.h>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <ratio>
+#include <vector>
 
 // Establish a chrono duration for the N64 46.875MHz clock rate
 typedef std::ratio<3000, 64> n64ClockRatio;
@@ -20,6 +22,12 @@ struct GdxDecompOSIoMesg {
     uint32_t size;
     OSPiHandle* piHandle;
 };
+
+/* Whole-file cartridge ROM image owned by the port layer (raw .z64 byte
+   stream, i.e. the exact cart byte order). Resolved when the executable
+   links this static library. */
+extern uint8_t* gdx_rom_buffer;
+extern size_t gdx_rom_size;
 
 int32_t osContInit(OSMesgQueue* mq, uint8_t* controllerBits, OSContStatus* status) {
     *controllerBits = 0;
@@ -90,7 +98,32 @@ int32_t osEPiStartDma(OSPiHandle* pihandle, OSIoMesg* mb, int32_t direction) {
         decompMesg->piHandle = pihandle;
 
         if (direction == OS_READ && decompMesg->dramAddr != nullptr && decompMesg->size != 0) {
-            memset(decompMesg->dramAddr, 0, decompMesg->size);
+            /* Service cartridge reads from the loaded ROM image. devAddr is a
+               physical cart address (0x10000000-based) or a plain ROM offset;
+               masking covers both. Audio sample banks stream through here as
+               the default AudioLoad DMA handler — zero-filling them produced
+               fully silent synthesis output. Out-of-range requests keep the
+               old zero-fill so callers still see deterministic contents. */
+            const uint32_t romOffset = decompMesg->devAddr & 0x0FFFFFFFu;
+            const uint64_t end = static_cast<uint64_t>(romOffset) + decompMesg->size;
+            if (gdx_rom_buffer != nullptr && end <= gdx_rom_size) {
+                memcpy(decompMesg->dramAddr, gdx_rom_buffer + romOffset, decompMesg->size);
+            } else {
+                memset(decompMesg->dramAddr, 0, decompMesg->size);
+                static int sEpiZeroLogs = 0;
+                if (sEpiZeroLogs < 8) {
+                    sEpiZeroLogs++;
+                    /* Plain fopen for the same sharing reason as the [ai-sink]
+                       probe below — fopen_s made this probe silently dead, which
+                       falsely "exonerated" sample-bank zero-fills. */
+                    FILE* lf = fopen("gdiffuser-run.log", "a");
+                    if (lf != nullptr) {
+                        fprintf(lf, "[epi] zero-fill devAddr=%08X size=%u romSize=%zu\n",
+                                decompMesg->devAddr, decompMesg->size, gdx_rom_size);
+                        fclose(lf);
+                    }
+                }
+            }
         }
 
         if (decompMesg->hdr.retQueue != nullptr) {
@@ -100,6 +133,12 @@ int32_t osEPiStartDma(OSPiHandle* pihandle, OSIoMesg* mb, int32_t direction) {
 
     return 0;
 }
+
+// Phase 3 (port/gdx_audio_thread.cpp): queried below without a header include -- this file is
+// compiled as part of the libultraship target, which has no include path onto port/. Same
+// cross-module extern-declaration-without-header pattern already used elsewhere in this port
+// (e.g. port/n64_sched.c's own forward declaration of gdx_audio_hle_run).
+extern "C" int gdx_audio_thread_active(void);
 
 uint32_t osAiGetLength() {
     // R7 (audio slice): real hardware returns the byte count still queued in the AI FIFO.
@@ -114,7 +153,44 @@ uint32_t osAiGetLength() {
     if (player == nullptr || !player->IsInitialized()) {
         return 0;
     }
-    return (uint32_t)player->Buffered() * 4;
+    // Host jitter cushion: the game's adaptive fill (thread.c,
+    // samplesRemainingInAi) targets the console AI FIFO depth — roughly one
+    // 60Hz frame (~17ms) of audio. SDL pulls 1024-frame chunks and Windows
+    // scheduling adds multi-ms jitter, so a 17ms cushion dips to empty
+    // constantly; every dip plays as an audible silence hole (measured: 725
+    // holes of ~10ms in a 113s capture). Under-report the queued amount so
+    // the game's own fill math settles at target + cushion instead. 2048
+    // frames = 64ms at 32kHz; must stay well under SDLAudioPlayer::DoPlay's
+    // drop threshold. Tunable via GDX_AI_CUSHION (frames).
+    //
+    // Phase 3 (port/gdx_audio_thread.cpp): this cushion only papered over ordinary host
+    // scheduling jitter for the legacy per-VI-tick fiber producer, which has no independent
+    // catch-up mechanism of its own — it could never survive a real stall (a long synchronous
+    // game-thread load blocks that same fiber outright; measured up to ~131ms hitches, far
+    // longer than any cushion could cover). The dedicated audio thread replaces this with a
+    // real catch-up loop (`while (Buffered() < DesiredBuffered) produce()`, driven off the
+    // ACTUAL buffered amount) that is immune to game-thread stalls by construction (real OS
+    // thread, not a fiber sharing the stalled thread) — under-reporting here would just make
+    // it over-produce for no reason. Report honestly whenever the dedicated thread is active;
+    // restore the exact old under-report cushion when the kill switch (GDX_AUDIO_THREAD=0)
+    // reverts to the fiber path, so that path's behavior is completely unchanged for a clean
+    // A/B comparison.
+    static int32_t sCushionFrames = -1;
+    if (sCushionFrames < 0) {
+        if (gdx_audio_thread_active()) {
+            sCushionFrames = 0;
+        } else {
+            sCushionFrames = 2048;
+            if (const char* env = std::getenv("GDX_AI_CUSHION")) {
+                const long v = std::strtol(env, nullptr, 10);
+                if (v >= 0 && v <= 4096) {
+                    sCushionFrames = (int32_t)v;
+                }
+            }
+        }
+    }
+    const int32_t buffered = (int32_t)player->Buffered() - sCushionFrames;
+    return buffered > 0 ? (uint32_t)buffered * 4 : 0;
 }
 
 int32_t osAiSetNextBuffer(void* buff, size_t len) {
@@ -131,36 +207,137 @@ int32_t osAiSetNextBuffer(void* buff, size_t len) {
     auto audio = Ship::Context::GetInstance() != nullptr ? Ship::Context::GetInstance()->GetAudio() : nullptr;
     std::shared_ptr<Ship::AudioPlayer> player = audio != nullptr ? audio->GetAudioPlayer() : nullptr;
 
+    // Hoisted out of the diagnostics block below (which computes it) so the
+    // underrun-resilience fallback further down can reuse it without a second
+    // full-buffer scan.
+    bool allZero = true;
+
     // TEMP one-shot diagnostics (audio-silence triage): distinguishes the three
     // failure sites in one run — no [ai] lines = submission never happens;
     // zero=1 = interpreter produced silence (input side); zero=0 but no sound =
     // SDL output side. Appends to the same log the port writes. Remove once
     // audio is confirmed audible.
     {
+        // Boot-window-only logging hid the steady state (music starts well after
+        // the first frames). Keep the first 6 lines AND emit a periodic summary
+        // with the running nonzero-buffer count so any run's tail answers
+        // "did real waveforms EVER reach the device".
         static int sAiDiag = 0;
-        if (sAiDiag < 6) {
-            ++sAiDiag;
-            bool allZero = true;
-            const uint8_t* p = static_cast<const uint8_t*>(buff);
-            for (size_t k = 0; k < len; k++) {
-                if (p[k] != 0) {
-                    allZero = false;
-                    break;
-                }
+        static uint32_t sAiTotal = 0;
+        static uint32_t sAiNonZero = 0;
+        const uint8_t* p = static_cast<const uint8_t*>(buff);
+        for (size_t k = 0; k < len; k++) {
+            if (p[k] != 0) {
+                allZero = false;
+                break;
+            }
+        }
+        sAiTotal++;
+        if (!allZero) {
+            sAiNonZero++;
+        }
+        if (sAiDiag < 6 || (sAiTotal & 511u) == 0u) {
+            if (sAiDiag < 6) {
+                ++sAiDiag;
             }
             FILE* f = fopen("gdiffuser-run.log", "ab");
             if (f != nullptr) {
-                fprintf(f, "[ai] submit #%d len=%zu zero=%d player=%d init=%d\n", sAiDiag, len, allZero ? 1 : 0,
-                        player != nullptr ? 1 : 0, (player != nullptr && player->IsInitialized()) ? 1 : 0);
+                fprintf(f, "[ai] submit #%u len=%zu zero=%d nonzeroTotal=%u player=%d init=%d\n", sAiTotal, len,
+                        allZero ? 1 : 0, sAiNonZero, player != nullptr ? 1 : 0,
+                        (player != nullptr && player->IsInitialized()) ? 1 : 0);
                 fclose(f);
             }
         }
     }
 
+    // AI buffer underrun resilience: when the GAME thread runs a long
+    // synchronous operation (course/segment asset loads, large mio0
+    // decompresses) without yielding, the cooperative fiber scheduler can't
+    // run the AUDIO fiber for that whole stretch (see port/n64_sched.c and
+    // the engram discovery 'long-sync-load-audio-starve') -- AudioSynth_Update
+    // never got a chance to build a real command list for the missed tick(s),
+    // so the buffer reaching us here comes through all-zero. That was
+    // measured directly in gdiffuser-ai-tap.pcm as repeating few-ms silence
+    // bursts during course loads. Emitting that silence verbatim is an
+    // audible drop-out/click on the real device; repeat the last buffer that
+    // actually had audio in it instead, halving its gain on each consecutive
+    // miss so a longer stall decays toward true silence rather than looping
+    // one snippet at full volume forever. This is a resilience measure, not a
+    // fix for the underlying starvation -- the cooperative yields added to
+    // Dma_LoadAssets (decomp/src/sys/dma.c) and mio0_decode
+    // (torch/lib/libmio0/mio0.c) address that; this only softens whatever
+    // underrun still slips through.
+    static std::vector<uint8_t> sLastGoodAiBuffer;
+    static uint32_t sConsecutiveZeroAiBuffers = 0;
+    std::vector<uint8_t> fadedSubstitute;
+    const uint8_t* playBuf = static_cast<const uint8_t*>(buff);
+    size_t playLen = len;
+
+    // Gate this hack off when the dedicated audio thread (Phase 3, gdx_audio_thread.cpp) is
+    // driving playback. It predates that thread: it exists to paper over the cooperative fiber
+    // scheduler starving the AUDIO fiber during a long synchronous game-thread load, which left
+    // AudioSynth_Update no chance to build a real command list for the missed tick(s) -- see the
+    // comment block above. The dedicated thread does not share that starvation mode (it owns its
+    // own timing independent of the game/fiber scheduler), so an all-zero buffer reaching this
+    // function under the thread is a LEGITIMATE silence (e.g. no BGM/SFX playing between menu
+    // sounds), not an underrun. Substituting a decaying copy of whatever old audio last played
+    // turns that legitimate silence into audible ghost notes/beeps -- exactly the intermittent
+    // "beeps/crackles" symptom reported with the thread on. Skip the substitution entirely in
+    // that mode; just play the true (silent) buffer. NOTE: the "last good buffer" bookkeeping
+    // below is keyed on `!allZero` (not on this gate), so a gated-off all-zero buffer neither
+    // resets the miss counter nor overwrites the cached "last good" audio with silence -- if the
+    // thread is ever disabled at runtime (kill switch), the fallback still has real audio to
+    // decay from instead of a cache poisoned by legitimate silence.
+    const bool substituteFade = allZero && !gdx_audio_thread_active();
+    if (substituteFade) {
+        if (!sLastGoodAiBuffer.empty() && sLastGoodAiBuffer.size() == len && (len % sizeof(int16_t)) == 0) {
+            ++sConsecutiveZeroAiBuffers;
+            // shift 1 => half gain, 2 => quarter, ... capped so it fully
+            // decays to zero (int16 >> 16 is well-defined here, not UB, since
+            // the shift amount is clamped below 16) rather than looping
+            // forever at an audible volume during a very long stall.
+            const uint32_t shift = sConsecutiveZeroAiBuffers > 15u ? 15u : sConsecutiveZeroAiBuffers;
+            fadedSubstitute.resize(len);
+            const int16_t* src = reinterpret_cast<const int16_t*>(sLastGoodAiBuffer.data());
+            int16_t* dst = reinterpret_cast<int16_t*>(fadedSubstitute.data());
+            const size_t numSamples = len / sizeof(int16_t);
+            for (size_t s = 0; s < numSamples; s++) {
+                dst[s] = static_cast<int16_t>(src[s] >> shift);
+            }
+            playBuf = fadedSubstitute.data();
+            playLen = fadedSubstitute.size();
+        }
+    }
+    if (!allZero) {
+        sConsecutiveZeroAiBuffers = 0;
+        if (sLastGoodAiBuffer.size() != len) {
+            sLastGoodAiBuffer.resize(len);
+        }
+        std::memcpy(sLastGoodAiBuffer.data(), buff, len);
+    }
+
     if (player == nullptr || !player->IsInitialized()) {
         return 0;
     }
-    player->Play(static_cast<const uint8_t*>(buff), len);
+    // GDX_AI_TAP=1: append every buffer actually handed to the device to
+    // gdiffuser-ai-tap.pcm (s16 interleaved stereo, host byte order) for offline
+    // waveform analysis. Captures playBuf (post-substitution), i.e. exactly what
+    // the listener hears.
+    {
+        static int sTapMode = -1;
+        if (sTapMode == -1) {
+            const char* e = getenv("GDX_AI_TAP");
+            sTapMode = (e != nullptr && e[0] == '1') ? 1 : 0;
+        }
+        if (sTapMode == 1) {
+            FILE* tf = fopen("gdiffuser-ai-tap.pcm", "ab");
+            if (tf != nullptr) {
+                fwrite(playBuf, 1, playLen, tf);
+                fclose(tf);
+            }
+        }
+    }
+    player->Play(playBuf, playLen);
     return 0;
 }
 

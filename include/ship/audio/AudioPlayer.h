@@ -12,7 +12,11 @@ namespace Ship {
  * @brief Configuration parameters shared by all AudioPlayer backends.
  */
 struct AudioSettings {
-    int32_t SampleRate = 44100;     ///< Output sample rate in Hz.
+    /// Output sample rate in Hz. This fork feeds the device the N64 AI
+    /// stream directly (osAiSetNextBuffer, no resampling), and F-Zero X
+    /// synthesizes at 32000 Hz - a 44100 Hz device plays everything ~38%
+    /// fast and high-pitched and drains faster than the game produces.
+    int32_t SampleRate = 32000;
     int32_t SampleLength = 1024;    ///< Number of samples per audio frame.
     int32_t DesiredBuffered = 2480; ///< Target number of frames to keep buffered.
     AudioChannelsSetting ChannelSetting =
