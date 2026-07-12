@@ -1,5 +1,6 @@
 #include "libultraship/libultraship.h"
 #include <SDL2/SDL.h>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -319,22 +320,109 @@ int32_t osAiSetNextBuffer(void* buff, size_t len) {
     if (player == nullptr || !player->IsInitialized()) {
         return 0;
     }
-    // GDX_AI_TAP=1: append every buffer actually handed to the device to
-    // gdiffuser-ai-tap.pcm (s16 interleaved stereo, host byte order) for offline
-    // waveform analysis. Captures playBuf (post-substitution), i.e. exactly what
-    // the listener hears.
+    // AI output tap (grain investigation): write every buffer handed to the device to
+    // gdiffuser-ai-tap.pcm (s16 interleaved stereo, host byte order) -- exactly what the
+    // listener hears (playBuf, post-substitution). DEFAULT ON with truncate-on-boot: the
+    // env-var gate proved unreliable in the owner's shell, so this always produces a
+    // FRESH capture each run (first write truncates), capped at ~120s so the file stays
+    // bounded. GDX_NO_AI_TAP=1 disables it once the grain is solved.
     {
         static int sTapMode = -1;
+        static long sTapBytes = 0;
+        static const long kTapCapBytes = 120L * 32000L * 4L; /* ~120s stereo s16 */
         if (sTapMode == -1) {
-            const char* e = getenv("GDX_AI_TAP");
-            sTapMode = (e != nullptr && e[0] == '1') ? 1 : 0;
+            const char* off = getenv("GDX_NO_AI_TAP");
+            sTapMode = (off != nullptr && off[0] == '1') ? 0 : 1;
+            if (sTapMode == 1) {
+                FILE* tf = fopen("gdiffuser-ai-tap.pcm", "wb"); /* truncate: fresh per run */
+                if (tf != nullptr) {
+                    fclose(tf);
+                }
+            }
         }
-        if (sTapMode == 1) {
+        if (sTapMode == 1 && sTapBytes < kTapCapBytes) {
             FILE* tf = fopen("gdiffuser-ai-tap.pcm", "ab");
             if (tf != nullptr) {
                 fwrite(playBuf, 1, playLen, tf);
                 fclose(tf);
+                sTapBytes += (long)playLen;
             }
+        }
+    }
+    // Output reconstruction low-pass (matches the N64 audio DAC's output-stage rolloff
+    // that accurate emulation models but a raw HLE pipeline omits -- the reference diff
+    // measured +7.4dB of excess HF imaging near Nyquist that this removes). 4th-order
+    // Butterworth (two cascaded biquads, RBJ cookbook) -- steep, no ringing, midrange
+    // untouched. DEFAULT ON at 15kHz -- a gentle near-Nyquist rolloff chosen by listening
+    // test: LLE audio removed the grain outright, so this only tames the top ~1kHz sliver
+    // to match the console's analog reconstruction stage (11kHz was the HLE-era band-aid).
+    // gdx-audio-lowpass.txt overrides the cutoff (a number in Hz) or disables it entirely
+    // (contents "0" or "off"). Applied to a COPY so the AI tap upstream stays raw for analysis.
+    {
+        static int sInit = 0;
+        static int sEnabled = 0;
+        static double sB[2][3], sA[2][2];      /* [section]{b0,b1,b2}, {a1,a2} (a0 normalized) */
+        static double sZ[2][2][2];             /* [channel][section]{x/y history} -> use DF2T state */
+        static std::vector<int16_t> sBuf;
+        if (!sInit) {
+            sInit = 1;
+            int hz = 15000;
+            FILE* cf = fopen("gdx-audio-lowpass.txt", "r");
+            if (cf != nullptr) {
+                char t[32] = { 0 };
+                if (fscanf(cf, "%31s", t) == 1) {
+                    if (t[0] == 'o' /*off*/ || (t[0] == '0' && t[1] == '\0')) {
+                        hz = 0;
+                    } else {
+                        int v = atoi(t);
+                        if (v > 500 && v < 16000) hz = v;
+                    }
+                }
+                fclose(cf);
+            }
+            sEnabled = (hz > 0) ? 1 : 0;
+            if (sEnabled) {
+                const double kPi = 3.14159265358979323846;
+                const double w0 = 2.0 * kPi * (double)hz / 32000.0;
+                const double cw = std::cos(w0), sw = std::sin(w0);
+                const double Q[2] = { 0.54119610, 1.30656296 }; /* 4th-order Butterworth section Qs */
+                for (int s = 0; s < 2; s++) {
+                    double alpha = sw / (2.0 * Q[s]);
+                    double a0 = 1.0 + alpha;
+                    sB[s][0] = ((1.0 - cw) / 2.0) / a0;
+                    sB[s][1] = (1.0 - cw) / a0;
+                    sB[s][2] = ((1.0 - cw) / 2.0) / a0;
+                    sA[s][0] = (-2.0 * cw) / a0;
+                    sA[s][1] = (1.0 - alpha) / a0;
+                }
+                memset(sZ, 0, sizeof(sZ));
+            }
+            FILE* lf = fopen("gdiffuser-run.log", "ab");
+            if (lf != nullptr) {
+                fprintf(lf, "[audio] output reconstruction LP: %s (cutoff %dHz, 4th-order Butterworth)\n",
+                        sEnabled ? "ON" : "OFF", hz);
+                fclose(lf);
+            }
+        }
+        if (sEnabled && (playLen % 4) == 0) {
+            const size_t frames = playLen / 4;
+            sBuf.resize(frames * 2);
+            const int16_t* src = reinterpret_cast<const int16_t*>(playBuf);
+            for (int ch = 0; ch < 2; ch++) {
+                for (size_t i = 0; i < frames; i++) {
+                    double x = (double)src[2 * i + ch];
+                    for (int s = 0; s < 2; s++) { /* transposed direct form II */
+                        double y = sB[s][0] * x + sZ[ch][s][0];
+                        sZ[ch][s][0] = sB[s][1] * x - sA[s][0] * y + sZ[ch][s][1];
+                        sZ[ch][s][1] = sB[s][2] * x - sA[s][1] * y;
+                        x = y;
+                    }
+                    long v = (long)(x >= 0 ? x + 0.5 : x - 0.5);
+                    if (v > 32767) v = 32767; else if (v < -32768) v = -32768;
+                    sBuf[2 * i + ch] = (int16_t)v;
+                }
+            }
+            playBuf = reinterpret_cast<const uint8_t*>(sBuf.data());
         }
     }
     player->Play(playBuf, playLen);
