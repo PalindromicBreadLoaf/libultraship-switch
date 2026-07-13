@@ -1,4 +1,5 @@
 #include "libultraship/libultraship.h"
+#include "libultraship/bridge/consolevariablebridge.h" /* CVarGetInteger: live audio low-pass cutoff */
 #include <SDL2/SDL.h>
 #include <cmath>
 #include <cstdio>
@@ -359,27 +360,21 @@ int32_t osAiSetNextBuffer(void* buff, size_t len) {
     // gdx-audio-lowpass.txt overrides the cutoff (a number in Hz) or disables it entirely
     // (contents "0" or "off"). Applied to a COPY so the AI tap upstream stays raw for analysis.
     {
-        static int sInit = 0;
+        static int sLastHz = -1;               /* -1 = not yet configured */
         static int sEnabled = 0;
         static double sB[2][3], sA[2][2];      /* [section]{b0,b1,b2}, {a1,a2} (a0 normalized) */
         static double sZ[2][2][2];             /* [channel][section]{x/y history} -> use DF2T state */
         static std::vector<int16_t> sBuf;
-        if (!sInit) {
-            sInit = 1;
-            int hz = 15000;
-            FILE* cf = fopen("gdx-audio-lowpass.txt", "r");
-            if (cf != nullptr) {
-                char t[32] = { 0 };
-                if (fscanf(cf, "%31s", t) == 1) {
-                    if (t[0] == 'o' /*off*/ || (t[0] == '0' && t[1] == '\0')) {
-                        hz = 0;
-                    } else {
-                        int v = atoi(t);
-                        if (v > 500 && v < 16000) hz = v;
-                    }
-                }
-                fclose(cf);
-            }
+        /* Live cutoff from the ImGui Audio tab (F1 > Audio): gEnhancements.Audio.LowPassHz
+         * (Hz; 0 = off; default 15000). Read each buffer on the audio thread (benign int race
+         * with the menu); recompute the Butterworth coefficients ONLY when the value changes
+         * (rare, on a menu edit). The filter history sZ is intentionally kept across a change so
+         * moving the slider does not click. */
+        int hz = CVarGetInteger("gEnhancements.Audio.LowPassHz", 15000);
+        if (hz < 0) { hz = 0; }
+        if (hz >= 16000) { hz = 15999; }
+        if (hz != sLastHz) {
+            sLastHz = hz;
             sEnabled = (hz > 0) ? 1 : 0;
             if (sEnabled) {
                 const double kPi = 3.14159265358979323846;
@@ -395,7 +390,6 @@ int32_t osAiSetNextBuffer(void* buff, size_t len) {
                     sA[s][0] = (-2.0 * cw) / a0;
                     sA[s][1] = (1.0 - alpha) / a0;
                 }
-                memset(sZ, 0, sizeof(sZ));
             }
             FILE* lf = fopen("gdiffuser-run.log", "ab");
             if (lf != nullptr) {
@@ -423,6 +417,45 @@ int32_t osAiSetNextBuffer(void* buff, size_t len) {
                 }
             }
             playBuf = reinterpret_cast<const uint8_t*>(sBuf.data());
+        }
+    }
+    // Master volume (FINAL output stage). CVar gEnhancements.Audio.MasterVolume (0..100, default
+    // 100), registered by the port's GdxMenuBar ctor. Read live each buffer on the audio thread --
+    // exactly the low-pass's pattern above -- so a menu edit applies without a restart (a benign int
+    // race with the main-thread ImGui write: worst case one buffer sees the old value). Placed AFTER
+    // the reconstruction low-pass so gain is the very last thing done to the PCM before the device.
+    //
+    // BIT-EXACT BY DEFAULT: at vol==100 the multiply is skipped ENTIRELY, so playBuf is left
+    // untouched and a fresh config is sample-for-sample identical to today. Applied to a COPY (its
+    // own static scratch vector) reading from playBuf and repointing it -- it never mutates the raw
+    // AI tap upstream (the gdiffuser-ai-tap.pcm capture above stays raw) nor the low-pass buffer in
+    // place. Guarded on (playLen % 4)==0 like the low-pass so a ragged length is never misread as
+    // whole stereo s16 frames.
+    {
+        static std::vector<int16_t> sVolBuf;
+        int vol = CVarGetInteger("gEnhancements.Audio.MasterVolume", 100);
+        if (vol < 0) {
+            vol = 0;
+        }
+        if (vol > 100) {
+            vol = 100;
+        }
+        if (vol != 100 && (playLen % 4) == 0) {
+            const size_t samples = playLen / sizeof(int16_t); /* interleaved stereo s16 */
+            sVolBuf.resize(samples);
+            const int16_t* src = reinterpret_cast<const int16_t*>(playBuf);
+            const double gain = (double)vol / 100.0;
+            for (size_t s = 0; s < samples; s++) {
+                double scaled = (double)src[s] * gain;
+                long v = (long)(scaled >= 0 ? scaled + 0.5 : scaled - 0.5); /* round half away from 0 */
+                if (v > 32767) {
+                    v = 32767;
+                } else if (v < -32768) {
+                    v = -32768;
+                }
+                sVolBuf[s] = (int16_t)v;
+            }
+            playBuf = reinterpret_cast<const uint8_t*>(sVolBuf.data());
         }
     }
     player->Play(playBuf, playLen);

@@ -428,6 +428,23 @@ void Fast3dGui::DrawGame() {
             size = ImVec2(float(mInterpreter.lock()->mCurDimensions.width) * factor,
                           float(mInterpreter.lock()->mCurDimensions.height) * factor);
         }
+    } else if (Ship::Context::GetInstance()->GetConsoleVariables()->GetInteger("gEnhancements.Graphics.Widescreen",
+                                                                               1) == 0) {
+        // 4:3 pillarbox (gEnhancements.Graphics.Widescreen == 0). With widescreen disabled the game
+        // framebuffer holds native-proportion content stretched to the window's aspect, because
+        // Interpreter::AdjXForAspectRatio returns x unchanged. Drawing that full-width framebuffer
+        // into a centred 4:3 rect compresses it back to native proportions; the cleared window
+        // background then forms the side bars. Falls back to letterbox if the window is narrower
+        // than 4:3. Interpreter::StartFrame forces the offscreen render target this relies on.
+        const float targetAspect = 4.0f / 3.0f;
+        float sWdth = size.y * targetAspect;
+        float sHght = size.y;
+        if (sWdth > size.x) { // window narrower than 4:3 -> letterbox instead of pillarbox
+            sWdth = size.x;
+            sHght = size.x / targetAspect;
+        }
+        pos = ImVec2(floor((size.x - sWdth) / 2.0f), floor((size.y - sHght) / 2.0f));
+        size = ImVec2(sWdth, sHght);
     }
     uintptr_t fb = Ship::Context::GetInstance()->GetWindow()->GetGfxFrameBuffer();
     if (fb) {

@@ -38,6 +38,7 @@
 #include "ship/config/ConsoleVariable.h"
 
 #include "libultraship/libultra/os.h"
+#include "libultraship/bridge/consolevariablebridge.h" // CVarGetInteger: live widescreen toggle
 
 #include <spdlog/fmt/fmt.h>
 
@@ -1708,6 +1709,38 @@ void Interpreter::ImportTexture(int i, int tile, bool importReplacement) {
     }
     key.line_size_bytes = mRdp->loaded_texture[tmemIdex].line_size_bytes;
     key.full_image_line_size_bytes = mRdp->loaded_texture[tmemIdex].full_image_line_size_bytes;
+
+    // CI palette-content hash (opt-in: GDX_CI_PALETTE_HASH). MASTER_SCOPE Track B,
+    // "frozen menu fades" half: the CI key above carries the palette DRAM ADDRESS
+    // (palette_addrs), which distinguishes different palettes but NOT an in-place
+    // fade that rewrites the palette CONTENT at the same address every frame -- so
+    // the fade returns the stale decode and freezes. Fold the bound TLUT's bytes
+    // into the key (same pattern as tmem_content_hash for RGBA16) so a content
+    // change misses the cache and re-decodes. Hash the fixed palette_staging
+    // buffers (always 256 bytes, always readable), never a raw DRAM pointer, so
+    // it can never fault. Disabled by default: with the env unset the field stays
+    // 0 for every key, leaving the proven CI path byte-for-byte unchanged -- the
+    // safe way to re-add this in isolation without risking the race CI regression
+    // the earlier combined attempt caused.
+    static const bool sCiPaletteHash = std::getenv("GDX_CI_PALETTE_HASH") != nullptr;
+    if (sCiPaletteHash && fmt == G_IM_FMT_CI) {
+        uint32_t palHash = 2166136261u;
+        const auto foldPalette = [&palHash](const uint8_t* pal) {
+            for (uint32_t b = 0; b < 256u; b++) {
+                palHash = (palHash ^ pal[b]) * 16777619u;
+            }
+        };
+        if (siz == G_IM_SIZ_4b) {
+            // CI4 uses one 16-entry palette; paletteIndex/8 selects the staging half
+            // the key's palette_addrs already references.
+            foldPalette(mRdp->palette_staging[(paletteIndex / 8) & 1]);
+        } else {
+            // CI8 spans both palette halves.
+            foldPalette(mRdp->palette_staging[0]);
+            foldPalette(mRdp->palette_staging[1]);
+        }
+        key.palette_content_hash = palHash;
+    }
     const uint32_t cacheTileWidth =
         mRdp->texture_tile[tile].lrs >= mRdp->texture_tile[tile].uls
             ? (mRdp->texture_tile[tile].lrs - mRdp->texture_tile[tile].uls + 4u) / 4u
@@ -1996,6 +2029,15 @@ float Interpreter::AdjXForAspectRatio(float x) const {
         (!mActiveFrameBuffer->second.resize || mActiveFrameBuffer->second.forceFixedAspect)) {
         return x;
     } else {
+        // gEnhancements.Graphics.Widescreen: default 1 (ON) reproduces the current shipping
+        // behaviour - the hor+ aspect correction that keeps 3D proportions correct at any
+        // window aspect. When set to 0, skip the correction (return x unchanged) so the game
+        // renders at native proportions; Fast3dGui::DrawGame then composites the frame into a
+        // centred 4:3 pillarbox, and Interpreter::StartFrame forces an offscreen render target
+        // so that composite target always exists. Read live each call so the toggle is instant.
+        if (CVarGetInteger("gEnhancements.Graphics.Widescreen", 1) == 0) {
+            return x;
+        }
         return x * (4.0f / 3.0f) / ((float)mCurDimensions.width / (float)mCurDimensions.height);
     }
 }
@@ -6363,9 +6405,17 @@ void Interpreter::StartFrame() {
 
     mPrvDimensions = mCurDimensions;
     mPrevNativeDimensions = mNativeDimensions;
-    if (!ViewportMatchesRendererResolution() || mMsaaLevel > 1) {
+    // gEnhancements.Graphics.Widescreen == 0 renders the game at native proportions and lets
+    // Fast3dGui::DrawGame pillarbox it into a centred 4:3 sub-region. That compositor needs the
+    // frame in an offscreen texture (mGfxFrameBuffer), so force an offscreen render target while
+    // the pillarbox is active - even at 1x internal resolution with no MSAA, where the game would
+    // otherwise render straight to the window and expose no composite target. Inert at the default
+    // (Widescreen == 1): widescreenPillarbox is false, so both conditions below are unchanged and
+    // the original render path is preserved byte-for-byte.
+    const bool widescreenPillarbox = CVarGetInteger("gEnhancements.Graphics.Widescreen", 1) == 0;
+    if (!ViewportMatchesRendererResolution() || mMsaaLevel > 1 || widescreenPillarbox) {
         mRendersToFb = true;
-        if (!ViewportMatchesRendererResolution()) {
+        if (!ViewportMatchesRendererResolution() || (widescreenPillarbox && mMsaaLevel <= 1)) {
             mRapi->UpdateFramebufferParameters(mGameFb, mCurDimensions.width, mCurDimensions.height, mMsaaLevel, true,
                                                true, true, true);
         } else {

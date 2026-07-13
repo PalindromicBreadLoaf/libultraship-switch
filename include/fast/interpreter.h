@@ -200,6 +200,17 @@ struct TextureCacheKey {
     // from bypassing the TMEM decode.
     uint32_t tmem_content_hash = 0;
 
+    // Content hash of the CI palette (TLUT) currently bound for this draw.
+    // The CI key already carries palette_addrs (the DRAM source ADDRESS), which
+    // distinguishes the same texture drawn with different palettes -- but a menu
+    // fade rewrites the palette CONTENT in place at the SAME address every frame,
+    // so an address-only key returns the stale decode and the fade freezes.
+    // Hashing the bound palette content makes an in-place fade miss the cache and
+    // re-decode. Left 0 (disabled) unless GDX_CI_PALETTE_HASH is set, so the
+    // proven default path is untouched until this is validated (MASTER_SCOPE
+    // Track B: re-add the palette-content cache key alone and test separately).
+    uint32_t palette_content_hash = 0;
+
     bool operator==(const TextureCacheKey&) const noexcept = default;
 
     struct Hasher {
