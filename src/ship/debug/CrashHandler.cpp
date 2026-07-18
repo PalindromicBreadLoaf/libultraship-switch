@@ -139,7 +139,16 @@ void CrashHandler::PrintRegisters(ucontext_t* ctx) {
 }
 
 static void ErrorHandler(int sig, siginfo_t* sigInfo, void* data) {
-    std::shared_ptr<CrashHandler> crashHandler = Context::GetInstance()->GetCrashHandler();
+    // A signal during ~Context finds GetInstance() empty; dereferencing it here nested a
+    // second fault inside the handler. With no live handler, fall straight through to the
+    // default disposition so the kernel still produces a core.
+    auto instance = Context::GetInstance();
+    std::shared_ptr<CrashHandler> crashHandler = (instance != nullptr) ? instance->GetCrashHandler() : nullptr;
+    if (crashHandler == nullptr) {
+        signal(sig, SIG_DFL);
+        raise(sig);
+        return;
+    }
     char intToCharBuffer[16];
 
     std::array<void*, 4096> arr;
@@ -191,16 +200,23 @@ static void ErrorHandler(int sig, siginfo_t* sigInfo, void* data) {
         WRITE_VAR_LINE(crashHandler, intToCharBuffer, functionName.c_str());
     }
     SDL_ShowSimpleMessageBox(
-        SDL_MESSAGEBOX_ERROR, (Context::GetInstance()->GetName() + " has crashed").c_str(),
-        (Context::GetInstance()->GetName() + " has crashed. Please open an issue with the logs on the GitHub repository.")
-            .c_str(),
+        SDL_MESSAGEBOX_ERROR, (instance->GetName() + " has crashed").c_str(),
+        (instance->GetName() + " has crashed. Please open an issue with the logs on the GitHub repository.").c_str(),
         nullptr);
     free(symbols);
     crashHandler->PrintCommon();
 
-    Context::GetInstance()->GetLogger()->flush();
+    if (instance->GetLogger() != nullptr) {
+        instance->GetLogger()->flush();
+    }
     spdlog::shutdown();
-    exit(1);
+    // Re-raise with the default disposition instead of exit(1): exit() discards the
+    // kernel/systemd-coredump capture, and the in-process backtrace above is
+    // unreliable on fiber stacks — several crashes were undiagnosable because the
+    // only artifact was this handler's truncated trace. Restoring the default
+    // handler and re-raising preserves the log AND produces a real core.
+    signal(sig, SIG_DFL);
+    raise(sig);
 }
 
 static void ShutdownHandler(int sig, siginfo_t* sigInfo, void* data) {
@@ -420,17 +436,23 @@ extern "C" LONG WINAPI seh_filter(PEXCEPTION_POINTERS ex) {
     }
 
     char exceptionString[20];
-    std::shared_ptr<CrashHandler> crashHandler = Context::GetInstance()->GetCrashHandler();
+    // The crash may fire during ~Context (e.g. a message pumped by DestroyWindow), when
+    // GetInstance() returns an empty shared_ptr — dereferencing it here turned every
+    // teardown fault into a nested crash-in-crash. Degrade to the raw stderr/file line
+    // already written above instead.
+    auto ctx = Context::GetInstance();
+    std::shared_ptr<CrashHandler> crashHandler = (ctx != nullptr) ? ctx->GetCrashHandler() : nullptr;
+    if (crashHandler == nullptr) {
+        return EXCEPTION_EXECUTE_HANDLER;
+    }
 
     snprintf(exceptionString, std::size(exceptionString), "0x%x", ex->ExceptionRecord->ExceptionCode);
 
     WRITE_VAR_LINE(crashHandler, "Exception: ", exceptionString);
     crashHandler->PrintStack(ex->ContextRecord);
-    MessageBoxA(
-        nullptr,
-        (Context::GetInstance()->GetName() + " has crashed. Please open an issue with the logs on the GitHub repository.")
-            .c_str(),
-        "Crash", MB_OK | MB_ICONERROR);
+    MessageBoxA(nullptr,
+                (ctx->GetName() + " has crashed. Please open an issue with the logs on the GitHub repository.").c_str(),
+                "Crash", MB_OK | MB_ICONERROR);
 
     return EXCEPTION_EXECUTE_HANDLER;
 }

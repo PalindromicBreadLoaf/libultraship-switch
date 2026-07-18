@@ -606,6 +606,9 @@ class Interpreter {
     ColorCombiner* LookupOrCreateColorCombiner(const ColorCombinerKey& key);
     void ShaderCacheClear();
     void TextureCacheClear();
+    // G-Diffuser Workshop W0: dump the just-decoded RGBA32 texture (port/gdx_workshop.cpp). No-op
+    // unless gEnhancements.Workshop.TextureDump is on. Off the hot path (gated inside).
+    void GdxDumpDecodedRgba32(int tile, const uint8_t* rgba32, uint32_t width, uint32_t height);
     bool TextureCacheLookup(int i, const TextureCacheKey& key);
     void TextureCacheDelete(const uint8_t* origAddr);
     void ImportTextureRgba16(int textureUnit, int tile, bool importReplacement, bool forceOpaqueAlpha);
@@ -628,6 +631,7 @@ class Interpreter {
     void GfxSpVertex(size_t numVertices, size_t destIndex, const F3DVtx* vertices);
     void GfxSpModifyVertex(uint16_t vtxIdx, uint8_t where, uint32_t val);
     void GfxSpTri1(uint8_t vtx1Idx, uint8_t vtx2Idx, uint8_t vtx3Idx, bool isRect);
+    void GfxSpLine3DGdx(uint8_t vtx1Idx, uint8_t vtx2Idx, uint8_t halfWidth);
     void GfxSpGeometryMode(uint32_t clear, uint32_t set);
     void GfxSpExtraGeometryMode(uint32_t clear, uint32_t set);
     void GfxSpMovememF3dex2(uint8_t index, uint8_t offset, const void* data);
@@ -717,6 +721,12 @@ class Interpreter {
 
     bool mFbActive{};
     bool mRendersToFb{}; // game_renders_to_framebuffer;
+    // Per-frame caches of the widescreen CVars, latched in StartFrame. AdjXForAspectRatio
+    // runs per vertex and GfxDrawRectangle per rect; a CVarGetInteger string-hash lookup on
+    // those paths cost ~2 lookups/vertex. One-frame toggle latency is imperceptible.
+    bool mWidescreenEnabledCache = true;
+    bool mForceFixedAspectCache = false;
+    bool mWidescreenUiCache = false;
     std::map<int, FBInfo>::iterator mActiveFrameBuffer;
     std::map<int, FBInfo> mFrameBuffers;
 

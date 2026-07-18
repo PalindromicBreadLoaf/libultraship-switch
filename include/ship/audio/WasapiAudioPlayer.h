@@ -36,6 +36,11 @@ class WasapiAudioPlayer : public AudioPlayer, public IMMNotificationClient {
      */
     int Buffered() override;
 
+    /** @brief Identifies this backend as "WASAPI". */
+    const char* GetBackendName() const override {
+        return "WASAPI";
+    }
+
   protected:
     /**
      * @brief Opens the WASAPI shared-mode audio client and registers device notifications.

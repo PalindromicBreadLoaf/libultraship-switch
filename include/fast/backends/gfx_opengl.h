@@ -37,9 +37,16 @@ struct ShaderProgram {
     GLint noiseScaleLocation;
     GLint prim_depth_location;
     GLint alpha_compare_threshold_location;
-    GLint texture_width_location;
-    GLint texture_height_location;
-    GLint texture_filtering_location;
+    /* Per-element locations for the texture_* array uniforms. GLSL compilers trim an
+       array uniform to its ACTIVE size: when a material's second texel is dead-stripped
+       (e.g. F-Zero X world materials whose combiner never reads texVal1), texture_width[2]
+       shrinks to one active element and a glUniform1iv(location, 2, ...) covering both
+       elements is rejected wholesale — element 0 silently stays 0, filter3point divides
+       by that zero size, and every sample goes NaN/black. Setting each element through
+       its own location survives trimming (inactive elements report -1 and are ignored). */
+    GLint texture_width_locations[2];
+    GLint texture_height_locations[2];
+    GLint texture_filtering_locations[2];
 };
 
 struct FramebufferOGL {

@@ -4,6 +4,7 @@
 #include <memory>
 #include <vector>
 #include <list>
+#include <shared_mutex>
 #include <unordered_map>
 #include <unordered_set>
 #include <stdint.h>
@@ -220,6 +221,17 @@ class ArchiveManager {
     void ResetVirtualFileSystem();
 
   private:
+    /** @brief AddArchive body without taking mVfsMutex — for callers already holding it. */
+    std::shared_ptr<Archive> AddArchiveUnlocked(std::shared_ptr<Archive> archive);
+
+    /**
+     * @brief Guards the virtual file system (mArchives/mHashes/mFileToArchive/mDirectories/
+     * mGameVersions). ResourceManager's thread-pool tasks read these concurrently with
+     * runtime archive mounts/unmounts (texture-pack hot reload); without the lock a reload
+     * clearing mHashes mid-ListFiles was a use-after-free.
+     */
+    mutable std::shared_mutex mVfsMutex;
+
     std::vector<std::shared_ptr<Archive>> mArchives;
     std::vector<uint32_t> mGameVersions;
     std::unordered_set<uint32_t> mValidGameVersions;

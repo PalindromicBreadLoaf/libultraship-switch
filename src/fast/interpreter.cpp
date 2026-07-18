@@ -48,6 +48,11 @@
 
 std::stack<std::string> currentDir;
 
+/* GDX-DEBUG-2026-07-15: run-log printf shim (port_log.h) for the bounded diagnostics in
+   this file. Declared at global scope because C++ forbids an extern "C" linkage spec inside
+   a block. Remove together with the [GDX-DBG ...] probes below. */
+extern "C" void gdx_dbg_logf(const char* fmt, ...);
+
 #define SEG_ADDR(seg, addr) (addr | (seg << 24) | 1)
 #define SUPPORT_CHECK(x) assert(x)
 
@@ -529,6 +534,26 @@ void Interpreter::TextureCacheClear() {
     std::fill(std::begin(mRenderingState.mTextures), std::end(mRenderingState.mTextures), nullptr);
 }
 
+// G-Diffuser Workshop W0 texture dump (port/gdx_workshop.cpp). Declared extern "C" at namespace
+// scope so the linkage matches the port's definitions (block-scope extern "C" is ill-formed).
+extern "C" int gdx_workshop_texture_dump_enabled(void);
+extern "C" void gdx_workshop_dump_texture(const void* origSrcAddr, size_t origSrcLen,
+                                          const char* resourcePathOrNull, const uint8_t* rgba32,
+                                          int width, int height, int n64Fmt, int n64Siz);
+
+void Interpreter::GdxDumpDecodedRgba32(int tile, const uint8_t* rgba32, uint32_t width, uint32_t height) {
+    if (!gdx_workshop_texture_dump_enabled()) {
+        return;
+    }
+    uint32_t tmem = mRdp->texture_tile[tile].tmem_index;
+    const RawTexMetadata* metadata = &mRdp->loaded_texture[tmem].raw_tex_metadata;
+    const void* origAddr = mRdp->loaded_texture[tmem].addr;
+    size_t origLen = mRdp->loaded_texture[tmem].size_bytes;
+    const char* path = (metadata->resource != nullptr) ? metadata->resource->GetInitData()->Path.c_str() : nullptr;
+    gdx_workshop_dump_texture(origAddr, origLen, path, rgba32, (int)width, (int)height,
+                              (int)mRdp->texture_tile[tile].fmt, (int)mRdp->texture_tile[tile].siz);
+}
+
 void Interpreter::ShaderCacheClear() {
     mRapi->ClearShaderCache();
 }
@@ -639,6 +664,7 @@ extern "C" int gGdxCountdownProbeArm;
 // vertex pointer argument against this to latch precisely onto that draw.
 extern "C" uintptr_t gGdxCountdownProbeResolvedVtx;
 static bool sGdxCountdownDigitVtxLatched = false;
+
 // Ring buffer of recent tile writes; flushed to disk only when a suspect draw
 // fires, so the trace shows exactly the SETTILE history leading to that draw.
 #include <deque>
@@ -843,6 +869,7 @@ void Interpreter::ImportTextureRgba16(int textureUnit, int tile, bool importRepl
                         }
                     }
                 }
+                GdxDumpDecodedRgba32(tile, mTexUploadBuffer, width, height);
                 mRapi->UploadTexture(mTexUploadBuffer, width, height);
                 return;
             }
@@ -1018,6 +1045,7 @@ void Interpreter::ImportTextureRgba16(int textureUnit, int tile, bool importRepl
         }
     }
 
+    GdxDumpDecodedRgba32(tile, mTexUploadBuffer, width, height);
     mRapi->UploadTexture(mTexUploadBuffer, width, height);
 }
 
@@ -1078,6 +1106,7 @@ void Interpreter::ImportTextureRgba32(int tile, bool importReplacement) {
             i++;
         }
     }
+    GdxDumpDecodedRgba32(tile, mTexUploadBuffer, width, height);
     mRapi->UploadTexture(mTexUploadBuffer, width, height);
 }
 
@@ -1124,6 +1153,7 @@ void Interpreter::ImportTextureIA4(int tile, bool importReplacement) {
         }
     }
 
+    GdxDumpDecodedRgba32(tile, mTexUploadBuffer, width, height);
     mRapi->UploadTexture(mTexUploadBuffer, width, height);
 }
 
@@ -1167,6 +1197,7 @@ void Interpreter::ImportTextureIA8(int tile, bool importReplacement) {
         }
     }
 
+    GdxDumpDecodedRgba32(tile, mTexUploadBuffer, width, height);
     mRapi->UploadTexture(mTexUploadBuffer, width, height);
 }
 
@@ -1218,6 +1249,7 @@ void Interpreter::ImportTextureIA16(int tile, bool importReplacement) {
         }
     }
 
+    GdxDumpDecodedRgba32(tile, mTexUploadBuffer, width, height);
     mRapi->UploadTexture(mTexUploadBuffer, width, height);
 }
 
@@ -1320,6 +1352,7 @@ void Interpreter::ImportTextureI4(int tile, bool importReplacement) {
         }
     }
 
+    GdxDumpDecodedRgba32(tile, mTexUploadBuffer, width, height);
     mRapi->UploadTexture(mTexUploadBuffer, width, height);
 }
 
@@ -1361,6 +1394,7 @@ void Interpreter::ImportTextureI8(int tile, bool importReplacement) {
         }
     }
 
+    GdxDumpDecodedRgba32(tile, mTexUploadBuffer, width, height);
     mRapi->UploadTexture(mTexUploadBuffer, width, height);
 }
 
@@ -1443,6 +1477,7 @@ void Interpreter::ImportTextureCi4(int tile, bool importReplacement) {
         }
     }
 
+    GdxDumpDecodedRgba32(tile, mTexUploadBuffer, width, height);
     mRapi->UploadTexture(mTexUploadBuffer, width, height);
 }
 
@@ -1525,6 +1560,7 @@ void Interpreter::ImportTextureCi8(int tile, bool importReplacement) {
         }
     }
 
+    GdxDumpDecodedRgba32(tile, mTexUploadBuffer, width, height);
     mRapi->UploadTexture(mTexUploadBuffer, width, height);
 }
 
@@ -1622,6 +1658,7 @@ void Interpreter::ImportTextureRaw(int tile, bool importReplacement) {
         memset(mTexUploadBuffer + resourceImageSizeBytes, 0, numLoadedBytes - resourceImageSizeBytes);
     }
 
+    GdxDumpDecodedRgba32(tile, mTexUploadBuffer, resultNewLineSize / 4, resultNewHeight);
     mRapi->UploadTexture(mTexUploadBuffer, resultNewLineSize / 4, resultNewHeight);
 }
 
@@ -1918,6 +1955,7 @@ void Interpreter::ImportTextureMask(int i, int tile) {
         }
     }
 
+    GdxDumpDecodedRgba32(tile, mTexUploadBuffer, width, height);
     mRapi->UploadTexture(mTexUploadBuffer, width, height);
 }
 
@@ -1955,12 +1993,11 @@ void Interpreter::CalculateNormalDir(const F3DLight_t* light, float coeffs[3]) {
 void Interpreter::GfxSpMatrix(uint8_t parameters, const int32_t* addr) {
     float matrix[4][4];
 
-    if (auto it = mCurMtxReplacements->find((Mtx*)addr); it != mCurMtxReplacements->end()) {
+    auto it = mCurMtxReplacements->find((Mtx*)addr);
+    if (it != mCurMtxReplacements->end()) {
         for (int i = 0; i < 4; i++) {
             for (int j = 0; j < 4; j++) {
-                float v = it->second.mf[i][j];
-                int as_int = (int)(v * 65536.0f);
-                matrix[i][j] = as_int * (1.0f / 65536.0f);
+                matrix[i][j] = (int)(it->second.mf[i][j] * 65536.0f) * (1.0f / 65536.0f);
             }
         }
     } else {
@@ -2022,6 +2059,21 @@ void Interpreter::GfxSpPopMatrix(uint32_t count) {
     mRsp->lights_changed = true;
 }
 
+// G-Diffuser runtime fixed-aspect flag. The game publishes this per frame AND at the exact
+// mode-flip instant (port/input_bridge.c gdx_fixed_aspect_publish); the renderer folds it into
+// the Widescreen==0 pillarbox path so EK-editor frames render stock 4:3. Deliberately a plain
+// process global rather than a CVar: it is per-frame runtime state that must never be persisted
+// to gdiffuser.cfg.json (a stale copy saved as 1 pillarboxed the next boot), and its consumers
+// include per-task/per-frame paths where CVar string-hash lookups are unwelcome. All writers and
+// readers run on the host thread (game fibers included), so no synchronization is needed.
+static int sGdxForceFixedAspect = 0;
+extern "C" void gdx_set_force_fixed_aspect(int on) {
+    sGdxForceFixedAspect = on ? 1 : 0;
+}
+extern "C" int gdx_get_force_fixed_aspect(void) {
+    return sGdxForceFixedAspect;
+}
+
 float Interpreter::AdjXForAspectRatio(float x) const {
     // Skip widescreen adjustment for fixed-size off-screen FBs (HUD elements,
     // small capture buffers), or those which specify a fixed aspect ratio.
@@ -2034,8 +2086,13 @@ float Interpreter::AdjXForAspectRatio(float x) const {
         // window aspect. When set to 0, skip the correction (return x unchanged) so the game
         // renders at native proportions; Fast3dGui::DrawGame then composites the frame into a
         // centred 4:3 pillarbox, and Interpreter::StartFrame forces an offscreen render target
-        // so that composite target always exists. Read live each call so the toggle is instant.
-        if (CVarGetInteger("gEnhancements.Graphics.Widescreen", 1) == 0) {
+        // so that composite target always exists.
+        // gGdxRuntime.ForceFixedAspect: the game publishes this per-frame (G-Diffuser
+        // input_bridge.c) for modes that must render stock 4:3 regardless of the widescreen
+        // settings (the Expansion Kit editors). It rides the identical pillarbox path.
+        // Both are latched per frame in StartFrame — this runs per vertex; a string-hash
+        // CVar lookup here cost ~2 lookups per vertex (millions per second).
+        if (!mWidescreenEnabledCache || mForceFixedAspectCache) {
             return x;
         }
         return x * (4.0f / 3.0f) / ((float)mCurDimensions.width / (float)mCurDimensions.height);
@@ -2066,6 +2123,7 @@ void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx
         reinterpret_cast<uintptr_t>(vertices) == gGdxCountdownProbeResolvedVtx) {
         sGdxCountdownDigitVtxLatched = true;
     }
+
     for (size_t i = 0; i < n_vertices; i++, dest_index++) {
         const F3DVtx_t* v = &vertices[i].v;
         const F3DVtx_tn* vn = &vertices[i].n;
@@ -2083,6 +2141,7 @@ void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx
                   v->ob[2] * mRsp->MP_matrix[2][2] + mRsp->MP_matrix[3][2];
         float w = v->ob[0] * mRsp->MP_matrix[0][3] + v->ob[1] * mRsp->MP_matrix[1][3] +
                   v->ob[2] * mRsp->MP_matrix[2][3] + mRsp->MP_matrix[3][3];
+
         mGeometryDiagnostics.verticesLoaded++;
         if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z) || !std::isfinite(w)) {
             mGeometryDiagnostics.invalidVertices++;
@@ -2450,6 +2509,7 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
             }
         }
     }
+
     if (requiresClipping) {
         LoadedVertex polygonA[16] = { *v1, *v2, *v3 };
         LoadedVertex polygonB[16]{};
@@ -3365,6 +3425,81 @@ void Interpreter::GfxSpExtraGeometryMode(uint32_t clear, uint32_t set) {
     mRsp->extra_geometry_mode |= set;
 }
 
+// G-Diffuser: expand an L3DEX2 G_LINE3D into a screen-space quad. Fast3D has no line
+// primitive; the port's gfx bridge rewrites Course Edit's line commands (course spline and
+// control-point connectors) into OTR_G_LINE3D_GDX and this draws each as two triangles of
+// constant pixel width, using the two already-transformed loaded vertices.
+void Interpreter::GfxSpLine3DGdx(uint8_t vtx1Idx, uint8_t vtx2Idx, uint8_t halfWidth) {
+    const struct LoadedVertex a = mRsp->loaded_vertices[vtx1Idx];
+    const struct LoadedVertex b = mRsp->loaded_vertices[vtx2Idx];
+
+    /* GDX-DEBUG-2026-07-15: confirm the L3DEX2 line handler fires at all in Course Edit and
+       whether the w<=0 near-plane early-out is what suppresses the spline lines. Bounded to
+       32 lines total (hits + early-outs combined). Remove after #2 line-render is confirmed. */
+    {
+        static int sGdxLineDbg = 0;
+        if (sGdxLineDbg < 32) {
+            sGdxLineDbg++;
+            gdx_dbg_logf("[GDX-DBG line] v0=%u v1=%u wd=%u aw=%.3f bw=%.3f %s\n",
+                         vtx1Idx, vtx2Idx, halfWidth, a.w, b.w,
+                         (a.w <= 0.0f || b.w <= 0.0f) ? "EARLYOUT(w<=0)" : "draw");
+        }
+    }
+
+    // Both endpoints must be in front of the camera; near-plane clipping of partially
+    // visible lines is not worth the complexity for the editor's on-canvas geometry.
+    if (a.w <= 0.0f || b.w <= 0.0f) {
+        return;
+    }
+
+    const float ax = a.x / a.w, ay = a.y / a.w;
+    const float bx = b.x / b.w, by = b.y / b.w;
+
+    // Direction in pixel space so the visual width is uniform regardless of line angle
+    // and window aspect.
+    const float pixelHalfW = (float)mCurDimensions.width * 0.5f;
+    const float pixelHalfH = (float)mCurDimensions.height * 0.5f;
+    const float dx = (bx - ax) * pixelHalfW;
+    const float dy = (by - ay) * pixelHalfH;
+    const float len = sqrtf(dx * dx + dy * dy);
+    if (len < 0.0001f) {
+        return;
+    }
+    // Hardware line width: wd is in half-pixel units on top of a 1.5px base, and the
+    // quad extends half that width to each side. Scale from the 320x240 native raster
+    // to the current output so lines keep their authored proportion.
+    const float nativeWidthPx = 1.5f + (float)halfWidth * 0.5f;
+    const float outputScale = (float)mCurDimensions.height / 240.0f;
+    const float halfPx = nativeWidthPx * 0.5f * (outputScale > 0.0f ? outputScale : 1.0f);
+    const float perpX = (-dy / len) * halfPx / pixelHalfW; // back to NDC units
+    const float perpY = (dx / len) * halfPx / pixelHalfH;
+
+    struct LoadedVertex* quad = &mRsp->loaded_vertices[MAX_VERTICES + 0];
+    quad[0] = a;
+    quad[1] = a;
+    quad[2] = b;
+    quad[3] = b;
+    quad[0].x = (ax + perpX) * a.w;
+    quad[0].y = (ay + perpY) * a.w;
+    quad[1].x = (ax - perpX) * a.w;
+    quad[1].y = (ay - perpY) * a.w;
+    quad[2].x = (bx + perpX) * b.w;
+    quad[2].y = (by + perpY) * b.w;
+    quad[3].x = (bx - perpX) * b.w;
+    quad[3].y = (by - perpY) * b.w;
+    quad[0].clip_rej = 0;
+    quad[1].clip_rej = 0;
+    quad[2].clip_rej = 0;
+    quad[3].clip_rej = 0;
+
+    // Hardware lines never face-cull; suppress culling for the quad only.
+    const uint32_t savedGeometryMode = mRsp->geometry_mode;
+    mRsp->geometry_mode &= ~get_attr(CULL_BOTH);
+    GfxSpTri1(MAX_VERTICES + 0, MAX_VERTICES + 1, MAX_VERTICES + 2, false);
+    GfxSpTri1(MAX_VERTICES + 1, MAX_VERTICES + 3, MAX_VERTICES + 2, false);
+    mRsp->geometry_mode = savedGeometryMode;
+}
+
 void Interpreter::AdjustVIewportOrScissor(XYWidthHeight* area) {
     if (!mFbActive) {
         // Adjust the y origin based on the y-inversion for the active framebuffer
@@ -4127,8 +4262,59 @@ void Interpreter::GfxDrawRectangle(int32_t ulx, int32_t uly, int32_t lrx, int32_
     lrxf = lrxf / (4.0f * HALF_SCREEN_WIDTH(mActiveFrameBuffer)) - 1.0f;
     lryf = -(lryf / (4.0f * HALF_SCREEN_HEIGHT(mActiveFrameBuffer))) + 1.0f;
 
-    ulxf = AdjXForAspectRatio(ulxf);
-    lrxf = AdjXForAspectRatio(lrxf);
+    {
+        const bool fixedAspectFramebuffer =
+            mFbActive && mActiveFrameBuffer != mFrameBuffers.end() &&
+            (!mActiveFrameBuffer->second.resize || mActiveFrameBuffer->second.forceFixedAspect);
+        const float currentAspect = (float)mCurDimensions.width / (float)mCurDimensions.height;
+        const float aspectScale = (4.0f / 3.0f) / currentAspect;
+        const uint32_t widescreenMode =
+            mRsp->extra_geometry_mode &
+            (G_EX_WIDESCREEN_STRETCH | G_EX_WIDESCREEN_ANCHOR_LEFT | G_EX_WIDESCREEN_ANCHOR_RIGHT |
+             G_EX_WIDESCREEN_DISTRIBUTE);
+        // CVar states are latched per frame in StartFrame (hot-path cost).
+        // Forced-4:3 frames (EK editors) composite into a centered pillarbox; a stretch or
+        // anchor scope that slipped into such a frame (e.g. a transition capture) would be
+        // double-corrected after compositing, so the scopes go inert with the frame.
+        const bool widescreenFrameActive = !fixedAspectFramebuffer && currentAspect > (4.0f / 3.0f) &&
+                                           mWidescreenEnabledCache && !mForceFixedAspectCache;
+        // STRETCH follows the 3D Widescreen CVar alone: transitions redraw a captured
+        // widescreen frame and must cover the full viewport whenever the live frame renders
+        // widescreen, independent of the 2D-UI anchoring preference. ANCHOR/DISTRIBUTE
+        // reposition individual 2D elements and stay behind the WidescreenUI opt-in.
+        const bool stretchActive = widescreenFrameActive && (widescreenMode & G_EX_WIDESCREEN_STRETCH) != 0;
+        const bool enhancedWidescreenUi = widescreenFrameActive && widescreenMode != 0 && mWidescreenUiCache;
+
+        if (stretchActive) {
+            // F-Zero X's fullscreen 2D safe area is x=12..308. Map that explicit draw scope to
+            // the true viewport edges; foreground/menu artwork remains on the normal 4:3 path.
+            constexpr float kSafeAreaScale = 160.0f / (160.0f - 12.0f);
+            ulxf *= kSafeAreaScale;
+            lrxf *= kSafeAreaScale;
+        } else if (enhancedWidescreenUi && (widescreenMode & G_EX_WIDESCREEN_DISTRIBUTE) != 0) {
+            // Place a 2D widget by its native 320-wide centre so it follows a widescreen-spread
+            // 3D viewport, but retain the widget's 4:3-corrected width. This is distinct from
+            // STRETCH: SELECT MACHINE's cursor must move with its six 3D columns without becoming
+            // horizontally distorted.
+            const float center = (ulxf + lrxf) * 0.5f;
+            const float halfWidth = (lrxf - ulxf) * 0.5f * aspectScale;
+            ulxf = center - halfWidth;
+            lrxf = center + halfWidth;
+        } else {
+            ulxf = AdjXForAspectRatio(ulxf);
+            lrxf = AdjXForAspectRatio(lrxf);
+
+            if (enhancedWidescreenUi) {
+                const bool anchorLeft = (widescreenMode & G_EX_WIDESCREEN_ANCHOR_LEFT) != 0;
+                const bool anchorRight = (widescreenMode & G_EX_WIDESCREEN_ANCHOR_RIGHT) != 0;
+                if (anchorLeft != anchorRight) {
+                    const float offset = (anchorRight ? 1.0f : -1.0f) * (1.0f - aspectScale);
+                    ulxf += offset;
+                    lrxf += offset;
+                }
+            }
+        }
+    }
 
     struct LoadedVertex* ul = &mRsp->loaded_vertices[MAX_VERTICES + 0];
     struct LoadedVertex* ll = &mRsp->loaded_vertices[MAX_VERTICES + 1];
@@ -5930,6 +6116,19 @@ bool gfx_extra_geometry_mode_handler_custom(F3DGfx** cmd0) {
     return false;
 }
 
+// G-Diffuser: L3DEX2 G_LINE3D rewritten by the port's gfx bridge (operand encoding
+// preserved: vertex indices arrive pre-multiplied by 2, exactly like native L3DEX2).
+bool gfx_line3d_gdx_handler_custom(F3DGfx** cmd0) {
+    Interpreter* gfx = mInstance.lock().get();
+    F3DGfx* cmd = *(cmd0);
+
+    const uint8_t v0 = (uint8_t)(C0(16, 8) / 2);
+    const uint8_t v1 = (uint8_t)(C0(8, 8) / 2);
+    const uint8_t wd = (uint8_t)C0(0, 8);
+    gfx->GfxSpLine3DGdx(v0, v1, wd);
+    return false;
+}
+
 bool gfx_stubbed_command_handler(F3DGfx** cmd0) {
     return false;
 }
@@ -6029,6 +6228,7 @@ static constexpr UcodeHandler otrHandlers = {
     { OTR_G_REGBLENDEDTEX,
       { "G_REGBLENDEDTEX", gfx_register_blended_texture_handler_custom } },         // G_REGBLENDEDTEX (0x3f)
     { OTR_G_SETINTENSITY, { "G_SETINTENSITY", gfx_set_intensity_handler_custom } }, // G_SETINTENSITY (0x40)
+    { OTR_G_LINE3D_GDX, { "G_LINE3D_GDX", gfx_line3d_gdx_handler_custom } },        // G_LINE3D_GDX (0x41)
     { OTR_G_MOVEMEM_HASH, { "OTR_G_MOVEMEM_HASH", gfx_movemem_handler_otr } },      // OTR_G_MOVEMEM_HASH
     { OTR_G_PUSH_SHADER, { "G_PUSH_SHADER", gfx_push_shader } },
     { OTR_G_POP_SHADER, { "G_POP_SHADER", gfx_pop_shader } },
@@ -6262,6 +6462,11 @@ void Interpreter::SpReset() {
     while (!mShaderStack.empty()) {
         mShaderStack.pop();
     }
+    // A widescreen anchor/stretch scope set by a display list that was branched over or
+    // aborted mid-frame must not leak into the next task: a latched G_EX_WIDESCREEN_STRETCH
+    // would mis-stretch every subsequent 2D rect. The game clears its scopes explicitly on
+    // every normal path; this is the per-task backstop.
+    mRsp->extra_geometry_mode = 0;
     mRsp->modelview_matrix_stack_size = 1;
     mRsp->branch_z_target = 0;
     mRsp->viewport_z_scale = 511.0f;
@@ -6412,7 +6617,14 @@ void Interpreter::StartFrame() {
     // otherwise render straight to the window and expose no composite target. Inert at the default
     // (Widescreen == 1): widescreenPillarbox is false, so both conditions below are unchanged and
     // the original render path is preserved byte-for-byte.
-    const bool widescreenPillarbox = CVarGetInteger("gEnhancements.Graphics.Widescreen", 1) == 0;
+    // Latch the widescreen CVars once per frame: the per-vertex (AdjXForAspectRatio) and
+    // per-rect (GfxDrawRectangle) consumers read these members instead of doing string-hash
+    // CVar lookups on the hot path. The fixed-aspect flag is a process global (see
+    // gdx_set_force_fixed_aspect above) and is additionally re-latched per task in Run().
+    mWidescreenEnabledCache = CVarGetInteger("gEnhancements.Graphics.Widescreen", 1) != 0;
+    mForceFixedAspectCache = sGdxForceFixedAspect != 0;
+    mWidescreenUiCache = CVarGetInteger("gEnhancements.Graphics.WidescreenUI", 0) != 0;
+    const bool widescreenPillarbox = !mWidescreenEnabledCache || mForceFixedAspectCache;
     if (!ViewportMatchesRendererResolution() || mMsaaLevel > 1 || widescreenPillarbox) {
         mRendersToFb = true;
         if (!ViewportMatchesRendererResolution() || (widescreenPillarbox && mMsaaLevel <= 1)) {
@@ -6485,6 +6697,12 @@ void Interpreter::SetPortAfterClearHook(void (*hook)(Interpreter*)) {
 
 void Interpreter::Run(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtx_replacements) {
     SpReset();
+
+    // Re-latch the fixed-aspect flag per task: the game can flip its mode (and republish the
+    // flag from the flip site) BETWEEN this frame's StartFrame and the gfx task that renders
+    // the new mode, so the StartFrame latch alone would apply the old mode's aspect to the new
+    // mode's first frame (the owner-visible one-frame 4:3 squeeze on editor exit).
+    mForceFixedAspectCache = sGdxForceFixedAspect != 0;
 
     mGetPixelDepthPending.clear();
     mGetPixelDepthCached.clear();

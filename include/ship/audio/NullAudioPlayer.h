@@ -27,6 +27,11 @@ class NullAudioPlayer final : public AudioPlayer {
      */
     int Buffered() override;
 
+    /** @brief Identifies this backend as "Null". */
+    const char* GetBackendName() const override {
+        return "Null";
+    }
+
   protected:
     /** @brief Always returns true — no actual device needs to be opened. */
     bool DoInit() override;

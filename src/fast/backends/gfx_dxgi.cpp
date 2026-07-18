@@ -2,10 +2,13 @@
 
 #include <stdint.h>
 #include <math.h>
+#include <stdio.h>
+#include <stdlib.h>
 
 #include <map>
 #include <set>
 #include <string>
+#include <vector>
 
 #include <windows.h>
 #include <windowsx.h> // GET_X_LPARAM(), GET_Y_LPARAM()
@@ -625,8 +628,8 @@ void GfxWindowBackendDXGI::Init(const char* game_name, const char* gfx_api_name,
     RegisterRawInputDevices(mRawInputDevice, 1, sizeof(mRawInputDevice[0]));
 }
 
-void GfxWindowBackendDXGI::SetFullscreenChangedCallback(void (*mOnFullscreenChanged)(bool is_now_fullscreen)) {
-    mOnFullscreenChanged = mOnFullscreenChanged;
+void GfxWindowBackendDXGI::SetFullscreenChangedCallback(void (*onFullscreenChanged)(bool is_now_fullscreen)) {
+    mOnFullscreenChanged = onFullscreenChanged;
 }
 
 void GfxWindowBackendDXGI::SetCursorVisibility(bool visible) {
@@ -914,6 +917,181 @@ bool GfxWindowBackendDXGI::IsFrameReady() {
     return true;
 }
 
+/* GDX window-capture facility: dumps the fully-rendered D3D11 swapchain
+   backbuffer to numbered 24bpp BMP files just before Present, at the real
+   window resolution and aspect ratio. This closes the long-standing gap where
+   the only capture path (GDX_CAPTURE_FRAMES) read the 320x240 aspect-blind N64
+   frame mirror, which cannot show window-level artifacts such as the Cup Select
+   wipe judder. Env-gated and zero-cost when GDX_CAPTURE_WINDOW is unset.
+
+   Format: GDX_CAPTURE_WINDOW=<start>:<count> -- capture <count> presented
+   frames beginning at present index <start> (0-based). Output files are named
+   gdxwin_<index>.bmp next to the executable, where <index> is the absolute
+   present index so consecutive captures are trivially ordered. */
+// Decomp game-mode global, used by the capture facility's correlation aid so a
+// capture window can be aimed at a specific mode transition.
+extern "C" int gGameMode; // GET_MODE = gGameMode & 0x1F
+
+static void GdxMaybeCaptureWindowFrame(IDXGISwapChain1* swapChain, IUnknown* swapChainDevice) {
+    // Parse the env request exactly once. When unset or malformed the facility
+    // stays fully disabled and the per-present cost is a single bool test.
+    static int sState = 0; // 0 = unparsed, 1 = active, -1 = disabled
+    static unsigned int sStart = 0;
+    static unsigned int sCount = 0;
+    static unsigned int sPresentIndex = 0;
+
+    if (sState == -1) {
+        return;
+    }
+    if (sState == 0) {
+        const char* env = getenv("GDX_CAPTURE_WINDOW");
+        unsigned int start = 0, count = 0;
+        if (env != nullptr && sscanf(env, "%u:%u", &start, &count) == 2 && count > 0) {
+            sStart = start;
+            sCount = count;
+            sState = 1;
+        } else {
+            sState = -1;
+            return;
+        }
+    }
+
+    const unsigned int index = sPresentIndex++;
+
+    /* Correlation aid: while the facility is active, append the present index to
+       gdxwin-modes.txt whenever the decomp game mode changes, so a capture window
+       can be aimed at a specific transition (e.g. the 07->0A Cup Select wipe)
+       without guessing the present number. Bounded; only runs when capture is on. */
+    {
+        static int sLastMode = -1;
+        static int sModeLogs = 0;
+        const int mode = gGameMode & 0x1F;
+        if (mode != sLastMode && sModeLogs < 32) {
+            sLastMode = mode;
+            ++sModeLogs;
+            FILE* mf = fopen("gdxwin-modes.txt", "a");
+            if (mf != nullptr) {
+                fprintf(mf, "present=%u gameMode=0x%X\n", index, mode);
+                fclose(mf);
+            }
+        }
+    }
+
+    if (index < sStart || index >= sStart + sCount) {
+        return;
+    }
+    if (swapChain == nullptr || swapChainDevice == nullptr) {
+        return;
+    }
+
+    // The swapchain device is a D3D11 device on the DX11 backend and a D3D12
+    // command queue on the DX12 backend. Only DX11 is supported here; a failed
+    // QueryInterface silently skips (DX12 present path does not reach this).
+    ComPtr<ID3D11Device> device;
+    if (FAILED(swapChainDevice->QueryInterface(__uuidof(ID3D11Device), (void**)device.GetAddressOf()))) {
+        return;
+    }
+    ComPtr<ID3D11DeviceContext> ctx;
+    device->GetImmediateContext(ctx.GetAddressOf());
+    if (ctx == nullptr) {
+        return;
+    }
+
+    ComPtr<ID3D11Texture2D> backbuffer;
+    if (FAILED(swapChain->GetBuffer(0, __uuidof(ID3D11Texture2D), (void**)backbuffer.GetAddressOf()))) {
+        return;
+    }
+    D3D11_TEXTURE2D_DESC desc;
+    backbuffer->GetDesc(&desc);
+
+    D3D11_TEXTURE2D_DESC stagingDesc = desc;
+    stagingDesc.Usage = D3D11_USAGE_STAGING;
+    stagingDesc.BindFlags = 0;
+    stagingDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    stagingDesc.MiscFlags = 0;
+    stagingDesc.SampleDesc.Count = 1;
+    stagingDesc.SampleDesc.Quality = 0;
+
+    ComPtr<ID3D11Texture2D> staging;
+    if (FAILED(device->CreateTexture2D(&stagingDesc, nullptr, staging.GetAddressOf()))) {
+        return;
+    }
+    // Backbuffers are single-sampled; a straight CopyResource is valid.
+    ctx->CopyResource(staging.Get(), backbuffer.Get());
+
+    D3D11_MAPPED_SUBRESOURCE mapped;
+    if (FAILED(ctx->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &mapped))) {
+        return;
+    }
+
+    const unsigned int width = desc.Width;
+    const unsigned int height = desc.Height;
+    // BGRA vs RGBA byte order in the mapped rows. The common flip-model
+    // backbuffer format is DXGI_FORMAT_B8G8R8A8_UNORM; R8G8B8A8 is handled too.
+    const bool isBgra = (desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM ||
+                         desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB);
+
+    const unsigned int rowBytes = (width * 3u + 3u) & ~3u;
+    const unsigned int imageBytes = rowBytes * height;
+    const unsigned int fileBytes = 14u + 40u + imageBytes;
+    unsigned char header[54] = { 0 };
+    header[0] = 'B';
+    header[1] = 'M';
+    header[2] = (unsigned char)(fileBytes);
+    header[3] = (unsigned char)(fileBytes >> 8);
+    header[4] = (unsigned char)(fileBytes >> 16);
+    header[5] = (unsigned char)(fileBytes >> 24);
+    header[10] = 54; // pixel data offset
+    header[14] = 40; // BITMAPINFOHEADER size
+    header[18] = (unsigned char)(width);
+    header[19] = (unsigned char)(width >> 8);
+    header[20] = (unsigned char)(width >> 16);
+    header[21] = (unsigned char)(width >> 24);
+    header[22] = (unsigned char)(height);
+    header[23] = (unsigned char)(height >> 8);
+    header[24] = (unsigned char)(height >> 16);
+    header[25] = (unsigned char)(height >> 24);
+    header[26] = 1;  // planes
+    header[28] = 24; // bpp
+
+    char path[64];
+    snprintf(path, sizeof(path), "gdxwin_%05u.bmp", index);
+    FILE* f = fopen(path, "wb");
+    if (f == nullptr) {
+        ctx->Unmap(staging.Get(), 0);
+        return;
+    }
+    fwrite(header, 1, sizeof(header), f);
+
+    std::vector<unsigned char> row(rowBytes, 0);
+    for (unsigned int y = 0; y < height; y++) {
+        // BMP rows are bottom-up; the backbuffer is top-down.
+        const unsigned char* src =
+            (const unsigned char*)mapped.pData + (size_t)(height - 1 - y) * mapped.RowPitch;
+        for (unsigned int x = 0; x < width; x++) {
+            const unsigned char c0 = src[x * 4 + 0];
+            const unsigned char c1 = src[x * 4 + 1];
+            const unsigned char c2 = src[x * 4 + 2];
+            unsigned char r, g, b;
+            if (isBgra) {
+                b = c0;
+                g = c1;
+                r = c2;
+            } else {
+                r = c0;
+                g = c1;
+                b = c2;
+            }
+            row[x * 3 + 0] = b;
+            row[x * 3 + 1] = g;
+            row[x * 3 + 2] = r;
+        }
+        fwrite(row.data(), 1, rowBytes, f);
+    }
+    fclose(f);
+    ctx->Unmap(staging.Get(), 0);
+}
+
 void GfxWindowBackendDXGI::SwapBuffersBegin() {
     // mLengthInVsyncFrames (now mVsyncEnabled) was used as present interval. Present interval >1 (aka fractional
     // V-Sync) breaks VRR and introduces even more input lag than capping via normal V-Sync does. Get the present
@@ -941,6 +1119,9 @@ void GfxWindowBackendDXGI::SwapBuffersBegin() {
     }
     QueryPerformanceCounter(&t);
     mPreviousPresentTime = t;
+    // Window-level backbuffer capture (env-gated, zero-cost when unset). Runs
+    // before Present so the dumped frame is exactly what is about to be shown.
+    GdxMaybeCaptureWindowFrame(swap_chain.Get(), mSwapChainDevice.Get());
     if (mTearingSupport && !mVsyncEnabled) {
         // 512: DXGI_PRESENT_ALLOW_TEARING - allows for true V-Sync off with flip model
         ThrowIfFailed(swap_chain->Present(mVsyncEnabled, DXGI_PRESENT_ALLOW_TEARING));

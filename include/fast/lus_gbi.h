@@ -66,6 +66,10 @@ constexpr int8_t OTR_G_DL_INDEX = OPCODE(0x3d);
 constexpr int8_t OTR_G_READFB = OPCODE(0x3e);
 constexpr int8_t OTR_G_REGBLENDEDTEX = OPCODE(0x3f);
 constexpr int8_t OTR_G_SETINTENSITY = OPCODE(0x40);
+/* G-Diffuser: L3DEX2 G_LINE3D rewritten by the port's gfx bridge. Same operand
+ * encoding as the native command (w0[23:16]=v0*2, w0[15:8]=v1*2, w0[7:0]=wd);
+ * the interpreter expands it into a screen-space quad of constant pixel width. */
+constexpr int8_t OTR_G_LINE3D_GDX = OPCODE(0x41);
 constexpr int8_t OTR_G_MOVEMEM_HASH = OPCODE(0x42);
 constexpr int8_t OTR_G_PUSH_SHADER = OPCODE(0x43);
 constexpr int8_t OTR_G_POP_SHADER = OPCODE(0x44);
@@ -207,6 +211,10 @@ constexpr int8_t RDP_G_TRI1_WIDE = OPCODE(0x49);
  */
 #define G_EX_INVERT_CULLING 0x00000001
 #define G_EX_ALWAYS_EXECUTE_BRANCH 0x00000002
+#define G_EX_WIDESCREEN_STRETCH 0x00000004
+#define G_EX_WIDESCREEN_ANCHOR_LEFT 0x00000008
+#define G_EX_WIDESCREEN_ANCHOR_RIGHT 0x00000010
+#define G_EX_WIDESCREEN_DISTRIBUTE 0x00000020
 
 /*
  * G_SETIMG fmt: set image formats

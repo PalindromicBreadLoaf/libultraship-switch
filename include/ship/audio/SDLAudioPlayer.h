@@ -29,6 +29,11 @@ class SDLAudioPlayer final : public AudioPlayer {
      */
     int Buffered() override;
 
+    /** @brief Identifies this backend as "SDL". */
+    const char* GetBackendName() const override {
+        return "SDL";
+    }
+
   protected:
     /**
      * @brief Opens the SDL audio device with the configured settings.

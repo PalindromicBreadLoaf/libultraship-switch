@@ -37,6 +37,10 @@
 IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
 #endif
 
+// G-Diffuser runtime fixed-aspect flag (defined in interpreter.cpp; published by the game at
+// mode flips). Read live in DrawGame's pillarbox decision.
+extern "C" int gdx_get_force_fixed_aspect(void);
+
 namespace Fast {
 
 Fast3dGui::Fast3dGui() : Ship::Gui() {
@@ -47,6 +51,9 @@ Fast3dGui::Fast3dGui(std::vector<std::shared_ptr<Ship::GuiWindow>> guiWindows) :
 
 void Fast3dGui::Init(GuiWindowInitData windowImpl) {
     mImpl = windowImpl;
+    // Capture the backend while the Context singleton is alive: the ImGui shutdown
+    // methods run during ~Context and must not re-fetch it (see mCachedBackend).
+    mCachedBackend = Ship::Context::GetInstance()->GetWindow()->GetWindowBackend();
     Gui::Init();
 }
 
@@ -121,8 +128,12 @@ void Fast3dGui::ImGuiWMInit() {
 }
 
 void Fast3dGui::ImGuiWMShutdown() {
-    auto window = Ship::Context::GetInstance()->GetWindow();
-    switch (window->GetWindowBackend()) {
+    // Runs from ~Context (mWindow reset -> ~Fast3dWindow -> ~Window -> ShutDownImGui), when
+    // Context::GetInstance() already returns an empty shared_ptr. Never re-fetch the
+    // singleton here: switch on the backend captured at Init so the platform backend is
+    // ALWAYS shut down (an earlier null-guard skipped it and ImGui::DestroyContext asserted
+    // "Forgot to shutdown Platform backend?").
+    switch (mCachedBackend) {
 #ifdef ENABLE_OPENGL
         case WindowBackend::FAST3D_SDL_OPENGL:
             ImGui_ImplSDL2_Shutdown();
@@ -178,8 +189,8 @@ void Fast3dGui::ImGuiBackendInit() {
 }
 
 void Fast3dGui::ImGuiBackendShutdown() {
-    auto window = Ship::Context::GetInstance()->GetWindow();
-    switch (window->GetWindowBackend()) {
+    // Same rule as ImGuiWMShutdown: cached backend, no singleton re-fetch mid-destruction.
+    switch (mCachedBackend) {
 #ifdef ENABLE_OPENGL
         case WindowBackend::FAST3D_SDL_OPENGL:
             ImGui_ImplOpenGL3_Shutdown();
@@ -429,8 +440,14 @@ void Fast3dGui::DrawGame() {
                           float(mInterpreter.lock()->mCurDimensions.height) * factor);
         }
     } else if (Ship::Context::GetInstance()->GetConsoleVariables()->GetInteger("gEnhancements.Graphics.Widescreen",
-                                                                               1) == 0) {
-        // 4:3 pillarbox (gEnhancements.Graphics.Widescreen == 0). With widescreen disabled the game
+                                                                               1) == 0 ||
+               gdx_get_force_fixed_aspect() != 0) {
+        // 4:3 pillarbox (gEnhancements.Graphics.Widescreen == 0, or the game published the
+        // fixed-aspect runtime flag for a mode that must render stock 4:3 -- the Expansion Kit
+        // editors; see G-Diffuser input_bridge.c gdx_fixed_aspect_publish and the flag's
+        // definition in interpreter.cpp). Read live: the flag can change at the mode-flip
+        // mid-dispatch and this composite decision must track it within the same frame.
+        // With widescreen disabled the game
         // framebuffer holds native-proportion content stretched to the window's aspect, because
         // Interpreter::AdjXForAspectRatio returns x unchanged. Drawing that full-width framebuffer
         // into a centred 4:3 rect compresses it back to native proportions; the cleared window

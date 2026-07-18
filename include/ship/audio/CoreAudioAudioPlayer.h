@@ -31,6 +31,11 @@ class CoreAudioAudioPlayer : public AudioPlayer {
      */
     int Buffered() override;
 
+    /** @brief Identifies this backend as "CoreAudio". */
+    const char* GetBackendName() const override {
+        return "CoreAudio";
+    }
+
   protected:
     /**
      * @brief Opens and configures the Core Audio output unit.

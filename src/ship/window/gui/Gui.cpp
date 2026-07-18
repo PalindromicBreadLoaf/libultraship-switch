@@ -208,6 +208,10 @@ void Gui::DrawMenu() {
          Ship::Context::GetInstance()->GetConsoleVariables()->GetInteger(CVAR_IMGUI_CONTROLLER_NAV, 0))) {
         if ((ImGui::IsKeyPressed(ImGuiKey_Escape, false) || ImGui::IsKeyPressed(TOGGLE_PAD_BTN, false)) && GetMenu()) {
             GetMenu()->ToggleVisibility();
+        } else if (ImGui::IsKeyPressed(TOGGLE_BTN, false) && GetMenu()) {
+            // Full-screen game menus are the modern replacement for the legacy menu bar. Keep F1
+            // as the common port hotkey when a game registers Gui::SetMenu() instead of SetMenuBar().
+            GetMenu()->ToggleVisibility();
         } else if ((ImGui::IsKeyPressed(TOGGLE_BTN, false) || ImGui::IsKeyPressed(TOGGLE_PAD_BTN, false)) &&
                    GetMenuBar()) {
             GetMenuBar()->ToggleVisibility();

@@ -66,14 +66,16 @@ void GfxRenderingAPIOGL::SetPerDrawUniforms() {
     glUniform1f(mCurrentShaderProgram->alpha_compare_threshold_location, mCurrentAlphaCompareThreshold);
 
     if (mCurrentShaderProgram->usedTextures[0] || mCurrentShaderProgram->usedTextures[1]) {
-        GLint filtering[2] = { textures[mCurrentTextureIds[0]].filtering, textures[mCurrentTextureIds[1]].filtering };
-        glUniform1iv(mCurrentShaderProgram->texture_filtering_location, 2, filtering);
-
-        GLint width[2] = { textures[mCurrentTextureIds[0]].width, textures[mCurrentTextureIds[1]].width };
-        glUniform1iv(mCurrentShaderProgram->texture_width_location, 2, width);
-
-        GLint height[2] = { textures[mCurrentTextureIds[0]].height, textures[mCurrentTextureIds[1]].height };
-        glUniform1iv(mCurrentShaderProgram->texture_height_location, 2, height);
+        // Set the texture_* array uniforms one element at a time (see the ShaderProgram
+        // header comment): a two-element glUniform1iv is rejected in full when the driver
+        // trimmed the array to one active element, which left texture_width[0] at 0 and
+        // turned every three-point-filtered world sample black (division by zero size).
+        for (int i = 0; i < 2; i++) {
+            glUniform1i(mCurrentShaderProgram->texture_filtering_locations[i],
+                        textures[mCurrentTextureIds[i]].filtering);
+            glUniform1i(mCurrentShaderProgram->texture_width_locations[i], textures[mCurrentTextureIds[i]].width);
+            glUniform1i(mCurrentShaderProgram->texture_height_locations[i], textures[mCurrentTextureIds[i]].height);
+        }
     }
 }
 
@@ -507,9 +509,18 @@ ShaderProgram* GfxRenderingAPIOGL::CreateAndLoadNewShader(uint64_t shader_id0, u
     prg->noiseScaleLocation = glGetUniformLocation(shader_program, "noise_scale");
     prg->prim_depth_location = glGetUniformLocation(shader_program, "prim_depth");
     prg->alpha_compare_threshold_location = glGetUniformLocation(shader_program, "alpha_compare_threshold");
-    prg->texture_width_location = glGetUniformLocation(shader_program, "texture_width");
-    prg->texture_height_location = glGetUniformLocation(shader_program, "texture_height");
-    prg->texture_filtering_location = glGetUniformLocation(shader_program, "texture_filtering");
+    // Per-element lookups (see the ShaderProgram header comment): "name[i]" resolves even
+    // when the compiler trimmed the array's active size, and inactive elements yield -1,
+    // which glUniform1i ignores.
+    for (int i = 0; i < 2; i++) {
+        char uname[32];
+        snprintf(uname, sizeof(uname), "texture_width[%d]", i);
+        prg->texture_width_locations[i] = glGetUniformLocation(shader_program, uname);
+        snprintf(uname, sizeof(uname), "texture_height[%d]", i);
+        prg->texture_height_locations[i] = glGetUniformLocation(shader_program, uname);
+        snprintf(uname, sizeof(uname), "texture_filtering[%d]", i);
+        prg->texture_filtering_locations[i] = glGetUniformLocation(shader_program, uname);
+    }
 
     LoadShader(prg);
 
@@ -1022,8 +1033,11 @@ void GfxRenderingAPIOGL::ReadFramebufferToCPU(int fb_id, uint32_t width, uint32_
         uint8_t r = (rgba8[i * 4 + 0] >> 3) & 0x1F;
         uint8_t g = (rgba8[i * 4 + 1] >> 3) & 0x1F;
         uint8_t b = (rgba8[i * 4 + 2] >> 3) & 0x1F;
-        uint8_t a = rgba8[i * 4 + 3] ? 1 : 0;
-        rgba16_buf[i] = (r << 11) | (g << 6) | (b << 1) | a;
+        // Coverage bit, not alpha (parity with the DX11 readback): the framebuffer's host
+        // alpha is often 0 for fully opaque rendered pixels, and games redraw captured
+        // frames through alpha-compare passes — deriving the bit from host alpha discards
+        // those texels (blank transition wipes). Every rendered pixel has full coverage.
+        rgba16_buf[i] = (r << 11) | (g << 6) | (b << 1) | 1;
     }
 
     glBindFramebuffer(GL_FRAMEBUFFER, mFrameBuffers[mCurrentFrameBuffer].fbo);

@@ -122,6 +122,18 @@ class AudioPlayer {
      */
     int32_t GetNumOutputChannels() const;
 
+    /**
+     * @brief Returns a short, stable name for the concrete backend (e.g. "SDL", "WASAPI").
+     *
+     * Used for honest status reporting: the active AudioPlayer subclass identifies itself
+     * rather than callers inferring the backend from a possibly-misleading source such as
+     * SDL_GetCurrentAudioDriver() (which reports "none" when a non-SDL backend is active).
+     * The base implementation returns "Unknown"; each concrete backend overrides it.
+     */
+    virtual const char* GetBackendName() const {
+        return "Unknown";
+    }
+
   protected:
     /**
      * @brief Opens and configures the platform audio device.

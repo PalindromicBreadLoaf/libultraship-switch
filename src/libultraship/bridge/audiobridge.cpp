@@ -30,6 +30,15 @@ int32_t AudioPlayerGetDesiredBuffered() {
     return audio->GetDesiredBuffered();
 }
 
+const char* AudioPlayerBackendName() {
+    auto audio = Ship::Context::GetInstance()->GetAudio()->GetAudioPlayer();
+    if (audio == nullptr) {
+        return "None";
+    }
+
+    return audio->GetBackendName();
+}
+
 AudioChannelsSetting GetAudioChannels() {
     auto audio = Ship::Context::GetInstance()->GetAudio()->GetAudioPlayer();
 

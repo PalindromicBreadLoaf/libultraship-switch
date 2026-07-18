@@ -36,6 +36,7 @@ ArchiveManager::~ArchiveManager() {
 }
 
 bool ArchiveManager::IsLoaded() {
+    std::shared_lock lock(mVfsMutex);
     return !mArchives.empty();
 }
 
@@ -48,11 +49,18 @@ std::shared_ptr<File> ArchiveManager::LoadFile(const std::string& filePath) {
 }
 
 std::shared_ptr<File> ArchiveManager::LoadFile(uint64_t hash) {
-    auto archive = mFileToArchive[hash];
-    if (archive == nullptr) {
-        return nullptr;
+    std::shared_ptr<Archive> archive;
+    {
+        // find(), not operator[]: the lookup must not insert a null entry on miss (it also
+        // made this "read" a map mutation, unsafe under the shared lock).
+        std::shared_lock lock(mVfsMutex);
+        auto it = mFileToArchive.find(hash);
+        if (it == mFileToArchive.end() || it->second == nullptr) {
+            return nullptr;
+        }
+        archive = it->second;
     }
-
+    // Archive I/O happens outside the lock: it can be slow and needs no VFS state.
     return archive->LoadFile(hash);
 }
 
@@ -61,11 +69,14 @@ bool ArchiveManager::HasFile(const std::string& filePath) {
 }
 
 bool ArchiveManager::HasFile(uint64_t hash) {
+    std::shared_lock lock(mVfsMutex);
     return mFileToArchive.count(hash) > 0;
 }
 
 std::shared_ptr<Archive> ArchiveManager::GetArchiveFromFile(const std::string& filePath) {
-    return mFileToArchive[CRC64(filePath.c_str())];
+    std::shared_lock lock(mVfsMutex);
+    auto it = mFileToArchive.find(CRC64(filePath.c_str()));
+    return it != mFileToArchive.end() ? it->second : nullptr;
 }
 
 std::shared_ptr<std::vector<std::string>> ArchiveManager::ListFiles(const std::string& searchMask) {
@@ -79,6 +90,7 @@ std::shared_ptr<std::vector<std::string>> ArchiveManager::ListFiles(const std::s
 std::shared_ptr<std::vector<std::string>> ArchiveManager::ListFiles(const std::list<std::string>& includes,
                                                                     const std::list<std::string>& excludes) {
     auto list = std::make_shared<std::vector<std::string>>();
+    std::shared_lock lock(mVfsMutex);
     for (const auto& [hash, path] : mHashes) {
         if (includes.empty() && excludes.empty()) {
             list->push_back(path);
@@ -111,6 +123,7 @@ std::shared_ptr<std::vector<std::string>> ArchiveManager::ListFiles(const std::l
 
 std::shared_ptr<std::vector<std::string>> ArchiveManager::ListDirectories(const std::string& searchMask) {
     auto list = std::make_shared<std::vector<std::string>>();
+    std::shared_lock lock(mVfsMutex);
     for (const std::string& dir : mDirectories) {
         if (glob_match(searchMask.c_str(), dir.c_str())) {
             list->push_back(dir);
@@ -120,21 +133,25 @@ std::shared_ptr<std::vector<std::string>> ArchiveManager::ListDirectories(const 
 }
 
 std::vector<uint32_t> ArchiveManager::GetGameVersions() {
+    std::shared_lock lock(mVfsMutex);
     return mGameVersions;
 }
 
 void ArchiveManager::AddGameVersion(uint32_t newGameVersion) {
+    std::unique_lock lock(mVfsMutex);
     mGameVersions.push_back(newGameVersion);
 }
 
 std::shared_ptr<std::vector<std::shared_ptr<Archive>>> ArchiveManager::GetArchives() {
     auto archives = std::make_shared<std::vector<std::shared_ptr<Archive>>>();
+    std::shared_lock lock(mVfsMutex);
     for (const auto& archive : mArchives) {
         archives->push_back(archive);
     }
     return archives;
 }
 
+// Caller holds mVfsMutex exclusively (RemoveArchive / SetArchives).
 void ArchiveManager::ResetVirtualFileSystem() {
     // Store the original list of archives because we will clear it and re-add them.
     // The re-add will trigger the file virtual file system to get populated.
@@ -146,7 +163,7 @@ void ArchiveManager::ResetVirtualFileSystem() {
     for (const auto& archive : archives) {
         archive->Unload();
         archive->Load();
-        AddArchive(archive);
+        AddArchiveUnlocked(archive);
     }
 }
 
@@ -155,6 +172,7 @@ bool ArchiveManager::WriteFile(std::shared_ptr<Archive> archive, const std::stri
     if (archive) {
         if (archive->WriteFile(filePath, data)) {
             auto hash = CRC64(filePath.c_str());
+            std::unique_lock lock(mVfsMutex);
             mHashes[hash] = filePath;
             mFileToArchive[hash] = archive;
             return true; // Successfully wrote file
@@ -164,6 +182,7 @@ bool ArchiveManager::WriteFile(std::shared_ptr<Archive> archive, const std::stri
 }
 
 size_t ArchiveManager::RemoveArchive(const std::string& path) {
+    std::unique_lock lock(mVfsMutex);
     for (size_t i = 0; i < mArchives.size(); i++) {
         if (path == mArchives[i]->GetPath()) {
             mArchives[i]->Unload();
@@ -181,6 +200,7 @@ size_t ArchiveManager::RemoveArchive(std::shared_ptr<Archive> archive) {
 }
 
 void ArchiveManager::SetArchives(std::shared_ptr<std::vector<std::shared_ptr<Archive>>> archives) {
+    std::unique_lock lock(mVfsMutex);
     mArchives.clear();
 
     if (archives) {
@@ -193,6 +213,7 @@ void ArchiveManager::SetArchives(std::shared_ptr<std::vector<std::shared_ptr<Arc
 }
 
 const std::string* ArchiveManager::HashToString(uint64_t hash) const {
+    std::shared_lock lock(mVfsMutex);
     auto it = mHashes.find(hash);
     return it != mHashes.end() ? &it->second : nullptr;
 }
@@ -261,6 +282,11 @@ std::shared_ptr<Archive> ArchiveManager::AddArchive(const std::string& archivePa
 }
 
 std::shared_ptr<Archive> ArchiveManager::AddArchive(std::shared_ptr<Archive> archive) {
+    std::unique_lock lock(mVfsMutex);
+    return AddArchiveUnlocked(archive);
+}
+
+std::shared_ptr<Archive> ArchiveManager::AddArchiveUnlocked(std::shared_ptr<Archive> archive) {
     if (!archive->IsLoaded()) {
         SPDLOG_WARN("Attempting to add unloaded Archive at {} to Archive Manager", archive->GetPath());
         return nullptr;

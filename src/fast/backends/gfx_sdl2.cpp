@@ -36,6 +36,7 @@
 
 #include "ship/window/gui/Gui.h"
 #include "fast/Fast3dGui.h"
+#include <imgui.h> // touchscreen -> ImGui mouse feed (ImGui's SDL2 backend ignores SDL_FINGER events)
 
 #ifdef _WIN32
 #include <WTypesbase.h>
@@ -630,6 +631,33 @@ void GfxWindowBackendSDL2::HandleSingleEvent(SDL_Event& event) {
             mMouseWheelX = event.wheel.x;
             mMouseWheelY = event.wheel.y;
             break;
+        // Touchscreen -> ImGui: ImGui's SDL2 backend does not translate SDL_FINGER events, and SDL's
+        // touch->mouse synthesis is unreliable under Wayland (ROG Ally). Feed the primary finger to
+        // ImGui as a left-mouse pointer directly so taps/drags drive the menu. tfinger coordinates
+        // are normalized [0,1]; scale by the drawable size ImGui uses for io.DisplaySize. Only the
+        // first active finger acts as the pointer (menus are single-touch); extra fingers are ignored.
+        case SDL_FINGERDOWN:
+        case SDL_FINGERUP:
+        case SDL_FINGERMOTION: {
+            if (event.type == SDL_FINGERDOWN && mPrimaryFingerActive) {
+                break; // a finger is already acting as the pointer
+            }
+            if (event.type != SDL_FINGERDOWN && (!mPrimaryFingerActive || event.tfinger.fingerId != mPrimaryFingerId)) {
+                break; // not the pointer finger
+            }
+            ImGuiIO& io = ImGui::GetIO();
+            io.AddMousePosEvent(event.tfinger.x * static_cast<float>(mWindowWidth),
+                                event.tfinger.y * static_cast<float>(mWindowHeight));
+            if (event.type == SDL_FINGERDOWN) {
+                mPrimaryFingerActive = true;
+                mPrimaryFingerId = event.tfinger.fingerId;
+                io.AddMouseButtonEvent(0, true);
+            } else if (event.type == SDL_FINGERUP) {
+                io.AddMouseButtonEvent(0, false);
+                mPrimaryFingerActive = false;
+            }
+            break;
+        }
 #endif
         case SDL_WINDOWEVENT:
             switch (event.window.event) {

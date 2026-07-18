@@ -342,41 +342,64 @@ const char* Fast3dWindow::GetKeyName(int32_t scancode) {
     return mWindowManagerApi->GetKeyName(scancode);
 }
 
+// These handlers are driven by the window backend's message pump, which ALSO runs
+// synchronously inside DestroyWindow during ~Fast3dWindow — i.e. while ~Context is
+// tearing the singleton down and Context::GetInstance() returns an empty shared_ptr.
+// Every handler must therefore tolerate a dead singleton (this was the Windows exit
+// crash: a queued key/mouse message during DestroyWindow dereferenced null->GetControlDeck()).
 bool Fast3dWindow::KeyUp(int32_t scancode) {
-    if (scancode == Ship::Context::GetInstance()->GetWindow()->GetFullscreenScancode()) {
-        Ship::Context::GetInstance()->GetWindow()->ToggleFullscreen();
+    auto ctx = Ship::Context::GetInstance();
+    if (ctx == nullptr) {
+        return false;
+    }
+    if (scancode == ctx->GetWindow()->GetFullscreenScancode()) {
+        ctx->GetWindow()->ToggleFullscreen();
     }
 
-    if (scancode == Ship::Context::GetInstance()->GetWindow()->GetMouseCaptureScancode()) {
-        Ship::Context::GetInstance()->GetWindow()->GetMouseStateManager()->ToggleMouseCaptureOverride();
+    if (scancode == ctx->GetWindow()->GetMouseCaptureScancode()) {
+        ctx->GetWindow()->GetMouseStateManager()->ToggleMouseCaptureOverride();
     }
 
-    Ship::Context::GetInstance()->GetWindow()->SetLastScancode(-1);
-    return Ship::Context::GetInstance()->GetControlDeck()->ProcessKeyboardEvent(
-        Ship::KbEventType::LUS_KB_EVENT_KEY_UP, static_cast<Ship::KbScancode>(scancode));
+    ctx->GetWindow()->SetLastScancode(-1);
+    return ctx->GetControlDeck()->ProcessKeyboardEvent(Ship::KbEventType::LUS_KB_EVENT_KEY_UP,
+                                                       static_cast<Ship::KbScancode>(scancode));
 }
 
 bool Fast3dWindow::KeyDown(int32_t scancode) {
-    bool isProcessed = Ship::Context::GetInstance()->GetControlDeck()->ProcessKeyboardEvent(
-        Ship::KbEventType::LUS_KB_EVENT_KEY_DOWN, static_cast<Ship::KbScancode>(scancode));
-    Ship::Context::GetInstance()->GetWindow()->SetLastScancode(scancode);
+    auto ctx = Ship::Context::GetInstance();
+    if (ctx == nullptr) {
+        return false;
+    }
+    bool isProcessed = ctx->GetControlDeck()->ProcessKeyboardEvent(Ship::KbEventType::LUS_KB_EVENT_KEY_DOWN,
+                                                                   static_cast<Ship::KbScancode>(scancode));
+    ctx->GetWindow()->SetLastScancode(scancode);
 
     return isProcessed;
 }
 
 void Fast3dWindow::AllKeysUp() {
-    Ship::Context::GetInstance()->GetControlDeck()->ProcessKeyboardEvent(Ship::KbEventType::LUS_KB_EVENT_ALL_KEYS_UP,
-                                                                         Ship::KbScancode::LUS_KB_UNKNOWN);
+    auto ctx = Ship::Context::GetInstance();
+    if (ctx == nullptr) {
+        return;
+    }
+    ctx->GetControlDeck()->ProcessKeyboardEvent(Ship::KbEventType::LUS_KB_EVENT_ALL_KEYS_UP,
+                                                Ship::KbScancode::LUS_KB_UNKNOWN);
 }
 
 bool Fast3dWindow::MouseButtonUp(int button) {
-    return Ship::Context::GetInstance()->GetControlDeck()->ProcessMouseButtonEvent(false,
-                                                                                   static_cast<Ship::MouseBtn>(button));
+    auto ctx = Ship::Context::GetInstance();
+    if (ctx == nullptr) {
+        return false;
+    }
+    return ctx->GetControlDeck()->ProcessMouseButtonEvent(false, static_cast<Ship::MouseBtn>(button));
 }
 
 bool Fast3dWindow::MouseButtonDown(int button) {
-    bool isProcessed = Ship::Context::GetInstance()->GetControlDeck()->ProcessMouseButtonEvent(
-        true, static_cast<Ship::MouseBtn>(button));
+    auto ctx = Ship::Context::GetInstance();
+    if (ctx == nullptr) {
+        return false;
+    }
+    bool isProcessed = ctx->GetControlDeck()->ProcessMouseButtonEvent(true, static_cast<Ship::MouseBtn>(button));
     return isProcessed;
 }
 

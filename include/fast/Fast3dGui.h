@@ -156,6 +156,13 @@ class Fast3dGui : public Ship::Gui {
 
     std::weak_ptr<Interpreter> mInterpreter; ///< Weak reference to the Fast3D scripting interpreter.
     GuiWindowInitData mImpl;                 ///< Backend-specific window/context handles passed to Init().
+    /// WindowBackend captured at Init while the Context singleton is alive. The ImGui
+    /// shutdown methods MUST switch on this cached value: they run from ~Context (whose
+    /// mWindow reset destroys the Window), when Context::GetInstance() already returns an
+    /// empty shared_ptr — re-fetching it there either crashed (null deref) or, when
+    /// null-guarded, skipped the ImGui_Impl*_Shutdown calls and made ImGui::DestroyContext
+    /// assert ("Forgot to shutdown Platform backend?"). -1 = Init never ran.
+    int32_t mCachedBackend = -1;
 
   private:
     /** @brief Applies any pending resolution or MSAA changes to the render target. */

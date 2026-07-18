@@ -15,6 +15,17 @@ API_EXPORT int32_t AudioPlayerBuffered();
 /** @brief Returns the configured target number of buffered audio frames. */
 API_EXPORT int32_t AudioPlayerGetDesiredBuffered();
 
+/**
+ * @brief Returns a short, stable name for the active audio backend.
+ *
+ * Reflects the concrete AudioPlayer subclass currently in use ("SDL", "WASAPI",
+ * "CoreAudio", "Null"). Returns "None" when no player exists yet. Use this instead of
+ * SDL_GetCurrentAudioDriver() for status reporting: the latter returns "none" whenever a
+ * non-SDL backend (e.g. WASAPI on Windows) is active, which is misleading. The returned
+ * pointer is a static string literal owned by the backend and needs no freeing.
+ */
+API_EXPORT const char* AudioPlayerBackendName();
+
 /** @brief Returns the current audio channel mode (stereo / 5.1 matrix / 5.1 raw). */
 API_EXPORT AudioChannelsSetting GetAudioChannels();
 

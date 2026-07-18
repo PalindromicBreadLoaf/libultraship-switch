@@ -370,6 +370,10 @@ void ResourceManager::DirtyResources(const std::string& searchMask) {
     DirtyResources({ { searchMask }, {}, mDefaultCacheOwner, mDefaultCacheArchive });
 }
 
+void ResourceManager::WaitForAsyncTasks() {
+    mThreadPool->wait();
+}
+
 void ResourceManager::UnloadResourcesAsync(const std::string& searchMask, BS::priority_t priority) {
     UnloadResourcesAsync({ { searchMask }, {}, mDefaultCacheOwner, mDefaultCacheArchive }, priority);
 }
