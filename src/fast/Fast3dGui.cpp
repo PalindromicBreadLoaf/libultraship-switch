@@ -341,12 +341,6 @@ void Fast3dGui::CalculateGameViewport() {
     mainPos.x -= mTemporaryWindowPos.x;
     mainPos.y -= mTemporaryWindowPos.y;
     ImVec2 size = ImGui::GetContentRegionAvail();
-    { static bool sDiag = false; if (!sDiag) { sDiag = true;
-        if (FILE* f = fopen("gdx_diag.txt", "a")) {
-            fprintf(f, "[diag-viewport] imgui content region: %dx%d win pos=(%d,%d)\n",
-                    (int)size.x, (int)size.y, (int)mainPos.x, (int)mainPos.y);
-            fclose(f);
-        } } }
     mInterpreter.lock()->mCurDimensions.width = (uint32_t)(size.x * mInterpreter.lock()->mCurDimensions.internal_mul);
     mInterpreter.lock()->mCurDimensions.height = (uint32_t)(size.y * mInterpreter.lock()->mCurDimensions.internal_mul);
     mInterpreter.lock()->mGameWindowViewport.x = (int16_t)mainPos.x;
@@ -408,6 +402,42 @@ void Fast3dGui::DrawGame() {
         const float sw = size.y * 320.0f / 240.0f;
         pos = ImVec2(floor(size.x / 2 - sw / 2), 0);
         size = ImVec2(sw, size.y);
+    } else if (Ship::Context::GetInstance()->GetConsoleVariables()->GetInteger("gEnhancements.Graphics.Widescreen",
+                                                                               1) == 0 ||
+               gdx_get_force_fixed_aspect() != 0) {
+        // 4:3 pillarbox (gEnhancements.Graphics.Widescreen == 0, or the game published the
+        // fixed-aspect runtime flag for a mode that must render stock 4:3 -- the Expansion Kit
+        // editors; see G-Diffuser input_bridge.c gdx_fixed_aspect_publish and the flag's
+        // definition in interpreter.cpp). Read live: the flag can change at the mode-flip
+        // mid-dispatch and this composite decision must track it within the same frame.
+        //
+        // This branch MUST precede the Advanced Resolution branch below. Advanced Resolution is
+        // how the port renders above native res (e.g. an HD 1920x1080 internal target), and its
+        // non-pixel-perfect fit sizes the composite from mCurDimensions' aspect -- which is
+        // widescreen (16:9+) for a normal HD profile. When it ran first it blitted the game
+        // framebuffer full-window, so the native-proportion content this fixed-aspect frame
+        // produced (Interpreter::AdjXForAspectRatio returns x unchanged, filling the full FB
+        // width) was shown stretched to 16:9 with no pillarbox even though StartFrame had forced
+        // the offscreen render target (renders_fb=1). Checking the fixed-aspect condition first
+        // makes the forced-4:3 and Widescreen==0 frames pillarbox regardless of the Advanced
+        // Resolution aspect, matching the stock Widescreen==0 pillarbox exactly. Normal play
+        // (Widescreen==1 && !forceFixed) fails this condition and falls through to the Advanced
+        // Resolution branch unchanged, so PixelPerfect / IgnoreAspectCorrection are preserved.
+        //
+        // The game framebuffer holds native-proportion content stretched to the FB's (window)
+        // aspect. Drawing that full-width framebuffer into a centred 4:3 rect compresses it back
+        // to native proportions; the cleared window background then forms the side bars. Falls
+        // back to letterbox if the window is narrower than 4:3. Interpreter::StartFrame forces the
+        // offscreen render target this relies on.
+        const float targetAspect = 4.0f / 3.0f;
+        float sWdth = size.y * targetAspect;
+        float sHght = size.y;
+        if (sWdth > size.x) { // window narrower than 4:3 -> letterbox instead of pillarbox
+            sWdth = size.x;
+            sHght = size.x / targetAspect;
+        }
+        pos = ImVec2(floor((size.x - sWdth) / 2.0f), floor((size.y - sHght) / 2.0f));
+        size = ImVec2(sWdth, sHght);
     } else if (Ship::Context::GetInstance()->GetConsoleVariables()->GetInteger(
                    CVAR_PREFIX_ADVANCED_RESOLUTION ".Enabled", 0)) {
         if (!Ship::Context::GetInstance()->GetConsoleVariables()->GetInteger(
@@ -439,29 +469,6 @@ void Fast3dGui::DrawGame() {
             size = ImVec2(float(mInterpreter.lock()->mCurDimensions.width) * factor,
                           float(mInterpreter.lock()->mCurDimensions.height) * factor);
         }
-    } else if (Ship::Context::GetInstance()->GetConsoleVariables()->GetInteger("gEnhancements.Graphics.Widescreen",
-                                                                               1) == 0 ||
-               gdx_get_force_fixed_aspect() != 0) {
-        // 4:3 pillarbox (gEnhancements.Graphics.Widescreen == 0, or the game published the
-        // fixed-aspect runtime flag for a mode that must render stock 4:3 -- the Expansion Kit
-        // editors; see G-Diffuser input_bridge.c gdx_fixed_aspect_publish and the flag's
-        // definition in interpreter.cpp). Read live: the flag can change at the mode-flip
-        // mid-dispatch and this composite decision must track it within the same frame.
-        // With widescreen disabled the game
-        // framebuffer holds native-proportion content stretched to the window's aspect, because
-        // Interpreter::AdjXForAspectRatio returns x unchanged. Drawing that full-width framebuffer
-        // into a centred 4:3 rect compresses it back to native proportions; the cleared window
-        // background then forms the side bars. Falls back to letterbox if the window is narrower
-        // than 4:3. Interpreter::StartFrame forces the offscreen render target this relies on.
-        const float targetAspect = 4.0f / 3.0f;
-        float sWdth = size.y * targetAspect;
-        float sHght = size.y;
-        if (sWdth > size.x) { // window narrower than 4:3 -> letterbox instead of pillarbox
-            sWdth = size.x;
-            sHght = size.x / targetAspect;
-        }
-        pos = ImVec2(floor((size.x - sWdth) / 2.0f), floor((size.y - sHght) / 2.0f));
-        size = ImVec2(sWdth, sHght);
     }
     uintptr_t fb = Ship::Context::GetInstance()->GetWindow()->GetGfxFrameBuffer();
     if (fb) {

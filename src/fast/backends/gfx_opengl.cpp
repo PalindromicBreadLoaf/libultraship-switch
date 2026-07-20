@@ -322,7 +322,7 @@ std::string GfxRenderingAPIOGL::BuildFsShader(const CCFeatures& cc_features) {
         Ship::Context::GetInstance()->GetResourceManager()->LoadResource(path, true, init));
 
     if (res == nullptr) {
-        SPDLOG_ERROR("Failed to load default fragment shader, missing f3d.o2r?");
+        SPDLOG_ERROR("Failed to load default fragment shader, missing gdiffuser.o2r?");
         abort();
     }
 
@@ -388,7 +388,7 @@ static std::string BuildVsShader(const CCFeatures& cc_features) {
         Ship::Context::GetInstance()->GetResourceManager()->LoadResource(path, true, init));
 
     if (res == nullptr) {
-        SPDLOG_ERROR("Failed to load default vertex shader, missing f3d.o2r?");
+        SPDLOG_ERROR("Failed to load default vertex shader, missing gdiffuser.o2r?");
         abort();
     }
 
@@ -1020,24 +1020,72 @@ void GfxRenderingAPIOGL::ReadFramebufferToCPU(int fb_id, uint32_t width, uint32_
         return;
     }
 
+    const FramebufferOGL& fb = mFrameBuffers[fb_id];
+
+    // The requested output size (width/height) is frequently NOT the real size of
+    // this framebuffer: transition captures request a fixed 320x240, but the source
+    // framebuffer is resized to the window every frame (see UpdateFramebufferParameters,
+    // which stores the applied size in fb.width/fb.height). glReadPixels(0,0,width,height)
+    // would then read a top-left CROP of the real image, distorting the captured frame.
+    // Match the DX11 path (GfxRenderingAPIDX11::ReadFramebufferToCPU): read the FULL
+    // framebuffer at its actual size and nearest-neighbor resample to the requested size.
+    // fb.width/fb.height are tracked CPU-side, so no glGetTexLevelParameteriv query needed.
+    const uint32_t actualW = std::max<uint32_t>(fb.width, 1u);
+    const uint32_t actualH = std::max<uint32_t>(fb.height, 1u);
+
+    // Row-order contract: DX11 is the reference the transition consumer is validated
+    // against — its readback returns output row 0 = TOP of the scene. For an
+    // invertY framebuffer the interpreter already negates vertex Y at render time
+    // (Interpreter's invertY handling), so the image is stored physically TOP-DOWN in
+    // the FBO and a straight row-order read already matches DX11 (device-verified: adding
+    // a flip here rendered Linux transition wipes upside-down). Only a conventional
+    // bottom-up framebuffer (invertY == false) needs the vertical flip to produce
+    // top-down output.
+    const bool flipY = !fb.invertY;
+
     // Read as RGBA8 (GL_UNSIGNED_BYTE) then convert to RGBA16 (5551).
     // GL_RGBA + GL_UNSIGNED_SHORT_5_5_5_1 writes 4 separate u16 components per pixel
     // (8 bytes) on some drivers (NVIDIA), not the packed 2 bytes the spec implies.
     // Reading as RGBA8 and converting matches the DX11 path's approach.
-    glBindFramebuffer(GL_FRAMEBUFFER, mFrameBuffers[fb_id].fbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, fb.fbo);
 
-    std::vector<uint8_t> rgba8(width * height * 4);
-    glReadPixels(0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE, rgba8.data());
+    // Coverage bit, not alpha (parity with the DX11 readback): the framebuffer's host
+    // alpha is often 0 for fully opaque rendered pixels, and games redraw captured
+    // frames through alpha-compare passes — deriving the bit from host alpha discards
+    // those texels (blank transition wipes). Every rendered pixel has full coverage.
+    if (actualW == width && actualH == height && !flipY) {
+        // Fast path: sizes already match and no vertical flip is needed. Identical to
+        // the previous direct read — no temporary buffer and no resample.
+        std::vector<uint8_t> rgba8((size_t)width * height * 4);
+        glReadPixels(0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE, rgba8.data());
 
-    for (uint32_t i = 0; i < width * height; i++) {
-        uint8_t r = (rgba8[i * 4 + 0] >> 3) & 0x1F;
-        uint8_t g = (rgba8[i * 4 + 1] >> 3) & 0x1F;
-        uint8_t b = (rgba8[i * 4 + 2] >> 3) & 0x1F;
-        // Coverage bit, not alpha (parity with the DX11 readback): the framebuffer's host
-        // alpha is often 0 for fully opaque rendered pixels, and games redraw captured
-        // frames through alpha-compare passes — deriving the bit from host alpha discards
-        // those texels (blank transition wipes). Every rendered pixel has full coverage.
-        rgba16_buf[i] = (r << 11) | (g << 6) | (b << 1) | 1;
+        for (uint32_t i = 0; i < width * height; i++) {
+            uint8_t r = (rgba8[i * 4 + 0] >> 3) & 0x1F;
+            uint8_t g = (rgba8[i * 4 + 1] >> 3) & 0x1F;
+            uint8_t b = (rgba8[i * 4 + 2] >> 3) & 0x1F;
+            rgba16_buf[i] = (r << 11) | (g << 6) | (b << 1) | 1;
+        }
+    } else {
+        // General path: read the full framebuffer, then nearest-neighbor downsample to
+        // the requested size using the same index math as DX11
+        // (srcX = i * actualW / width, srcY = j * actualH / height).
+        std::vector<uint8_t> rgba8((size_t)actualW * actualH * 4);
+        glReadPixels(0, 0, actualW, actualH, GL_RGBA, GL_UNSIGNED_BYTE, rgba8.data());
+
+        for (uint32_t j = 0; j < height; j++) {
+            // Logical (top-down) source row, then converted to glReadPixels' bottom-left
+            // physical row order per the row-order contract documented above.
+            uint32_t srcYLogical = j * actualH / height;
+            uint32_t srcYPhys = flipY ? (actualH - 1 - srcYLogical) : srcYLogical;
+            const uint8_t* srcRow = rgba8.data() + (size_t)srcYPhys * actualW * 4;
+            for (uint32_t i = 0; i < width; i++) {
+                uint32_t srcX = i * actualW / width;
+                uint8_t r = (srcRow[srcX * 4 + 0] >> 3) & 0x1F;
+                uint8_t g = (srcRow[srcX * 4 + 1] >> 3) & 0x1F;
+                uint8_t b = (srcRow[srcX * 4 + 2] >> 3) & 0x1F;
+                rgba16_buf[i + j * width] = (r << 11) | (g << 6) | (b << 1) | 1;
+            }
+        }
     }
 
     glBindFramebuffer(GL_FRAMEBUFFER, mFrameBuffers[mCurrentFrameBuffer].fbo);

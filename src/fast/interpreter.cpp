@@ -647,24 +647,6 @@ int gGdxTraceSeq = 0;
 // diagnostics above can be restricted to in-race rendering (menu screens
 // otherwise exhaust the probe caps before the race is ever reached).
 extern "C" int gGdxRaceActive = 0;
-// Defined in port/n64_gfx_bridge.cpp; set to 1 by decomp's Racer_Draw right
-// when the "3,2,1,GO" countdown draw code runs (see racer.c ~6672). Used here
-// to arm a one-shot RDP render-state dump for bug #16 (invisible countdown
-// faces) -- the countdown geometry/matrix were already confirmed sane at the
-// draw, so the remaining suspects are render-state: blend/combine mode,
-// scissor/viewport, or z-occlusion.
-extern "C" int gGdxCountdownProbeArm;
-// #16 phase 3: gGdxCountdownProbeArm alone stays 1 for the rest of the process
-// once the countdown first runs, so the old edge-trigger on that flag caught
-// whatever triangle the interpreter happened to reach first afterward -- not
-// necessarily the countdown digit quad. n64_gfx_bridge.cpp publishes the
-// resolved host pointer of the digit quad's own vertex buffer here (tagged
-// decomp-side in racer.c, matched bridge-side by raw low32) the instant it
-// translates that specific G_VTX command. GfxSpVertex below compares its own
-// vertex pointer argument against this to latch precisely onto that draw.
-extern "C" uintptr_t gGdxCountdownProbeResolvedVtx;
-static bool sGdxCountdownDigitVtxLatched = false;
-
 // Ring buffer of recent tile writes; flushed to disk only when a suspect draw
 // fires, so the trace shows exactly the SETTILE history leading to that draw.
 #include <deque>
@@ -1685,7 +1667,9 @@ void Interpreter::ImportTexture(int i, int tile, bool importReplacement) {
         // race-gated but UNGATED by the env flag and with their own budget, so the
         // verdict "does ImportTexture ever run for these tiles" cannot be lost to
         // env-ordering or budget accidents again.
-        if (gGdxRaceActive != 0 && tile >= 1 && tile <= 4) {
+        // Env-gated (GDX_DIAG_EFFECTTILE) so a normal Release run stays silent; cached once.
+        static const bool sDiagEffectTile = std::getenv("GDX_DIAG_EFFECTTILE") != nullptr;
+        if (sDiagEffectTile && gGdxRaceActive != 0 && tile >= 1 && tile <= 4) {
             static int sEffectTileLogs = 0;
             if (sEffectTileLogs < 64) {
                 ++sEffectTileLogs;
@@ -1718,7 +1702,16 @@ void Interpreter::ImportTexture(int i, int tile, bool importReplacement) {
     }
 
     if (origAddr == nullptr) {
-        SPDLOG_WARN("ImportTexture: null texture address for tile {} at TMEM word {}", tile, tmemIdex);
+        static std::array<uint32_t, 32> sNullTextureWarningKeys{};
+        static size_t sNullTextureWarningKeyCount = 0;
+        const uint32_t warningKey = (static_cast<uint32_t>(tile) << 16) | static_cast<uint16_t>(tmemIdex);
+        const auto warningKeysEnd = sNullTextureWarningKeys.begin() + sNullTextureWarningKeyCount;
+        if (std::find(sNullTextureWarningKeys.begin(), warningKeysEnd, warningKey) == warningKeysEnd &&
+            sNullTextureWarningKeyCount < sNullTextureWarningKeys.size()) {
+            sNullTextureWarningKeys[sNullTextureWarningKeyCount++] = warningKey;
+            SPDLOG_WARN("ImportTexture: null texture address for tile {} at TMEM word {}; repeats suppressed", tile,
+                        tmemIdex);
+        }
         return;
     }
 
@@ -1798,12 +1791,45 @@ void Interpreter::ImportTexture(int i, int tile, bool importReplacement) {
         diagnosticForcePreFlxOpaqueAlpha && mF3dex2Variant != F3dex2Variant::FZeroFlxReject;
     key.force_opaque_alpha = forceOpaqueAlpha;
 
-    // TMEM-decoded textures (raw RGBA16) are cached by CONTENT: hash the
-    // tile's emulated-TMEM span so a repeat of the same source address with
-    // different TMEM contents cannot hit a stale entry and bypass the decode.
+    // TMEM-decoded textures are cached by CONTENT: hash the tile's emulated-TMEM
+    // span so a repeat of the same source address with different TMEM contents
+    // cannot hit a stale entry and bypass the decode.
+    //
+    // Format coverage:
+    //   * RGBA16 — always hashed (unchanged, proven). Protects F-Zero X driver
+    //     names / RGBA16 glyphs that decode into reused arena addresses.
+    //   * I4 / I8 and IA4 / IA8 / IA16 — hashed too (opt-out via
+    //     GDX_FONT_CONTENT_HASH=0). These are the FONT paths that previously had
+    //     ZERO collision protection: I4 FONT_SET_3 course names ("SILENCE",
+    //     editor menu labels) and the editor's streamed dialog glyphs (A2E90.c's
+    //     rolling glyph buffer) decode into REUSED TMEM/arena addresses, so a
+    //     content change at the same address returned a stale GPU texture and
+    //     produced scrambled text. IA text shares the same reuse hazard.
+    //   * CI is DELIBERATELY EXCLUDED here. Its palette-content aspect is handled
+    //     separately and opt-in via GDX_CI_PALETTE_HASH above; a prior attempt to
+    //     fold CI into this same content-hash gate caused a race regression
+    //     ("frozen menu fades" / CI decode race), so CI must never be added to
+    //     this predicate.
+    //
+    // The hash itself is format-agnostic: it folds raw TMEM bytes. The hashed
+    // length uses line_size_bytes (the tile's per-line TMEM byte FOOTPRINT, which
+    // already accounts for 4-bit packing — I4 stores two texels per byte, so its
+    // line_size_bytes is proportionally smaller). min(remaining TMEM, lineBytes*64)
+    // therefore covers up to ~64 rows of the actual load for any format without
+    // over- or under-hashing, so no per-format size adjustment is required.
     static const bool sTmemCacheDisabled = std::getenv("GDX_NO_TMEM") != nullptr;
-    if (!sTmemCacheDisabled && !importReplacement && metadata->resource == nullptr && fmt == G_IM_FMT_RGBA &&
-        siz == G_IM_SIZ_16b) {
+    static const bool sFontContentHashDisabled = [] {
+        const char* v = std::getenv("GDX_FONT_CONTENT_HASH");
+        return v != nullptr && v[0] == '0';
+    }();
+    const bool isRgba16 = (fmt == G_IM_FMT_RGBA && siz == G_IM_SIZ_16b);
+    const bool isFontFmt = (fmt == G_IM_FMT_I && (siz == G_IM_SIZ_4b || siz == G_IM_SIZ_8b)) ||
+                           (fmt == G_IM_FMT_IA &&
+                            (siz == G_IM_SIZ_4b || siz == G_IM_SIZ_8b || siz == G_IM_SIZ_16b));
+    // RGBA16 stays gated exactly as before; the env only toggles the new I/IA
+    // coverage, leaving the RGBA16 path byte-for-byte unchanged when it is off.
+    const bool hashThisFormat = isRgba16 || (!sFontContentHashDisabled && isFontFmt);
+    if (!sTmemCacheDisabled && !importReplacement && metadata->resource == nullptr && hashThisFormat) {
         const uint32_t tmemByteOffset = static_cast<uint32_t>(tmemIdex) * 8u;
         const uint32_t lineBytes = mRdp->texture_tile[tile].line_size_bytes;
         if (tmemByteOffset < sizeof(mRdp->tmem) && lineBytes >= 2) {
@@ -2114,16 +2140,6 @@ void Interpreter::AdjustWidthHeightForScale(uint32_t& width, uint32_t& height, u
 }
 
 void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx* vertices) {
-    /* #16 phase 3: latch precisely onto the countdown digit quad's own vertex
-       load (see gGdxCountdownProbeResolvedVtx above) so the render-state dump
-       further down this file fires on the triangle(s) that actually consume
-       this buffer instead of the first triangle reached after the coarse arm
-       flag went high. */
-    if (gGdxCountdownProbeArm != 0 && gGdxCountdownProbeResolvedVtx != 0 &&
-        reinterpret_cast<uintptr_t>(vertices) == gGdxCountdownProbeResolvedVtx) {
-        sGdxCountdownDigitVtxLatched = true;
-    }
-
     for (size_t i = 0; i < n_vertices; i++, dest_index++) {
         const F3DVtx_t* v = &vertices[i].v;
         const F3DVtx_tn* vn = &vertices[i].n;
@@ -2176,7 +2192,52 @@ void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx
             world_pos[2] = v->ob[0] * mtx[0][2] + v->ob[1] * mtx[1][2] + v->ob[2] * mtx[2][2] + mtx[3][2];
         }
 
-        x = AdjXForAspectRatio(x);
+        // G_EX_WIDESCREEN_STRETCH honoring for the vertex path (mirror of GfxDrawRectangle's
+        // stretch branch, interpreter.cpp GfxDrawRectangle). The screen-transition tiles
+        // (decomp transition.c Transition_TiledDraw: gSPVertex + gSP2Triangles) redraw the
+        // captured widescreen background as triangles inside an active STRETCH scope; without
+        // this, those vertices would take the unconditional hor+ AdjXForAspectRatio path and
+        // the capture would be squeezed into the central 4:3 band.
+        //
+        // Coordinate-space derivation. At this point `x` is the clip-space X coordinate
+        // (post-MP_matrix, pre-perspective divide). The renderer forms NDC X as x/w, and the
+        // game's projection maps the native full screen width to NDC [-1, 1] -- the same
+        // [-1, 1] mapping GfxDrawRectangle uses for its rectangle corners before adjustment.
+        // AdjXForAspectRatio multiplies clip-space x by a constant; because (k*x)/w == k*(x/w),
+        // scaling clip-space x by k scales NDC x by the identical k. GfxDrawRectangle's STRETCH
+        // branch, instead of applying the hor+ AdjXForAspectRatio compression, scales the
+        // already-[-1, 1] rectangle NDC x by kSafeAreaScale = 160/(160-12) so the native 2D
+        // safe area (x = 12..308) reaches the true viewport edges and fills the frame. To keep
+        // triangle draws consistent with rectangle draws under one STRETCH scope, apply the
+        // identical NDC scale here: multiply clip-space x by kSafeAreaScale in place of
+        // AdjXForAspectRatio.
+        //
+        // Fast path: the flag test below reads a value already loaded and, when unset (all
+        // normal geometry), takes the historical single AdjXForAspectRatio call unchanged --
+        // byte-identical to prior behavior. The activation predicate replicates
+        // GfxDrawRectangle's `widescreenFrameActive && stretch` exactly, so precedence matches:
+        // a forced-fixed-aspect or non-widescreen frame leaves widescreenFrameActive false and
+        // falls back to AdjXForAspectRatio (which itself returns x unchanged when forceFixed is
+        // set or widescreen is disabled). If both the STRETCH flag and mForceFixedAspectCache
+        // are somehow set at once, forceFixed wins -- no stretch -- mirroring the rectangle path.
+        if ((mRsp->extra_geometry_mode & G_EX_WIDESCREEN_STRETCH) != 0) {
+            const bool fixedAspectFramebuffer =
+                mFbActive && mActiveFrameBuffer != mFrameBuffers.end() &&
+                (!mActiveFrameBuffer->second.resize || mActiveFrameBuffer->second.forceFixedAspect);
+            const bool widescreenFrameActive =
+                !fixedAspectFramebuffer &&
+                ((float)mCurDimensions.width / (float)mCurDimensions.height) > (4.0f / 3.0f) &&
+                mWidescreenEnabledCache && !mForceFixedAspectCache;
+            if (widescreenFrameActive) {
+                // Identical calibration to GfxDrawRectangle: native safe area x=12..308 -> full viewport.
+                constexpr float kSafeAreaScale = 160.0f / (160.0f - 12.0f);
+                x = x * kSafeAreaScale;
+            } else {
+                x = AdjXForAspectRatio(x);
+            }
+        } else {
+            x = AdjXForAspectRatio(x);
+        }
 
         short U = v->tc[0] * mRsp->texture_scaling_factor.s >> 16;
         short V = v->tc[1] * mRsp->texture_scaling_factor.t >> 16;
@@ -2663,63 +2724,6 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
         }
     }
 
-    // Countdown render-state probe (#16, phase 3): the countdown "3,2,1,GO"
-    // quad's object-space geometry and modelview matrix were already confirmed
-    // sane via the [rect]/[mtx-content] probes, so the remaining suspects for
-    // its invisibility are RDP render state -- blend/combine mistranslation,
-    // scissor/viewport placement, z-occlusion, or draw order. Phase 2 dumped
-    // on the coarse 0->armed transition of gGdxCountdownProbeArm, but that flag
-    // is set once decomp-side and never reset, so the edge trigger fired on
-    // whatever triangle the interpreter reached FIRST after the transition --
-    // not necessarily the digit quad (the captured state was an all-zero/FILL
-    // pipeline, consistent with an unrelated early-frame draw, not this HUD
-    // quad). Fire instead on sGdxCountdownDigitVtxLatched, set by GfxSpVertex
-    // only when the just-loaded vertex buffer is the digit quad's own
-    // (matched by resolved host pointer via gGdxCountdownProbeResolvedVtx), so
-    // this captures the triangle that actually consumes that buffer.
-    {
-        static int sCountdownRenderStateLogs = 0;
-        if (sGdxCountdownDigitVtxLatched) {
-            // Consume the latch on this first triangle after the digit quad's
-            // vertex load; otherwise it would stay set and mis-fire again on
-            // whatever draw happens to be next once the log cap is exhausted.
-            sGdxCountdownDigitVtxLatched = false;
-        if (sCountdownRenderStateLogs < 40) {
-            ++sCountdownRenderStateLogs;
-            FILE* tf = fopen("countdown-renderstate.txt", sCountdownRenderStateLogs == 1 ? "w" : "a");
-            if (tf != nullptr) {
-                const uint8_t tile = mRdp->first_tile_index;
-                fprintf(tf,
-                        "[countdown-rs] #%d ucode_variant=%d geo_mode=%08X other_mode_l=%08X "
-                        "other_mode_h=%08X combine=%016llX "
-                        "prim=(%u,%u,%u,%u) env=(%u,%u,%u,%u) blend=(%u,%u,%u,%u) fog=(%u,%u,%u,%u) "
-                        "scissor=(%d,%d,%u,%u) viewport=(%d,%d,%u,%u) "
-                        "tile=%u fmt=%u siz=%u cms=%u cmt=%u masks=%u maskt=%u tmem=%u "
-                        "zbuf=%p cimg=%p\n",
-                        sCountdownRenderStateLogs,
-                        static_cast<int>(mF3dex2Variant),
-                        mRsp->geometry_mode,
-                        mRdp->other_mode_l, mRdp->other_mode_h,
-                        static_cast<unsigned long long>(mRdp->combine_mode),
-                        mRdp->prim_color.r, mRdp->prim_color.g, mRdp->prim_color.b, mRdp->prim_color.a,
-                        mRdp->env_color.r, mRdp->env_color.g, mRdp->env_color.b, mRdp->env_color.a,
-                        mRdp->blend_color.r, mRdp->blend_color.g, mRdp->blend_color.b, mRdp->blend_color.a,
-                        mRdp->fog_color.r, mRdp->fog_color.g, mRdp->fog_color.b, mRdp->fog_color.a,
-                        mRdp->scissor.x, mRdp->scissor.y, mRdp->scissor.width, mRdp->scissor.height,
-                        mRdp->viewport.x, mRdp->viewport.y, mRdp->viewport.width, mRdp->viewport.height,
-                        static_cast<unsigned>(tile),
-                        mRdp->texture_tile[tile].fmt, mRdp->texture_tile[tile].siz,
-                        mRdp->texture_tile[tile].cms, mRdp->texture_tile[tile].cmt,
-                        mRdp->texture_tile[tile].masks, mRdp->texture_tile[tile].maskt,
-                        mRdp->texture_tile[tile].tmem,
-                        reinterpret_cast<void*>(mRdp->z_buf_address),
-                        reinterpret_cast<void*>(mRdp->color_image_address));
-                fclose(tf);
-            }
-        }
-        }
-    }
-
     // depth_test is set when the fragment has a depth value to compare (either from vertex Z via
     // RSP G_ZBUFFER, or from the prim-depth register via G_ZS_PRIM) and Z_CMP is requested.
     bool zbuffer_enabled = (mRsp->geometry_mode & G_ZBUFFER) == G_ZBUFFER;
@@ -2910,7 +2914,9 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
     // is untested; log the combine id and which texel slots the combiner
     // actually uses so one more race run can confirm or rule this out
     // without touching the proven TMEM store/lookup path.
-    if (gGdxRaceActive != 0 && texel0Tile >= 1 && texel0Tile <= 4) {
+    // Env-gated (GDX_DIAG_EFFECTDRAW) so a normal Release run stays silent; cached once.
+    static const bool sDiagEffectDraw = std::getenv("GDX_DIAG_EFFECTDRAW") != nullptr;
+    if (sDiagEffectDraw && gGdxRaceActive != 0 && texel0Tile >= 1 && texel0Tile <= 4) {
         static int sEffectDrawStateLogs = 0;
         if (sEffectDrawStateLogs < 64) {
             ++sEffectDrawStateLogs;
@@ -3159,7 +3165,9 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
             int shifts = mRdp->texture_tile[uv_tile].shifts;
             int shiftt = mRdp->texture_tile[uv_tile].shiftt;
 
-            if (pitUvProbeThisTri && t == 0) {
+            // Env-gated (GDX_DIAG_PITUV) so a normal Release run stays silent; cached once.
+            static const bool sDiagPitUv = std::getenv("GDX_DIAG_PITUV") != nullptr;
+            if (sDiagPitUv && pitUvProbeThisTri && t == 0) {
                 SPDLOG_ERROR("[pit-uv-probe] tri={} vtx={} tile={} s={} t={} uls={} ult={} lrs={} lrt={} "
                              "shifts={} shiftt={}",
                              sPitUvProbeTris, i, uv_tile, (int)v_arr[i]->u, (int)v_arr[i]->v,
@@ -5634,7 +5642,14 @@ bool gfx_set_timg_otr_filepath_handler_custom(F3DGfx** cmd0) {
         gfx->GfxDpSetTextureImage(fmt, size, width, fileName, texFlags, rawTexMetadata,
                                   reinterpret_cast<char*>(texture->ImageData));
     } else {
-        SPDLOG_ERROR("G_SETTIMG_OTR_FILEPATH: Texture is null");
+        static uint32_t sMissingTextureLogs = 0;
+        if (sMissingTextureLogs < 8) {
+            ++sMissingTextureLogs;
+            SPDLOG_ERROR("G_SETTIMG_OTR_FILEPATH: Texture '{}' is null", fileName);
+            if (sMissingTextureLogs == 8) {
+                SPDLOG_ERROR("G_SETTIMG_OTR_FILEPATH: further missing-texture errors suppressed");
+            }
+        }
     }
     return false;
 }
@@ -6581,6 +6596,14 @@ bool Interpreter::ViewportMatchesRendererResolution() {
 #endif
 }
 
+// PORT (G-Diffuser): tracks whether StartFrame sized mGameFbMsaaResolved for the current frame.
+// Run()'s prologue re-latches the fixed-aspect flag mid-frame (see Run), so a mode flip that
+// happens AFTER StartFrame can make the epilogue request an MSAA resolve into mGameFbMsaaResolved
+// that StartFrame never allocated (e.g. the first editor-entry frame with MSAA on and 1x internal
+// resolution). When that happens this flag stays false and the epilogue falls back to the
+// resolve-to-0 shortcut rather than publishing an unallocated framebuffer's texture id.
+static bool sGameFbMsaaResolvedSized = false;
+
 void Interpreter::StartFrame() {
     mWapi->GetDimensions(&mGfxCurrentWindowDimensions.width, &mGfxCurrentWindowDimensions.height, &mCurWindowPosX,
                          &mCurWindowPosY);
@@ -6625,6 +6648,7 @@ void Interpreter::StartFrame() {
     mForceFixedAspectCache = sGdxForceFixedAspect != 0;
     mWidescreenUiCache = CVarGetInteger("gEnhancements.Graphics.WidescreenUI", 0) != 0;
     const bool widescreenPillarbox = !mWidescreenEnabledCache || mForceFixedAspectCache;
+    sGameFbMsaaResolvedSized = false;
     if (!ViewportMatchesRendererResolution() || mMsaaLevel > 1 || widescreenPillarbox) {
         mRendersToFb = true;
         if (!ViewportMatchesRendererResolution() || (widescreenPillarbox && mMsaaLevel <= 1)) {
@@ -6636,9 +6660,17 @@ void Interpreter::StartFrame() {
             mRapi->UpdateFramebufferParameters(mGameFb, mGfxCurrentWindowDimensions.width,
                                                mGfxCurrentWindowDimensions.height, mMsaaLevel, false, true, true, true);
         }
-        if (mMsaaLevel > 1 && !ViewportMatchesRendererResolution()) {
+        // The MSAA resolve target must exist not only when the viewport differs from the render
+        // resolution, but also when a whole-frame pillarbox is required (Widescreen off, or forced
+        // fixed aspect for the EK editors). In the pillarbox case the epilogue must resolve into
+        // this offscreen target and publish it as mGfxFrameBuffer so Fast3dGui::DrawGame composites
+        // the centred 4:3 sub-region; resolving straight to the window (framebuffer 0) would stretch
+        // the 4:3 content across the whole 16:9 window. Sized to mCurDimensions, matching the
+        // non-matching-viewport case above.
+        if (mMsaaLevel > 1 && (!ViewportMatchesRendererResolution() || widescreenPillarbox)) {
             mRapi->UpdateFramebufferParameters(mGameFbMsaaResolved, mCurDimensions.width, mCurDimensions.height, 1,
                                                false, false, false, false);
+            sGameFbMsaaResolvedSized = true;
         }
     } else {
         mRendersToFb = false;
@@ -6651,6 +6683,12 @@ GfxExecStack g_exec_stack = {};
 
 void Interpreter::RunGuiOnly() {
     SpReset();
+
+    // PORT (G-Diffuser): unlike Run(), this path does NOT re-latch mForceFixedAspectCache, so it has
+    // no StartFrame-vs-here staleness gap: mRendersToFb and this epilogue's widescreenPillarbox both
+    // derive from StartFrame's single latch and stay consistent. No aspect mode flip reaches the GUI-
+    // only path (a mode change arrives with a game task, which dispatches through Run()). If a future
+    // change adds a re-latch here, it MUST also recompute mRendersToFb the way Run()'s prologue does.
 
     mGetPixelDepthPending.clear();
     mGetPixelDepthCached.clear();
@@ -6668,13 +6706,24 @@ void Interpreter::RunGuiOnly() {
     mGfxFrameBuffer = 0;
 
     if (mRendersToFb) {
+        const bool widescreenPillarbox = !mWidescreenEnabledCache || mForceFixedAspectCache;
         mRapi->StartDrawToFramebuffer(0, 1);
         mRapi->ClearFramebuffer(true, true);
         if (mMsaaLevel > 1) {
-            if (!ViewportMatchesRendererResolution()) {
+            if (ViewportMatchesRendererResolution() && !widescreenPillarbox) {
+                // Normal path (widescreen play at 1x, viewport == render resolution): resolve the
+                // MSAA game FB straight to the window. mGfxFrameBuffer stays 0, so DrawGame presents
+                // the resolved window contents directly.
+                mRapi->ResolveMSAAColorBuffer(0, mGameFb);
+            } else if (sGameFbMsaaResolvedSized) {
+                // Viewport differs OR a whole-frame pillarbox is required: resolve into the offscreen
+                // target and publish it so DrawGame composites (pillarboxes) it instead of stretching.
                 mRapi->ResolveMSAAColorBuffer(mGameFbMsaaResolved, mGameFb);
                 mGfxFrameBuffer = (uintptr_t)mRapi->GetFramebufferTextureId(mGameFbMsaaResolved);
             } else {
+                // Guard: a config flip after StartFrame requested the offscreen resolve but StartFrame
+                // never sized mGameFbMsaaResolved this frame. Fall back to the resolve-to-0 shortcut
+                // rather than publishing an unallocated framebuffer's texture id.
                 mRapi->ResolveMSAAColorBuffer(0, mGameFb);
             }
         } else {
@@ -6703,6 +6752,37 @@ void Interpreter::Run(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtx_r
     // the new mode, so the StartFrame latch alone would apply the old mode's aspect to the new
     // mode's first frame (the owner-visible one-frame 4:3 squeeze on editor exit).
     mForceFixedAspectCache = sGdxForceFixedAspect != 0;
+
+    // PORT (G-Diffuser): re-evaluate the render-target decision alongside the fixed-aspect re-latch
+    // above. StartFrame() latched mRendersToFb from the fixed-aspect flag as it stood BEFORE this
+    // frame's dispatch; the game can flip its aspect mode mid-dispatch and republish the flag, so
+    // StartFrame's decision is stale for the mode actually about to render. This reproduces
+    // StartFrame's exact predicate with the fresh flag so the prologue's StartDrawToFramebuffer
+    // target and the epilogue's publish/pillarbox decision (both read mRendersToFb) agree. Without
+    // it, entering a forced-4:3 mode renders straight to window fb 0 (stale mRendersToFb == false)
+    // while vertices already skip hor+ correction (fresh flag) -- one squashed, un-pillarboxed frame.
+    //
+    // Only mMsaaLevel <= 1 can actually flip mRendersToFb here: mMsaaLevel > 1 forces mRendersToFb
+    // true in StartFrame regardless of aspect, so this recompute leaves it true and the MSAA
+    // offscreen-resolve sizing (mGameFbMsaaResolved / sGameFbMsaaResolvedSized) stays owned solely
+    // by StartFrame. A flip that stales that sizing is caught by the epilogue's branch-3 guard,
+    // which degrades to a one-frame resolve-to-0 fallback. Both flip directions are safe: on entry
+    // (false -> true) we render into mGameFb and publish its texture for the composite; on exit
+    // (true -> false, non-MSAA) we render straight to window fb 0, which is presented directly --
+    // no frame renders offscreen without being composited, because prologue and epilogue share the
+    // single mRendersToFb set here.
+    {
+        const bool widescreenPillarbox = !mWidescreenEnabledCache || mForceFixedAspectCache;
+        const bool rendersToFb = !ViewportMatchesRendererResolution() || mMsaaLevel > 1 || widescreenPillarbox;
+        if (rendersToFb && !mRendersToFb && mMsaaLevel <= 1) {
+            // StartFrame took its else branch and never sized mGameFb this frame. Reproduce its
+            // non-MSAA sizing (interpreter.cpp StartFrame, mGameFb == mCurDimensions branch) so the
+            // freshly-targeted offscreen render matches the window's aspect before the composite.
+            mRapi->UpdateFramebufferParameters(mGameFb, mCurDimensions.width, mCurDimensions.height, mMsaaLevel, true,
+                                               true, true, true);
+        }
+        mRendersToFb = rendersToFb;
+    }
 
     mGetPixelDepthPending.clear();
     mGetPixelDepthCached.clear();
@@ -6758,13 +6838,32 @@ void Interpreter::Run(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtx_r
     currentDir = std::stack<std::string>();
 
     if (mRendersToFb) {
+        // Recompute the pillarbox decision from the caches as they stand at task end. mForceFixedAspectCache
+        // was re-latched in this Run()'s prologue, so on a mode flip it reflects the mode actually rendered
+        // (not StartFrame's stale latch). widescreenPillarbox is true when the whole frame must be pillarboxed:
+        // Widescreen off, or forced fixed aspect for the EK editors.
+        const bool widescreenPillarbox = !mWidescreenEnabledCache || mForceFixedAspectCache;
         mRapi->StartDrawToFramebuffer(0, 1);
         mRapi->ClearFramebuffer(true, true);
         if (mMsaaLevel > 1) {
-            if (!ViewportMatchesRendererResolution()) {
+            if (ViewportMatchesRendererResolution() && !widescreenPillarbox) {
+                // Normal path (widescreen play at 1x, viewport == render resolution): resolve the
+                // MSAA game FB straight to the window. mGfxFrameBuffer stays 0, so DrawGame presents
+                // the resolved window contents directly. Byte-identical to the pre-fix shortcut.
+                mRapi->ResolveMSAAColorBuffer(0, mGameFb);
+            } else if (sGameFbMsaaResolvedSized) {
+                // Viewport differs OR a whole-frame pillarbox is required: resolve into the offscreen
+                // target and publish it so Fast3dGui::DrawGame composites the centred 4:3 sub-region
+                // (its placement is gated on mGfxFrameBuffer != 0) instead of stretching 4:3 content
+                // across the whole 16:9 window.
                 mRapi->ResolveMSAAColorBuffer(mGameFbMsaaResolved, mGameFb);
                 mGfxFrameBuffer = (uintptr_t)mRapi->GetFramebufferTextureId(mGameFbMsaaResolved);
             } else {
+                // Guard: the mode flipped to pillarbox AFTER StartFrame (which sizes mGameFbMsaaResolved
+                // from its own earlier latch), so the offscreen target is not allocated for this frame.
+                // Fall back to the resolve-to-0 shortcut for this one frame rather than publishing an
+                // unallocated framebuffer's texture id; the next StartFrame sizes it and the pillarbox
+                // composite resumes.
                 mRapi->ResolveMSAAColorBuffer(0, mGameFb);
             }
         } else {

@@ -166,7 +166,13 @@
         return @{texture}(tex, uv);
     }
 
-    #define TEX_SIZE(tex) vec2(texture_width[tex], texture_height[tex])
+    // Tile size comes from the bound texture itself (textureSize), matching the D3D11
+    // shader's GetDimensions(): the texture_width/height uniforms are CPU-supplied and a
+    // stale/zero element collapses the CLAMP bound below (0.5 / 0 -> Inf clamps every
+    // sample to one edge texel -> solid-black primitives; seen on Linux race backgrounds
+    // while D3D11 rendered the same scene correctly). The max(..., 1.0) floor guards the
+    // undefined size of an incomplete texture. The texture_width/height uniforms above
+    // stay declared; drivers trim the now-unused ones and the CPU setters no-op on -1.
 
     void main() {
         @for(i in 0..2)
@@ -174,7 +180,7 @@
                 @{s = o_clamp[i][0]}
                 @{t = o_clamp[i][1]}
 
-                vec2 texSize@{i} = TEX_SIZE(@{i});
+                vec2 texSize@{i} = max(vec2(textureSize(uTex@{i}, 0)), vec2(1.0));
 
                 @if(!s && !t)
                     vec2 vTexCoordAdj@{i} = vTexCoord@{i};

@@ -265,7 +265,7 @@ MTL::VertexDescriptor* gfx_metal_build_shader(std::string& result, size_t& numFl
         Ship::Context::GetInstance()->GetResourceManager()->LoadResource(path, true, init));
 
     if (res == nullptr) {
-        SPDLOG_ERROR("Failed to load default metal shader, missing f3d.o2r?");
+        SPDLOG_ERROR("Failed to load default metal shader, missing gdiffuser.o2r?");
         abort();
     }
 

@@ -1483,7 +1483,7 @@ std::string gfx_direct3d_common_build_shader(size_t& numFloats, const CCFeatures
         "shaders/directx/default.shader.hlsl", true, init));
 
     if (res == nullptr) {
-        SPDLOG_ERROR("Failed to load default directx shader, missing f3d.o2r?");
+        SPDLOG_ERROR("Failed to load default directx shader, missing gdiffuser.o2r?");
         abort();
     }
 

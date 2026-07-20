@@ -349,7 +349,8 @@ void ConsoleWindow::DrawElement() {
         ImGui::SetNextWindowPos(ImVec2(pos.x + 8, pos.y + size.y - 1));
         ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(3, 3));
         ImGui::Begin("##WndAutocomplete", nullptr, ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoMove);
-        ImGui::BeginChild("AC_Child", ImVec2(0, 0), false, ImGuiWindowFlags_HorizontalScrollbar);
+        ImGui::BeginChild("AC_Child", ImVec2(0, 0), ImGuiChildFlags_NavFlattened,
+                          ImGuiWindowFlags_HorizontalScrollbar);
         ImGui::PushStyleColor(ImGuiCol_FrameBgActive, ImVec4(.3f, .3f, .3f, 1.0f));
         if (ImGui::BeginTable("AC_History", 1)) {
             for (const auto& cmd : mAutoComplete) {
@@ -438,7 +439,7 @@ void ConsoleWindow::DrawElement() {
 
     // Renders console history
     const float footerHeightToReserve = ImGui::GetStyle().ItemSpacing.y + ImGui::GetFrameHeightWithSpacing();
-    ImGui::BeginChild("ScrollingRegion", ImVec2(0, -footerHeightToReserve), false,
+    ImGui::BeginChild("ScrollingRegion", ImVec2(0, -footerHeightToReserve), ImGuiChildFlags_NavFlattened,
                       ImGuiWindowFlags_HorizontalScrollbar);
     ImGui::PushStyleColor(ImGuiCol_FrameBgActive, ImVec4(.3f, .3f, .3f, 1.0f));
     if (ImGui::BeginTable("History", 1)) {

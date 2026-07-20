@@ -609,12 +609,15 @@ void GfxDebuggerWindow::DrawDisas() {
     const F3DGfx* cmd = dlist;
     auto gui = std::dynamic_pointer_cast<Fast::Fast3dGui>(Ship::Context::GetInstance()->GetWindow()->GetGui());
 
-    ImGui::BeginChild("###State", ImVec2(0.0f, 200.0f), true);
+    ImGui::BeginChild("###State", ImVec2(0.0f, 200.0f),
+                      ImGuiChildFlags_Borders | ImGuiChildFlags_NavFlattened);
     {
         ImGui::BeginGroup();
         {
             ImGui::Text("Disp Stack");
-            ImGui::BeginChild("### Disp Stack", ImVec2(400.0f, 0.0f), true, ImGuiWindowFlags_HorizontalScrollbar);
+            ImGui::BeginChild("### Disp Stack", ImVec2(400.0f, 0.0f),
+                              ImGuiChildFlags_Borders | ImGuiChildFlags_NavFlattened,
+                              ImGuiWindowFlags_HorizontalScrollbar);
             for (auto& disp : g_exec_stack.disp_stack) {
                 ImGui::Text("%s", fmt::format("{}:{}", disp.file, disp.line).c_str());
             }
@@ -626,7 +629,8 @@ void GfxDebuggerWindow::DrawDisas() {
         ImGui::BeginGroup();
         {
             ImGui::Text("Tiles");
-            ImGui::BeginChild("### Tile", ImVec2(400.0f, 0.0f), true);
+            ImGui::BeginChild("### Tile", ImVec2(400.0f, 0.0f),
+                              ImGuiChildFlags_Borders | ImGuiChildFlags_NavFlattened);
             // for (size_t i = 0; i < 8; i++) {
             //     auto& tile = g_rdp.texture_tile[i];
             //     ImGui::Text(
@@ -701,7 +705,8 @@ void GfxDebuggerWindow::DrawDisas() {
     }
     ImGui::EndChild();
 
-    ImGui::BeginChild("##Disassembler", ImVec2(0.0f, 0.0f), true);
+    ImGui::BeginChild("##Disassembler", ImVec2(0.0f, 0.0f),
+                      ImGuiChildFlags_Borders | ImGuiChildFlags_NavFlattened);
     {
         std::vector<const F3DGfx*> gfxPath;
         DrawDisasNode(dlist, gfxPath);

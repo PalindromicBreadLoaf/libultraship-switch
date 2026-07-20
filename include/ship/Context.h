@@ -190,7 +190,8 @@ class Context {
      * @return true on success.
      */
     bool InitLogging(spdlog::level::level_enum debugBuildLogLevel = spdlog::level::debug,
-                     spdlog::level::level_enum releaseBuildLogLevel = spdlog::level::warn);
+                     spdlog::level::level_enum releaseBuildLogLevel = spdlog::level::warn,
+                     bool enableFileSink = true);
 
     /** @brief Initializes the Config subsystem, loading the config file from disk. */
     bool InitConfiguration();

@@ -167,9 +167,27 @@ void GfxRenderingAPIMetal::Init() {
 
         kernel void convertToRGB5A1(texture2d<half, access::read> inTexture [[ texture(0) ]],
                                     device short* outputBuffer [[ buffer(0) ]],
-                                    uint2 gid [[ thread_position_in_grid ]]) {
-            uint index = gid.x + (inTexture.get_width() * gid.y);
-            half4 pixel = inTexture.read(gid);
+                                    uint2 gid [[ thread_position_in_grid ]],
+                                    uint2 gridSize [[ threads_per_grid ]]) {
+            // The dispatch grid spans the REQUESTED output size (width x height),
+            // while inTexture is the real framebuffer texture — at runtime it is
+            // window-sized and usually larger. Reading inTexture.read(gid) 1:1
+            // cropped the top-left corner (same crop bug the OpenGL/DX11 paths had),
+            // and indexing by inTexture.get_width() overran the output buffer.
+            // Nearest-neighbor scale from the output grid to the real texture,
+            // matching DX11's srcX = i * srcW / outW math. No new uniforms: the
+            // output dims come from threads_per_grid, source dims from the texture.
+            uint outW = gridSize.x;
+            uint outH = gridSize.y;
+            // Guard the dispatchThreadgroups fallback, which rounds the grid up to a
+            // multiple of the threadgroup size and can launch threads past outW/outH.
+            if (gid.x >= outW || gid.y >= outH) {
+                return;
+            }
+            uint2 src = uint2(gid.x * inTexture.get_width() / outW,
+                              gid.y * inTexture.get_height() / outH);
+            uint index = gid.x + (outW * gid.y);
+            half4 pixel = inTexture.read(src);
             uint r = pixel.r * 0x1F;
             uint g = pixel.g * 0x1F;
             uint b = pixel.b * 0x1F;

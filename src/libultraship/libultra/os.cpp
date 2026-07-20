@@ -112,19 +112,6 @@ int32_t osEPiStartDma(OSPiHandle* pihandle, OSIoMesg* mb, int32_t direction) {
                 memcpy(decompMesg->dramAddr, gdx_rom_buffer + romOffset, decompMesg->size);
             } else {
                 memset(decompMesg->dramAddr, 0, decompMesg->size);
-                static int sEpiZeroLogs = 0;
-                if (sEpiZeroLogs < 8) {
-                    sEpiZeroLogs++;
-                    /* Plain fopen for the same sharing reason as the [ai-sink]
-                       probe below — fopen_s made this probe silently dead, which
-                       falsely "exonerated" sample-bank zero-fills. */
-                    FILE* lf = fopen("gdiffuser-run.log", "a");
-                    if (lf != nullptr) {
-                        fprintf(lf, "[epi] zero-fill devAddr=%08X size=%u romSize=%zu\n",
-                                decompMesg->devAddr, decompMesg->size, gdx_rom_size);
-                        fclose(lf);
-                    }
-                }
             }
         }
 
@@ -209,46 +196,14 @@ int32_t osAiSetNextBuffer(void* buff, size_t len) {
     auto audio = Ship::Context::GetInstance() != nullptr ? Ship::Context::GetInstance()->GetAudio() : nullptr;
     std::shared_ptr<Ship::AudioPlayer> player = audio != nullptr ? audio->GetAudioPlayer() : nullptr;
 
-    // Hoisted out of the diagnostics block below (which computes it) so the
-    // underrun-resilience fallback further down can reuse it without a second
-    // full-buffer scan.
+    // Scan once; the underrun-resilience fallback below consumes this result.
     bool allZero = true;
 
-    // TEMP one-shot diagnostics (audio-silence triage): distinguishes the three
-    // failure sites in one run — no [ai] lines = submission never happens;
-    // zero=1 = interpreter produced silence (input side); zero=0 but no sound =
-    // SDL output side. Appends to the same log the port writes. Remove once
-    // audio is confirmed audible.
-    {
-        // Boot-window-only logging hid the steady state (music starts well after
-        // the first frames). Keep the first 6 lines AND emit a periodic summary
-        // with the running nonzero-buffer count so any run's tail answers
-        // "did real waveforms EVER reach the device".
-        static int sAiDiag = 0;
-        static uint32_t sAiTotal = 0;
-        static uint32_t sAiNonZero = 0;
-        const uint8_t* p = static_cast<const uint8_t*>(buff);
-        for (size_t k = 0; k < len; k++) {
-            if (p[k] != 0) {
-                allZero = false;
-                break;
-            }
-        }
-        sAiTotal++;
-        if (!allZero) {
-            sAiNonZero++;
-        }
-        if (sAiDiag < 6 || (sAiTotal & 511u) == 0u) {
-            if (sAiDiag < 6) {
-                ++sAiDiag;
-            }
-            FILE* f = fopen("gdiffuser-run.log", "ab");
-            if (f != nullptr) {
-                fprintf(f, "[ai] submit #%u len=%zu zero=%d nonzeroTotal=%u player=%d init=%d\n", sAiTotal, len,
-                        allZero ? 1 : 0, sAiNonZero, player != nullptr ? 1 : 0,
-                        (player != nullptr && player->IsInitialized()) ? 1 : 0);
-                fclose(f);
-            }
+    const uint8_t* samples = static_cast<const uint8_t*>(buff);
+    for (size_t k = 0; k < len; k++) {
+        if (samples[k] != 0) {
+            allZero = false;
+            break;
         }
     }
 
@@ -259,8 +214,8 @@ int32_t osAiSetNextBuffer(void* buff, size_t len) {
     // the engram discovery 'long-sync-load-audio-starve') -- AudioSynth_Update
     // never got a chance to build a real command list for the missed tick(s),
     // so the buffer reaching us here comes through all-zero. That was
-    // measured directly in gdiffuser-ai-tap.pcm as repeating few-ms silence
-    // bursts during course loads. Emitting that silence verbatim is an
+    // measured during the audio investigation as repeating few-ms silence bursts during course
+    // loads. Emitting that silence verbatim is an
     // audible drop-out/click on the real device; repeat the last buffer that
     // actually had audio in it instead, halving its gain on each consecutive
     // miss so a longer stall decays toward true silence rather than looping
@@ -321,35 +276,6 @@ int32_t osAiSetNextBuffer(void* buff, size_t len) {
     if (player == nullptr || !player->IsInitialized()) {
         return 0;
     }
-    // AI output tap (grain investigation): write every buffer handed to the device to
-    // gdiffuser-ai-tap.pcm (s16 interleaved stereo, host byte order) -- exactly what the
-    // listener hears (playBuf, post-substitution). DEFAULT ON with truncate-on-boot: the
-    // env-var gate proved unreliable in the owner's shell, so this always produces a
-    // FRESH capture each run (first write truncates), capped at ~120s so the file stays
-    // bounded. GDX_NO_AI_TAP=1 disables it once the grain is solved.
-    {
-        static int sTapMode = -1;
-        static long sTapBytes = 0;
-        static const long kTapCapBytes = 120L * 32000L * 4L; /* ~120s stereo s16 */
-        if (sTapMode == -1) {
-            const char* off = getenv("GDX_NO_AI_TAP");
-            sTapMode = (off != nullptr && off[0] == '1') ? 0 : 1;
-            if (sTapMode == 1) {
-                FILE* tf = fopen("gdiffuser-ai-tap.pcm", "wb"); /* truncate: fresh per run */
-                if (tf != nullptr) {
-                    fclose(tf);
-                }
-            }
-        }
-        if (sTapMode == 1 && sTapBytes < kTapCapBytes) {
-            FILE* tf = fopen("gdiffuser-ai-tap.pcm", "ab");
-            if (tf != nullptr) {
-                fwrite(playBuf, 1, playLen, tf);
-                fclose(tf);
-                sTapBytes += (long)playLen;
-            }
-        }
-    }
     // Output reconstruction low-pass (matches the N64 audio DAC's output-stage rolloff
     // that accurate emulation models but a raw HLE pipeline omits -- the reference diff
     // measured +7.4dB of excess HF imaging near Nyquist that this removes). 4th-order
@@ -358,7 +284,7 @@ int32_t osAiSetNextBuffer(void* buff, size_t len) {
     // test: LLE audio removed the grain outright, so this only tames the top ~1kHz sliver
     // to match the console's analog reconstruction stage (11kHz was the HLE-era band-aid).
     // gdx-audio-lowpass.txt overrides the cutoff (a number in Hz) or disables it entirely
-    // (contents "0" or "off"). Applied to a COPY so the AI tap upstream stays raw for analysis.
+    // (contents "0" or "off"). Applied to a copy so the source buffer remains untouched.
     {
         static int sLastHz = -1;               /* -1 = not yet configured */
         static int sEnabled = 0;
@@ -391,12 +317,6 @@ int32_t osAiSetNextBuffer(void* buff, size_t len) {
                     sA[s][1] = (1.0 - alpha) / a0;
                 }
             }
-            FILE* lf = fopen("gdiffuser-run.log", "ab");
-            if (lf != nullptr) {
-                fprintf(lf, "[audio] output reconstruction LP: %s (cutoff %dHz, 4th-order Butterworth)\n",
-                        sEnabled ? "ON" : "OFF", hz);
-                fclose(lf);
-            }
         }
         if (sEnabled && (playLen % 4) == 0) {
             const size_t frames = playLen / 4;
@@ -428,8 +348,8 @@ int32_t osAiSetNextBuffer(void* buff, size_t len) {
     // BIT-EXACT BY DEFAULT: at vol==100 the multiply is skipped ENTIRELY, so playBuf is left
     // untouched and a fresh config is sample-for-sample identical to today. Applied to a COPY (its
     // own static scratch vector) reading from playBuf and repointing it -- it never mutates the raw
-    // AI tap upstream (the gdiffuser-ai-tap.pcm capture above stays raw) nor the low-pass buffer in
-    // place. Guarded on (playLen % 4)==0 like the low-pass so a ragged length is never misread as
+    // source buffer or the low-pass buffer in place. Guarded on (playLen % 4)==0 like the low-pass
+    // so a ragged length is never misread as
     // whole stereo s16 frames.
     {
         static std::vector<int16_t> sVolBuf;
