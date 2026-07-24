@@ -1118,17 +1118,51 @@ void GfxRenderingAPIDX11::ReadFramebufferToCPU(int fb_id, uint32_t width, uint32
         return;
     }
 
-    // Convert RGBA32 → RGBA16 with nearest-neighbor scaling from actual texture
-    // dimensions to requested output dimensions, respecting RowPitch for row stride
+    // Convert RGBA32 → RGBA16 (5551) with a BOX-FILTER AVERAGE downscale from actual texture
+    // dimensions to requested output dimensions, respecting RowPitch for row stride.
+    //
+    // Issue C (fade-transition garbled horizontal-dash band): the previous NEAREST-neighbor
+    // resample sampled exactly one of every srcW/width source columns. At a widescreen source
+    // (1920x1080 → 320x240 is 6:1 horizontally) that decimation keeps only every 6th column, so
+    // high-frequency title-screen art is shredded into disconnected vertical/horizontal dashes —
+    // the owner's band. Averaging each destination pixel's full source footprint preserves the
+    // coherent image (soft/downsampled but correct). No aspect crop is done here: the transition
+    // redraws the 320x240 capture STRETCHED back across the full widescreen viewport
+    // (decomp ovl_i2/transition.c, G_EX_WIDESCREEN_STRETCH), so the squeeze→stretch round-trips
+    // the geometry and only the filter quality matters. This runs once per screen transition over a
+    // 320x240 destination, so the extra source reads (~27 texels/dest at 6:1) are trivial.
+    const uint32_t srcW = srcDesc.Width;
+    const uint32_t srcH = srcDesc.Height;
     for (uint32_t j = 0; j < height; j++) {
-        uint32_t srcY = j * srcDesc.Height / height;
-        uint8_t* srcRow = (uint8_t*)resource.pData + srcY * resource.RowPitch;
+        uint32_t sy0 = j * srcH / height;
+        uint32_t sy1 = (j + 1) * srcH / height;
+        if (sy1 <= sy0) sy1 = sy0 + 1;
+        if (sy1 > srcH) sy1 = srcH;
         for (uint32_t i = 0; i < width; i++) {
-            uint32_t srcX = i * srcDesc.Width / width;
-            uint32_t pixel = ((uint32_t*)srcRow)[srcX];
-            uint8_t r = (((pixel & 0xFF) + 4) * 0x1F) / 0xFF;
-            uint8_t g = ((((pixel >> 8) & 0xFF) + 4) * 0x1F) / 0xFF;
-            uint8_t b = ((((pixel >> 16) & 0xFF) + 4) * 0x1F) / 0xFF;
+            uint32_t sx0 = i * srcW / width;
+            uint32_t sx1 = (i + 1) * srcW / width;
+            if (sx1 <= sx0) sx1 = sx0 + 1;
+            if (sx1 > srcW) sx1 = srcW;
+
+            uint32_t accR = 0, accG = 0, accB = 0, count = 0;
+            for (uint32_t sy = sy0; sy < sy1; sy++) {
+                const uint32_t* srcRow =
+                    (const uint32_t*)((const uint8_t*)resource.pData + (size_t)sy * resource.RowPitch);
+                for (uint32_t sx = sx0; sx < sx1; sx++) {
+                    const uint32_t pixel = srcRow[sx];
+                    accR += pixel & 0xFF;
+                    accG += (pixel >> 8) & 0xFF;
+                    accB += (pixel >> 16) & 0xFF;
+                    ++count;
+                }
+            }
+            const uint32_t avgR = count ? accR / count : 0;
+            const uint32_t avgG = count ? accG / count : 0;
+            const uint32_t avgB = count ? accB / count : 0;
+            // Same 8→5-bit rounding (+4 bias) the per-pixel path used, now on the averaged channel.
+            uint8_t r = ((avgR + 4) * 0x1F) / 0xFF;
+            uint8_t g = ((avgG + 4) * 0x1F) / 0xFF;
+            uint8_t b = ((avgB + 4) * 0x1F) / 0xFF;
             // Coverage bit, not host alpha: an N64 framebuffer's low bit is
             // coverage, and a captured full frame is fully covered. The host
             // render target's alpha channel is whatever the combiner last

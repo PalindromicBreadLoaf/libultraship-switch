@@ -50,6 +50,13 @@ void ConnectedPhysicalDeviceManager::HandlePhysicalDeviceDisconnect(int32_t sdlJ
 }
 
 void ConnectedPhysicalDeviceManager::RefreshConnectedSDLGamepads() {
+    // Close previously opened handles before rebuilding the map, otherwise every refresh
+    // (app start + each hotplug event) leaks the SDL_GameController handles from the last scan.
+    for (const auto& [instanceId, gamepad] : mConnectedSDLGamepads) {
+        if (gamepad != nullptr) {
+            SDL_GameControllerClose(gamepad);
+        }
+    }
     mConnectedSDLGamepads.clear();
     mConnectedSDLGamepadNames.clear();
     static SDL_JoystickGUID sZeroGuid;

@@ -59,6 +59,11 @@ struct File {
     std::shared_ptr<std::vector<char>> Buffer;
     /** @brief Byte offset into Buffer where the resource payload starts (after any header). */
     size_t BufferOffset = 0;
+    /** @brief Real entry byte count; Buffer may be over-allocated by backends (e.g. +4096 padding
+     *  reserved as guard space by archive loaders), so this is the size callers should trust
+     *  for exact-size reads. 0 means unset (older/unsupported backend); callers should fall
+     *  back to Buffer->size() in that case. */
+    size_t TrueSize = 0;
     /** @brief Parsed reader; either a BinaryReader or an XMLDocument, depending on the format. */
     std::variant<std::shared_ptr<tinyxml2::XMLDocument>, std::shared_ptr<BinaryReader>> Reader;
     /** @brief True once the file has been fully loaded from its backing store. */

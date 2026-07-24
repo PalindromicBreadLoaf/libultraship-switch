@@ -39,6 +39,7 @@ std::shared_ptr<File> OtrArchive::LoadFile(const std::string& filePath) {
     }
     DWORD readBytes;
     fileToLoad->Buffer = std::make_shared<std::vector<char>>(fileSize + 4096);
+    fileToLoad->TrueSize = fileSize;
     bool readFileSuccess = SFileReadFile(fileHandle, fileToLoad->Buffer->data(), fileSize, &readBytes, NULL);
 
     if (!readFileSuccess) {

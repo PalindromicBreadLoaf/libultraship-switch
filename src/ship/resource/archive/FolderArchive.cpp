@@ -53,10 +53,16 @@ std::shared_ptr<File> Ship::FolderArchive::LoadFile(uint64_t hash) {
 std::shared_ptr<File> FolderArchive::LoadFileRaw(const std::string& filePath) {
     if (Ship::FileHelper::Exists(mArchiveBasePath + filePath)) {
         auto data = Ship::FileHelper::ReadAllBytes(mArchiveBasePath + filePath);
+        // Reject empty files like the O2r/Otr backends do; a 0-byte entry would also
+        // make TrueSize == 0 ambiguous with its "unset/legacy" sentinel meaning.
+        if (data.empty()) {
+            return nullptr;
+        }
         auto fileToLoad = std::make_shared<File>();
 
         fileToLoad->Buffer = std::make_shared<std::vector<char>>(data.size() + 4096);
         memcpy(fileToLoad->Buffer->data(), data.data(), data.size());
+        fileToLoad->TrueSize = data.size();
 
         fileToLoad->IsLoaded = true;
 

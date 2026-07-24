@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+#include <algorithm>
 #include <map>
 #include <set>
 #include <string>
@@ -1100,24 +1101,51 @@ void GfxWindowBackendDXGI::SwapBuffersBegin() {
 
     LARGE_INTEGER t;
     QueryPerformanceCounter(&t);
-    int64_t next = qpc_to_100ns(mPreviousPresentTime.QuadPart) +
-                   FRAME_INTERVAL_NS_NUMERATOR / (FRAME_INTERVAL_NS_DENOMINATOR * 100);
-    int64_t left = next - qpc_to_100ns(t.QuadPart) - 15000UL;
-    if (left > 0) {
-        LARGE_INTEGER li;
-        li.QuadPart = -left;
-        SetWaitableTimer(mTimer, &li, 0, nullptr, nullptr, false);
-        WaitForSingleObject(mTimer, INFINITE);
+
+    // When vsync is enabled and the requested target fps is within tolerance of the
+    // display's detected refresh rate, Present() below already blocks until the next
+    // vsync -- running this software wall-clock deadline wait as well means two
+    // independently-clocked pacers (this QPC deadline and the hardware refresh) beat
+    // against each other, which shows up as missed/duplicated vsync slots (judder,
+    // shimmer on high-frequency detail such as track rails). Tolerance absorbs
+    // NTSC/VRR drift (59.94 vs 60, 143.86 vs 144): max(1.0 Hz, 1.5% of refresh).
+    double vsyncTolerance = mDetectedHz > 0.0 ? std::max(1.0, mDetectedHz * 0.015) : 1.0;
+    bool vsyncPaced = mVsyncEnabled != 0 && mDetectedHz > 0.0 &&
+                      fabs((double)mTargetFps - mDetectedHz) <= vsyncTolerance;
+    static bool sVsyncPacedLogged = false;
+    static bool sWasVsyncPaced = false;
+    if (vsyncPaced != sWasVsyncPaced || !sVsyncPacedLogged) {
+        sWasVsyncPaced = vsyncPaced;
+        sVsyncPacedLogged = true;
+        SPDLOG_INFO("[pacer] vsync-paced: {} software wait target={:.2f} refresh={:.2f}",
+                    vsyncPaced ? "skipping" : "resuming", (double)mTargetFps, mDetectedHz);
     }
 
-    QueryPerformanceCounter(&t);
-    t.QuadPart = qpc_to_100ns(t.QuadPart);
-    while (t.QuadPart < next) {
-        YieldProcessor();
+    if (!vsyncPaced) {
+        int64_t next = qpc_to_100ns(mPreviousPresentTime.QuadPart) +
+                       FRAME_INTERVAL_NS_NUMERATOR / (FRAME_INTERVAL_NS_DENOMINATOR * 100);
+        int64_t left = next - qpc_to_100ns(t.QuadPart) - 15000UL;
+        if (left > 0) {
+            LARGE_INTEGER li;
+            li.QuadPart = -left;
+            SetWaitableTimer(mTimer, &li, 0, nullptr, nullptr, false);
+            WaitForSingleObject(mTimer, INFINITE);
+        }
+
         QueryPerformanceCounter(&t);
         t.QuadPart = qpc_to_100ns(t.QuadPart);
+        while (t.QuadPart < next) {
+            YieldProcessor();
+            QueryPerformanceCounter(&t);
+            t.QuadPart = qpc_to_100ns(t.QuadPart);
+        }
+        QueryPerformanceCounter(&t);
     }
-    QueryPerformanceCounter(&t);
+    // On the skip path, t is still the QPC sample taken at function entry (nothing
+    // expensive runs between it and Present below) -- keeping mPreviousPresentTime
+    // near-now here (instead of leaving it stale) means that if the target fps later
+    // drifts away from the refresh rate and the software wait re-engages, it resumes
+    // from a sane deadline instead of producing a catch-up burst.
     mPreviousPresentTime = t;
     // Window-level backbuffer capture (env-gated, zero-cost when unset). Runs
     // before Present so the dumped frame is exactly what is about to be shown.

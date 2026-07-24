@@ -1205,6 +1205,8 @@ void InputEditorWindow::DrawDeviceToggles(uint8_t portIndex) {
 
     auto connectedDeviceManager = Ship::Context::GetInstance()->GetControlDeck()->GetConnectedPhysicalDeviceManager();
     for (const auto& [instanceId, name] : connectedDeviceManager->GetConnectedSDLGamepadNames()) {
+        // Scope IDs per device so identical names (e.g. multiple GameCube adapter ports) don't collide.
+        ImGui::PushID(instanceId);
         ImGui::PushItemFlag(ImGuiItemFlags_Disabled, true);
         auto buttonColor = ImGui::GetStyleColorVec4(ImGuiCol_Button);
         auto buttonHoveredColor = ImGui::GetStyleColorVec4(ImGuiCol_ButtonHovered);
@@ -1226,6 +1228,7 @@ void InputEditorWindow::DrawDeviceToggles(uint8_t portIndex) {
         ImGui::PopStyleColor();
         ImGui::PopStyleColor();
         ImGui::PopItemFlag();
+        ImGui::PopID();
     }
 }
 

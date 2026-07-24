@@ -232,6 +232,15 @@ struct TextureCacheValue {
     uint64_t rgba16_transparent_pixels = 0;
     uint64_t rgba16_forced_opaque_pixels = 0;
 
+    // Set once UploadTexture has actually run for this entry's texture_id. A
+    // TextureCacheLookup() insert only reserves the slot (NewTexture()/SelectTexture());
+    // the real GPU resource is created by UploadTexture, which some decode paths can
+    // bail out of before reaching (e.g. a transiently-null CI palette slot, or a
+    // zero-sized load). Defense-in-depth: TextureCacheLookup treats a hit on an entry
+    // with uploaded == false as a miss so the decode is retried instead of serving a
+    // texture that was never actually created.
+    bool uploaded = false;
+
     std::list<struct TextureCacheMapIter>::iterator lru_location;
 };
 
@@ -413,6 +422,17 @@ struct RenderingState {
     bool sampler_linear_filter[SHADER_MAX_TEXTURES];
     uint8_t sampler_cms[SHADER_MAX_TEXTURES];
     uint8_t sampler_cmt[SHADER_MAX_TEXTURES];
+    // prim_depth (G_ZS_PRIM) is a lazily-sampled per-flush uniform: Flush() reads
+    // mRdp->prim_depth at drain time, not at G_SETPRIMDEPTH time (see Flush()'s
+    // SetCurrentPrimDepth call). Since this port's gDPPipeSync is a no-op stub,
+    // nothing else forces a drain between two draws that use different prim_depth
+    // values, so a later G_SETPRIMDEPTH can silently invalidate an earlier draw's
+    // still-buffered batch before it flushes. Track the prim_depth value the
+    // currently-buffered batch will read on flush, and force a Flush() in
+    // GfxSpTri1 whenever a prim-depth draw's value differs from it. 0xFFFFFFFF is
+    // a sentinel outside the 15-bit N64 prim_depth range (0..0x7FFF) so the very
+    // first prim-depth draw always flushes.
+    uint32_t lastFlushedPrimDepth = 0xFFFFFFFFu;
 };
 
 struct FBInfo {

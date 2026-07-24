@@ -1,4 +1,7 @@
 #include <stdio.h>
+#include <math.h>
+
+#include <algorithm>
 
 #if defined(ENABLE_OPENGL) || defined(__APPLE__)
 
@@ -284,6 +287,29 @@ static uint64_t previous_time;
 #ifdef _WIN32
 static HANDLE mTimer;
 #endif
+
+// Vsync-paced skip state: true when vsync is enabled and mTargetFps is within
+// tolerance of the display's detected refresh rate, meaning SDL_GL_SwapWindow in
+// SwapBuffersBegin already blocks on the hardware refresh. In that case
+// SyncFramerateWithTime's software wall-clock deadline wait would be a second,
+// independently-clocked pacer beating against the first (missed/duplicated vsync
+// slots -> judder/shimmer on high-frequency detail). Computed once per frame in
+// SwapBuffersBegin (which has member access to mWnd/mVsyncEnabled/mTargetFps) and
+// consumed by SyncFramerateWithTime (const, so it cannot recompute it itself).
+static bool sVsyncPaced = false;
+// Detected-refresh cache: SDL_GetCurrentDisplayMode is re-queried when the
+// window's display index changes, or at least once per second (a same-display
+// Hz change -- e.g. the user edits the OS refresh-rate setting, or a VRR
+// display renegotiates -- never moves the display index, so that check alone
+// cannot catch it). sLastRefreshRequeryTime100ns is compared against
+// previous_time, the frame timestamp SyncFramerateWithTime already computes
+// for the wall-clock pacer, so this costs a cheap subtract/compare and no
+// extra syscall beyond the periodic SDL_GetCurrentDisplayMode call itself.
+static int sCachedDisplayIndex = -1;
+static double sCachedRefreshHz = 0.0;
+static uint64_t sLastRefreshRequeryTime100ns = 0;
+// 1 second expressed in the 100ns ticks previous_time/qpc_to_100ns use.
+static constexpr uint64_t kRefreshRequeryInterval100ns = 10000000ull;
 
 #define FRAME_INTERVAL_US_NUMERATOR 1000000
 #define FRAME_INTERVAL_US_DENOMINATOR (mTargetFps)
@@ -720,43 +746,50 @@ static uint64_t qpc_to_100ns(uint64_t qpc) {
 void GfxWindowBackendSDL2::SyncFramerateWithTime() const {
     uint64_t t = qpc_to_100ns(SDL_GetPerformanceCounter());
 
-    const int64_t next = previous_time + 10 * FRAME_INTERVAL_US_NUMERATOR / FRAME_INTERVAL_US_DENOMINATOR;
-    int64_t left = next - t;
+    if (!sVsyncPaced) {
+        const int64_t next = previous_time + 10 * FRAME_INTERVAL_US_NUMERATOR / FRAME_INTERVAL_US_DENOMINATOR;
+        int64_t left = next - t;
 #ifdef _WIN32
-    // We want to exit a bit early, so we can busy-wait the rest to never miss the deadline
-    left -= 15000UL;
+        // We want to exit a bit early, so we can busy-wait the rest to never miss the deadline
+        left -= 15000UL;
 #elif defined(__APPLE__)
-    // Use macOS scheduler interval on macOS. Don't trust sysctl on macOS
-    left -= 10000UL;
+        // Use macOS scheduler interval on macOS. Don't trust sysctl on macOS
+        left -= 10000UL;
 #elif defined(__OpenBSD__)
-    left -= mBsdTick * 10;
+        left -= mBsdTick * 10;
 #endif
-    if (left > 0) {
+        if (left > 0) {
 #ifndef _WIN32
-        const timespec spec = { 0, left * 100 };
-        nanosleep(&spec, nullptr);
+            const timespec spec = { 0, left * 100 };
+            nanosleep(&spec, nullptr);
 #else
-        // The accuracy of this mTimer seems to usually be within +- 1.0 ms
-        LARGE_INTEGER li;
-        li.QuadPart = -left;
-        SetWaitableTimer(mTimer, &li, 0, nullptr, nullptr, false);
-        WaitForSingleObject(mTimer, INFINITE);
+            // The accuracy of this mTimer seems to usually be within +- 1.0 ms
+            LARGE_INTEGER li;
+            li.QuadPart = -left;
+            SetWaitableTimer(mTimer, &li, 0, nullptr, nullptr, false);
+            WaitForSingleObject(mTimer, INFINITE);
 #endif
-    }
+        }
 
-    t = qpc_to_100ns(SDL_GetPerformanceCounter());
-#ifdef _WIN32
-    while (t < next) {
-        YieldProcessor(); // TODO: Find a way for other compilers, OSes and architectures
         t = qpc_to_100ns(SDL_GetPerformanceCounter());
-    }
+#ifdef _WIN32
+        while (t < next) {
+            YieldProcessor(); // TODO: Find a way for other compilers, OSes and architectures
+            t = qpc_to_100ns(SDL_GetPerformanceCounter());
+        }
 #endif
-    if (left > 0 && t - next < 10000) {
-        // In case it takes some time for the application to wake up after sleep,
-        // or inaccurate mTimer,
-        // don't let that slow down the framerate.
-        t = next;
+        if (left > 0 && t - next < 10000) {
+            // In case it takes some time for the application to wake up after sleep,
+            // or inaccurate mTimer,
+            // don't let that slow down the framerate.
+            t = next;
+        }
     }
+    // On the skip path, t is still the sample taken at function entry -- keeping
+    // previous_time near-now here (instead of leaving it stale) means that if the
+    // target fps later drifts away from the refresh rate and the software wait
+    // re-engages, it resumes from a sane deadline instead of producing a catch-up
+    // burst.
     previous_time = t;
 }
 
@@ -767,6 +800,38 @@ void GfxWindowBackendSDL2::SwapBuffersBegin() {
         mVsyncEnabled = nextVsyncEnabled;
         SDL_GL_SetSwapInterval(mVsyncEnabled ? 1 : 0);
         SDL_RenderSetVSync(mRenderer, mVsyncEnabled ? 1 : 0);
+    }
+
+    // Vsync-paced skip decision: when vsync is enabled and mTargetFps is within
+    // tolerance of the display's detected refresh rate, SDL_GL_SwapWindow below
+    // already blocks on the hardware refresh, so SyncFramerateWithTime's software
+    // wall-clock deadline wait is skipped (see sVsyncPaced above). Tolerance absorbs
+    // NTSC/VRR drift (59.94 vs 60, 143.86 vs 144): max(1.0 Hz, 1.5% of refresh).
+    {
+        int displayIndex = SDL_GetWindowDisplayIndex(mWnd);
+        const bool displayChanged = displayIndex != sCachedDisplayIndex;
+        const bool refreshStale = (previous_time - sLastRefreshRequeryTime100ns) >= kRefreshRequeryInterval100ns;
+        if (displayChanged || refreshStale) {
+            sCachedDisplayIndex = displayIndex;
+            sLastRefreshRequeryTime100ns = previous_time;
+            SDL_DisplayMode mode;
+            if (SDL_GetCurrentDisplayMode(displayIndex, &mode) == 0 && mode.refresh_rate != 0) {
+                sCachedRefreshHz = (double)mode.refresh_rate;
+            } else {
+                sCachedRefreshHz = 60.0;
+            }
+        }
+
+        double tolerance = std::max(1.0, sCachedRefreshHz * 0.015);
+        bool vsyncPaced = mVsyncEnabled != 0 && sCachedRefreshHz > 0.0 &&
+                          fabs((double)mTargetFps - sCachedRefreshHz) <= tolerance;
+        static bool sVsyncPacedLogged = false;
+        if (vsyncPaced != sVsyncPaced || !sVsyncPacedLogged) {
+            sVsyncPaced = vsyncPaced;
+            sVsyncPacedLogged = true;
+            SPDLOG_INFO("[pacer] vsync-paced: {} software wait target={:.2f} refresh={:.2f}",
+                        vsyncPaced ? "skipping" : "resuming", (double)mTargetFps, sCachedRefreshHz);
+        }
     }
 
     SyncFramerateWithTime();

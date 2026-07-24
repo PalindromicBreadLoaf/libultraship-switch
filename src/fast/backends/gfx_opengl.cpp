@@ -1066,23 +1066,45 @@ void GfxRenderingAPIOGL::ReadFramebufferToCPU(int fb_id, uint32_t width, uint32_
             rgba16_buf[i] = (r << 11) | (g << 6) | (b << 1) | 1;
         }
     } else {
-        // General path: read the full framebuffer, then nearest-neighbor downsample to
-        // the requested size using the same index math as DX11
-        // (srcX = i * actualW / width, srcY = j * actualH / height).
+        // General path: read the full framebuffer, then BOX-FILTER AVERAGE downsample to the
+        // requested size. Mirrors the DX11 fix (GfxRenderingAPIDX11::ReadFramebufferToCPU):
+        // nearest-neighbor decimation (keeping one of every actualW/width columns) shreds
+        // high-frequency captured art — a 1920→320 (6:1) transition capture in particular — into
+        // disconnected dashes (Issue C's garbled band). Averaging each destination pixel's full
+        // source footprint preserves a coherent (soft) image. No aspect crop: the transition
+        // redraws the capture stretched back across the full widescreen viewport
+        // (decomp ovl_i2/transition.c, G_EX_WIDESCREEN_STRETCH), so the squeeze→stretch
+        // round-trips. One-shot per transition over a 320x240 destination — trivial cost.
         std::vector<uint8_t> rgba8((size_t)actualW * actualH * 4);
         glReadPixels(0, 0, actualW, actualH, GL_RGBA, GL_UNSIGNED_BYTE, rgba8.data());
 
         for (uint32_t j = 0; j < height; j++) {
-            // Logical (top-down) source row, then converted to glReadPixels' bottom-left
-            // physical row order per the row-order contract documented above.
-            uint32_t srcYLogical = j * actualH / height;
-            uint32_t srcYPhys = flipY ? (actualH - 1 - srcYLogical) : srcYLogical;
-            const uint8_t* srcRow = rgba8.data() + (size_t)srcYPhys * actualW * 4;
+            uint32_t sy0 = j * actualH / height;
+            uint32_t sy1 = (j + 1) * actualH / height;
+            if (sy1 <= sy0) sy1 = sy0 + 1;
+            if (sy1 > actualH) sy1 = actualH;
             for (uint32_t i = 0; i < width; i++) {
-                uint32_t srcX = i * actualW / width;
-                uint8_t r = (srcRow[srcX * 4 + 0] >> 3) & 0x1F;
-                uint8_t g = (srcRow[srcX * 4 + 1] >> 3) & 0x1F;
-                uint8_t b = (srcRow[srcX * 4 + 2] >> 3) & 0x1F;
+                uint32_t sx0 = i * actualW / width;
+                uint32_t sx1 = (i + 1) * actualW / width;
+                if (sx1 <= sx0) sx1 = sx0 + 1;
+                if (sx1 > actualW) sx1 = actualW;
+
+                uint32_t accR = 0, accG = 0, accB = 0, count = 0;
+                for (uint32_t syLogical = sy0; syLogical < sy1; syLogical++) {
+                    // Logical (top-down) source row → glReadPixels' bottom-left physical row order
+                    // per the row-order contract documented above.
+                    uint32_t syPhys = flipY ? (actualH - 1 - syLogical) : syLogical;
+                    const uint8_t* srcRow = rgba8.data() + (size_t)syPhys * actualW * 4;
+                    for (uint32_t sx = sx0; sx < sx1; sx++) {
+                        accR += srcRow[sx * 4 + 0];
+                        accG += srcRow[sx * 4 + 1];
+                        accB += srcRow[sx * 4 + 2];
+                        ++count;
+                    }
+                }
+                uint8_t r = count ? (uint8_t)((accR / count) >> 3) & 0x1F : 0;
+                uint8_t g = count ? (uint8_t)((accG / count) >> 3) & 0x1F : 0;
+                uint8_t b = count ? (uint8_t)((accB / count) >> 3) & 0x1F : 0;
                 rgba16_buf[i + j * width] = (r << 11) | (g << 6) | (b << 1) | 1;
             }
         }

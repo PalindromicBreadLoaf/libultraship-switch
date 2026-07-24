@@ -31,6 +31,16 @@ struct GdxDecompOSIoMesg {
 extern uint8_t* gdx_rom_buffer;
 extern size_t gdx_rom_size;
 
+/* Single byte-source shim (port/gdx_segment_source.c, contract C-R1.3/C-R2.2).
+   Declared here without its header because this file compiles in the
+   libultraship target, which has no include path onto port/ -- the same
+   cross-module extern pattern used for gdx_audio_thread_active below. Sources a
+   cart read archive-first via the shared segment_blob+audio_blob containment
+   table, raw-ROM fallback (byte-identical to a direct gdx_rom_buffer+off copy);
+   returns 1 on success (either source), 0 only when no source can satisfy the
+   read (ROM absent / out of bounds), leaving dst untouched. */
+int GdxSegmentSourceRead(uint32_t romBase, uint32_t size, void* dst);
+
 int32_t osContInit(OSMesgQueue* mq, uint8_t* controllerBits, OSContStatus* status) {
     *controllerBits = 0;
     status->status |= 1;
@@ -104,13 +114,23 @@ int32_t osEPiStartDma(OSPiHandle* pihandle, OSIoMesg* mb, int32_t direction) {
                physical cart address (0x10000000-based) or a plain ROM offset;
                masking covers both. Audio sample banks stream through here as
                the default AudioLoad DMA handler — zero-filling them produced
-               fully silent synthesis output. Out-of-range requests keep the
-               old zero-fill so callers still see deterministic contents. */
+               fully silent synthesis output.
+
+               Delivery swap (C-R2.2): the bytes are now sourced through the R1
+               single byte-source shim (GdxSegmentSourceRead) instead of a direct
+               gdx_rom_buffer copy. This sink now serves EVERY DMA from the shared
+               shim: the shim's one containment table covers ALL blob families
+               (R1 segment_blob geometry + the three R2 audio_blob families), and
+               any read not inside a blob span falls through to the raw ROM inside
+               the shim -- so audio and non-audio reads alike resolve through one
+               place, archive-first with a byte-identical raw-ROM fallback. The
+               shim's fallback bounds check (romOffset+size > gdx_rom_size, or a
+               null ROM image) is exactly the old guard, so it returns 0 in
+               precisely the cases the old code zero-filled; preserve that
+               zero-fill here so out-of-range/absent reads still see deterministic
+               contents. */
             const uint32_t romOffset = decompMesg->devAddr & 0x0FFFFFFFu;
-            const uint64_t end = static_cast<uint64_t>(romOffset) + decompMesg->size;
-            if (gdx_rom_buffer != nullptr && end <= gdx_rom_size) {
-                memcpy(decompMesg->dramAddr, gdx_rom_buffer + romOffset, decompMesg->size);
-            } else {
+            if (!GdxSegmentSourceRead(romOffset, decompMesg->size, decompMesg->dramAddr)) {
                 memset(decompMesg->dramAddr, 0, decompMesg->size);
             }
         }
