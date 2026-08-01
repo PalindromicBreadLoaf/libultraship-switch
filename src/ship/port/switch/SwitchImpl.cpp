@@ -164,9 +164,15 @@ static void on_applet_hook(AppletHookType hook, void* param) {
             break;
 
             /* Focus state*/
-        case AppletHookType_OnFocusState:
+        case AppletHookType_OnFocusState: {
             focus_state = appletGetFocusState();
-            hasFocus = focus_state == AppletFocusState_InFocus;
+            const bool nowHasFocus = focus_state == AppletFocusState_InFocus;
+
+            // Only react to real transitions.
+            if (nowHasFocus == hasFocus) {
+                break;
+            }
+            hasFocus = nowHasFocus;
 
             if (!hasFocus) {
                 if (hosversionBefore(8, 0, 0)) {
@@ -192,6 +198,7 @@ static void on_applet_hook(AppletHookType hook, void* param) {
             }
 
             break;
+        }
 
         case AppletHookType_OnResume:
             Ship::Switch::ApplyOverclock();
