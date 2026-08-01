@@ -98,6 +98,11 @@ if (CMAKE_SYSTEM_NAME STREQUAL "Android" OR CMAKE_SYSTEM_NAME STREQUAL "iOS")
     set(Source_Files__Port
         ${CMAKE_CURRENT_SOURCE_DIR}/port/mobile/MobileImpl.cpp
     )
+elseif (CMAKE_SYSTEM_NAME STREQUAL "NintendoSwitch")
+    set(Source_Files__Port
+        ${CMAKE_CURRENT_SOURCE_DIR}/port/switch/SwitchController.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/port/switch/SwitchImpl.cpp
+    )
 endif()
 
 source_group("port" FILES ${Source_Files__Port})

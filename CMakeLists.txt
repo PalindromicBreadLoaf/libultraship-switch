@@ -60,6 +60,14 @@ if (CMAKE_SYSTEM_NAME STREQUAL "iOS")
     include(cmake/dependencies/ios.cmake)
 endif()
 
+# Must be run before add_subdirectory("src"). switch.cmake declares libzip, spdlog,
+# tinyxml2 and nlohmann_json with OVERRIDE_FIND_PACKAGE so that the
+# find_package(... REQUIRED) calls in src/CMakeLists.txt resolve to the
+# FetchContent'd copies.
+if (CMAKE_SYSTEM_NAME STREQUAL "NintendoSwitch")
+    include(cmake/dependencies/switch.cmake)
+endif()
+
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     include(cmake/dependencies/linux.cmake)
 endif()
