@@ -13,6 +13,10 @@
 #include "fast/backends/gfx_direct3d11.h"
 #include "fast/backends/gfx_window_manager_api.h"
 
+#ifdef __SWITCH__
+#include "ship/port/switch/SwitchImpl.h"
+#endif
+
 #include "fast/Fast3dGui.h"
 
 #include <fstream>
@@ -299,7 +303,7 @@ uint32_t Fast3dWindow::GetCurrentRefreshRate() {
 }
 
 bool Fast3dWindow::SupportsWindowedFullscreen() {
-#ifdef __APPLE__
+#if defined(__APPLE__) || defined(__SWITCH__)
     return false;
 #endif
 
