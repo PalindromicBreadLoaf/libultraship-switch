@@ -16,6 +16,10 @@
 #include "ship/window/gui/resource/GuiTextureFactory.h"
 #include "ship/window/gui/resource/GuiTexture.h"
 
+#ifdef __SWITCH__
+#include "ship/port/switch/SwitchImpl.h"
+#endif
+
 namespace Ship {
 #define TOGGLE_BTN ImGuiKey_F1
 #define TOGGLE_PAD_BTN ImGuiKey_GamepadBack
@@ -78,6 +82,11 @@ void Gui::Init() {
     mImGuiIo->Fonts->AddFontFromMemoryCompressedBase85TTF(fontawesome_compressed_data_base85, iconFontSize,
                                                           &iconsConfig, sIconsRanges);
 
+#ifdef __SWITCH__
+    Ship::Switch::CreateKeyboard();
+    Ship::Switch::ImGuiSetupFont(mImGuiIo->Fonts);
+#endif
+
 #if defined(__ANDROID__)
     // Scale everything by 2 for Android
     ImGui::GetStyle().ScaleAllSizes(2.0f);
@@ -110,8 +119,16 @@ void Gui::Init() {
         std::make_shared<ResourceFactoryBinaryGuiTextureV0>(), RESOURCE_FORMAT_BINARY, "GuiTexture",
         static_cast<uint32_t>(RESOURCE_TYPE_GUI_TEXTURE), 0);
 
+#ifdef __SWITCH__
+    ImGui::GetStyle().ScaleAllSizes(2);
+#endif
+
     ImGuiWMInit();
     ImGuiBackendInit();
+
+#ifdef __SWITCH__
+    Ship::Switch::ApplyOverclock();
+#endif
 }
 
 void Gui::ImGuiWMInit() {

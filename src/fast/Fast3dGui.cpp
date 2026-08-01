@@ -24,6 +24,10 @@
 #include "ship/port/mobile/MobileImpl.h"
 #endif
 
+#ifdef __SWITCH__
+#include "ship/port/switch/SwitchImpl.h"
+#endif
+
 #ifdef ENABLE_OPENGL
 #include <imgui_impl_opengl3.h>
 #include <imgui_impl_sdl2.h>
@@ -70,7 +74,9 @@ void Fast3dGui::HandleWindowEvents(Fast::WindowEvent event) {
         case WindowBackend::FAST3D_SDL_OPENGL:
         case WindowBackend::FAST3D_SDL_METAL:
             ImGui_ImplSDL2_ProcessEvent(static_cast<const SDL_Event*>(event.Sdl.Event));
-#if defined(__ANDROID__) || defined(__IOS__)
+#if defined(__SWITCH__)
+            Ship::Switch::ImGuiProcessEvent(ImGui::GetIO().WantTextInput);
+#elif defined(__ANDROID__) || defined(__IOS__)
             Ship::Mobile::ImGuiProcessEvent(ImGui::GetIO().WantTextInput);
 #endif
             break;
