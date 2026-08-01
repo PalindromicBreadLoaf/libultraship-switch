@@ -15,6 +15,7 @@
 #define HANDHELD_MODE 0
 
 static AppletHookCookie applet_hook_cookie;
+static bool initializedPhases[Ship::PostInitPhase + 1] = { false };
 static bool isRunning = true;
 static bool hasFocus = true;
 static bool isShowingVirtualKeyboard = false;
@@ -29,6 +30,15 @@ void DetectAppletMode();
 static void on_applet_hook(AppletHookType hook, void* param);
 
 void Ship::Switch::Init(SwitchPhase phase) {
+    // Each phase runs once. Repeating a phase is not harmless. appletHook copies
+    // the hook list head into the cookie it is handed before pointing the head at
+    // that cookie, so registering the same static cookie a second time leaves ih
+    // pointing at itself.
+    if (initializedPhases[phase]) {
+        return;
+    }
+    initializedPhases[phase] = true;
+
     switch (phase) {
         case PreInitPhase:
             DetectAppletMode();
