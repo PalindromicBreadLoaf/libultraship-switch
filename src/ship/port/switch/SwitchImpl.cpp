@@ -130,19 +130,38 @@ void Ship::Switch::GetDisplaySize(int* width, int* height) {
     }
 }
 
-void Ship::Switch::ApplyOverclock(void) {
-    SwitchProfiles perfMode = (SwitchProfiles)CVarGetInteger(CVAR_SWITCH_PERF_MODE, (int)Ship::MAXIMUM);
+// Do not override users clocks. They can do that themselves.
+#define NO_PERF_MODE (-1)
 
-    if (perfMode >= 0 && perfMode <= Ship::POWERSAVINGM3) {
-        if (hosversionBefore(8, 0, 0)) {
-            pcvSetClockRate(PcvModule_CpuBus, SWITCH_CPU_SPEEDS_VALUES[perfMode]);
-        } else {
-            ClkrstSession session = { 0 };
-            clkrstOpenSession(&session, PcvModuleId_CpuBus, 3);
-            clkrstSetClockRate(&session, SWITCH_CPU_SPEEDS_VALUES[perfMode]);
-            clkrstCloseSession(&session);
-        }
+static int GetConfiguredPerfMode() {
+    const int perfMode = CVarGetInteger(CVAR_SWITCH_PERF_MODE, NO_PERF_MODE);
+
+    if (perfMode < (int)Ship::MAXIMUM || perfMode > (int)Ship::POWERSAVINGM3) {
+        return NO_PERF_MODE;
     }
+
+    return perfMode;
+}
+
+static void SetCpuClock(unsigned hz) {
+    if (hosversionBefore(8, 0, 0)) {
+        pcvSetClockRate(PcvModule_CpuBus, hz);
+    } else {
+        ClkrstSession session = { 0 };
+        clkrstOpenSession(&session, PcvModuleId_CpuBus, 3);
+        clkrstSetClockRate(&session, hz);
+        clkrstCloseSession(&session);
+    }
+}
+
+void Ship::Switch::ApplyOverclock(void) {
+    const int perfMode = GetConfiguredPerfMode();
+
+    if (perfMode == NO_PERF_MODE) {
+        return;
+    }
+
+    SetCpuClock(SWITCH_CPU_SPEEDS_VALUES[perfMode]);
 }
 
 char* Ship::Switch::GetControllerUUID(int controller) {
@@ -175,13 +194,9 @@ static void on_applet_hook(AppletHookType hook, void* param) {
             hasFocus = nowHasFocus;
 
             if (!hasFocus) {
-                if (hosversionBefore(8, 0, 0)) {
-                    pcvSetClockRate(PcvModule_CpuBus, SWITCH_CPU_SPEEDS_VALUES[Ship::STOCK]);
-                } else {
-                    ClkrstSession session = { 0 };
-                    clkrstOpenSession(&session, PcvModuleId_CpuBus, 3);
-                    clkrstSetClockRate(&session, SWITCH_CPU_SPEEDS_VALUES[Ship::STOCK]);
-                    clkrstCloseSession(&session);
+                // Only drop back to stock if we were the ones holding the clock somewhere else.
+                if (GetConfiguredPerfMode() != NO_PERF_MODE) {
+                    SetCpuClock(SWITCH_CPU_SPEEDS_VALUES[Ship::STOCK]);
                 }
             } else {
                 Ship::Switch::ApplyOverclock();
