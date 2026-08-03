@@ -792,7 +792,57 @@ static uint64_t qpc_to_100ns(uint64_t qpc) {
     return qpc / qpc_freq * _100NANOSECONDS_IN_SECOND + qpc % qpc_freq * _100NANOSECONDS_IN_SECOND / qpc_freq;
 }
 
+// [limiter-diag] GDX_DIAG_LIMITER=1 (any non-"0" value).
+//
+// IsFrameReady is the single point that refuses a present, and with frame interpolation on it was
+// refusing EVERY sub-frame of ~35% of ticks -- including the first pass of the tick, which no
+// theory about spacing between passes can explain. Three such theories were built and killed
+// against measurements: burst-calling, VSync interaction, and tick budget. Rather than guess at a
+// fourth, this reports the function's OWN arithmetic at the moment it decides.
+//
+// The decision is `vsyncs_to_wait = (desired_present_time - last_present_end) / vsync_interval`,
+// refused when that is non-positive ("too late"). So the fields that matter are how far the
+// internal schedule has drifted from real time (delta_ms) and how many presents DXGI still has
+// queued, since queued vsyncs push last_end forward and can starve the schedule.
+//
+// Emitted once per 300 calls (~2 s at 144 Hz); the per-call cost when disabled is one bool test.
+namespace {
+struct GdxLimiterDiag {
+    unsigned long long calls = 0, accepts = 0, dropLate = 0, dropRound = 0, noStats = 0, resync = 0;
+    unsigned long long intervalRejects = 0; // estimates overruled by the panel's known interval
+    double lastWait = 0.0;      // vsyncs_to_wait at the most recent refusal (pre-rounding)
+    long long lastDesiredNs = 0; // where the internal schedule wanted this present
+    long long lastEndNs = 0;     // when the previous present is expected to retire
+    unsigned lastQueued = 0;     // vsyncs still queued in the swapchain
+    unsigned long long lastInterval = 0; // measured vsync interval, ns
+};
+GdxLimiterDiag gLimiterDiag;
+
+bool GdxLimiterDiagOn() {
+    static const bool on = [] {
+        const char* e = getenv("GDX_DIAG_LIMITER");
+        return e != nullptr && e[0] != '\0' && !(e[0] == '0' && e[1] == '\0');
+    }();
+    return on;
+}
+
+void GdxLimiterDiagEmit() {
+    SPDLOG_WARN("[limiter-diag] calls={} accept={} drop_late={} drop_round={} resync={} nostats={} "
+                "int_reject={} "
+                "| last refusal: wait={:.3f} delta_ms={:.3f} desired={} last_end={} queued={} vsync_int_ns={}",
+                gLimiterDiag.calls, gLimiterDiag.accepts, gLimiterDiag.dropLate, gLimiterDiag.dropRound,
+                gLimiterDiag.resync, gLimiterDiag.noStats, gLimiterDiag.intervalRejects, gLimiterDiag.lastWait,
+                (double)(gLimiterDiag.lastDesiredNs - gLimiterDiag.lastEndNs) / 1.0e6,
+                gLimiterDiag.lastDesiredNs, gLimiterDiag.lastEndNs, gLimiterDiag.lastQueued,
+                gLimiterDiag.lastInterval);
+}
+} // namespace
+
 bool GfxWindowBackendDXGI::IsFrameReady() {
+    const bool gdxDiag = GdxLimiterDiagOn();
+    if (gdxDiag && (++gLimiterDiag.calls % 300ull) == 0ull) {
+        GdxLimiterDiagEmit();
+    }
     DXGI_FRAME_STATISTICS stats;
     if (swap_chain->GetFrameStatistics(&stats) == S_OK &&
         (stats.SyncRefreshCount != 0 || stats.SyncQPCTime.QuadPart != 0ULL)) {
@@ -846,6 +896,30 @@ bool GfxWindowBackendDXGI::IsFrameReady() {
             estimated_vsync_interval_ns = 16666666;
             estimated_vsync_interval = (double)estimated_vsync_interval_ns * qpc_freq / 1000000000;
         }
+        // [GDX] Anchor the estimate to the panel's ACTUAL refresh interval. Reverting this once
+        // coincided with a deterministic race-entry crash, so it is restored while that is
+        // understood; see the session notes before touching it again.
+        // GDX_NO_VSYNC_CLAMP=1 disables the clamp for A/B WITHOUT a rebuild. It is the prime
+        // suspect for the Mute City sky flicker because it is the only change in the interpolation
+        // effort that also affects the ordinary non-interpolated render path -- and the flicker was
+        // reported with interpolation switched off. Note removing this code entirely once coincided
+        // with a deterministic race-entry crash (3/3), so the toggle exists to test the clamp's
+        // EFFECT while leaving the code present.
+        static const bool sNoClamp = [] {
+            const char* e = getenv("GDX_NO_VSYNC_CLAMP");
+            return e != nullptr && e[0] != 0 && !(e[0] == 0x30 && e[1] == 0);
+        }();
+        if (!sNoClamp && mDetectedHz >= 20.0f) {
+            const uint64_t expected_ns = (uint64_t)(1000000000.0 / (double)mDetectedHz);
+            if (estimated_vsync_interval_ns < (expected_ns * 3) / 4 ||
+                estimated_vsync_interval_ns > (expected_ns * 5) / 4) {
+                estimated_vsync_interval_ns = expected_ns;
+                estimated_vsync_interval = (double)estimated_vsync_interval_ns * qpc_freq / 1000000000;
+                if (gdxDiag) {
+                    ++gLimiterDiag.intervalRejects;
+                }
+            }
+        }
 
         UINT queued_vsyncs = 0;
         bool is_first = true;
@@ -868,9 +942,19 @@ bool GfxWindowBackendDXGI::IsFrameReady() {
 
         if (vsyncs_to_wait <= 0) {
             // Too late
+            if (gdxDiag) {
+                gLimiterDiag.lastWait = vsyncs_to_wait;
+                gLimiterDiag.lastDesiredNs = (long long)(mFrameTimeStamp / FRAME_INTERVAL_NS_DENOMINATOR);
+                gLimiterDiag.lastEndNs = (long long)last_end_ns;
+                gLimiterDiag.lastQueued = queued_vsyncs;
+                gLimiterDiag.lastInterval = estimated_vsync_interval_ns;
+            }
 
             if ((int64_t)(mFrameTimeStamp / FRAME_INTERVAL_NS_DENOMINATOR - last_end_ns) < -66666666) {
                 // The application must have been paused or similar
+                if (gdxDiag) {
+                    ++gLimiterDiag.resync;
+                }
                 vsyncs_to_wait = round(((double)FRAME_INTERVAL_NS_NUMERATOR / FRAME_INTERVAL_NS_DENOMINATOR) /
                                        estimated_vsync_interval_ns);
                 if (vsyncs_to_wait < 1) {
@@ -881,6 +965,9 @@ bool GfxWindowBackendDXGI::IsFrameReady() {
             } else {
                 // Drop frame
                 // printf("Dropping frame\n");
+                if (gdxDiag) {
+                    ++gLimiterDiag.dropLate;
+                }
                 mDroppedFrame = true;
                 return false;
             }
@@ -910,10 +997,26 @@ bool GfxWindowBackendDXGI::IsFrameReady() {
             }
             if (vsyncs_to_wait == 0) {
                 // printf("vsyncs_to_wait became 0 so dropping frame\n");
+                if (gdxDiag) {
+                    ++gLimiterDiag.dropRound;
+                    gLimiterDiag.lastWait = orig_wait;
+                    gLimiterDiag.lastDesiredNs = (long long)(mFrameTimeStamp / FRAME_INTERVAL_NS_DENOMINATOR);
+                    gLimiterDiag.lastEndNs = (long long)last_end_ns;
+                    gLimiterDiag.lastQueued = queued_vsyncs;
+                    gLimiterDiag.lastInterval = estimated_vsync_interval_ns;
+                }
                 mDroppedFrame = true;
                 return false;
             }
         }
+    } else if (gdxDiag) {
+        // Fewer than two frame-statistics samples: the whole pacing block is skipped and the call
+        // is accepted unconditionally. Counted separately so "accepted" is never confused with
+        // "the limiter agreed" -- if this number is large the limiter is simply not engaging.
+        ++gLimiterDiag.noStats;
+    }
+    if (gdxDiag) {
+        ++gLimiterDiag.accepts;
     }
     return true;
 }
@@ -1117,7 +1220,12 @@ void GfxWindowBackendDXGI::SwapBuffersBegin() {
     if (vsyncPaced != sWasVsyncPaced || !sVsyncPacedLogged) {
         sWasVsyncPaced = vsyncPaced;
         sVsyncPacedLogged = true;
-        SPDLOG_INFO("[pacer] vsync-paced: {} software wait target={:.2f} refresh={:.2f}",
+        // WARN, not INFO: Release builds initialise the logger at spdlog::level::warn (Context.h
+        // InitLogging default), so this transition line has never once appeared in a Release log.
+        // It carries mTargetFps and mDetectedHz -- the two values that decide whether the software
+        // limiter drops a present -- and its absence is why a 90-second stretch of ~20 presents/s
+        // could not be attributed from a full GDX_LOG capture.
+        SPDLOG_WARN("[pacer] vsync-paced: {} software wait target={:.2f} refresh={:.2f}",
                     vsyncPaced ? "skipping" : "resuming", (double)mTargetFps, mDetectedHz);
     }
 

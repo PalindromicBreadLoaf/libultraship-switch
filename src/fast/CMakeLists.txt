@@ -41,3 +41,43 @@ endif()
 
 source_group("graphic" FILES ${Source_Files__Graphic})
 target_sources(libultraship PRIVATE ${Source_Files__Graphic})
+
+#=================== Shader cache fingerprint ===================
+#
+# backends/gfx_shader_cache.cpp persists compiled shader payloads (DXBC, GL program binaries)
+# across runs so the 9-15ms per-variant compile is paid once per install instead of once per
+# launch. A stored blob is only valid for the exact source text its generator emits today: edit
+# an emitter or a .glsl/.hlsl template and every stored blob becomes silently wrong -- wrong
+# pixels, or a driver rejecting the binary, on a user's machine, with no symptom pointing back
+# here. So hash the generator inputs at configure time and compile the digest in; the cache
+# rejects any store whose fingerprint differs and recompiles from source.
+#
+# CMAKE_CONFIGURE_DEPENDS is what keeps this honest. Without it, editing a shader template would
+# not re-run configure, and the compiled-in fingerprint would go on describing a build that no
+# longer exists -- which is exactly the failure this is meant to prevent.
+set(GDX_SHADER_FINGERPRINT_INPUTS
+    "${CMAKE_CURRENT_SOURCE_DIR}/backends/gfx_direct3d_common.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/backends/gfx_direct3d11.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/backends/gfx_opengl.cpp"
+)
+file(GLOB_RECURSE GDX_SHADER_FINGERPRINT_TEMPLATES "${CMAKE_CURRENT_SOURCE_DIR}/shaders/*")
+list(APPEND GDX_SHADER_FINGERPRINT_INPUTS ${GDX_SHADER_FINGERPRINT_TEMPLATES})
+list(SORT GDX_SHADER_FINGERPRINT_INPUTS)
+
+set(GDX_SHADER_FINGERPRINT_ACC "")
+foreach(gdxShaderInput IN LISTS GDX_SHADER_FINGERPRINT_INPUTS)
+    if(EXISTS "${gdxShaderInput}" AND NOT IS_DIRECTORY "${gdxShaderInput}")
+        file(SHA256 "${gdxShaderInput}" gdxShaderInputHash)
+        string(APPEND GDX_SHADER_FINGERPRINT_ACC "${gdxShaderInputHash}")
+        set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${gdxShaderInput}")
+    endif()
+endforeach()
+
+# Truncating to 64 bits is deliberate: this is a change detector, not a security boundary, and a
+# u64 is what the store header carries. An all-zero digest would read as "no fingerprint" and
+# disable the cache -- a 2^-64 event whose only cost is compiling shaders the way we always did.
+string(SHA256 GDX_SHADER_FINGERPRINT_FULL "${GDX_SHADER_FINGERPRINT_ACC}")
+string(SUBSTRING "${GDX_SHADER_FINGERPRINT_FULL}" 0 16 GDX_SHADER_FINGERPRINT_HEX)
+
+target_compile_definitions(libultraship PRIVATE GDX_SHADER_CACHE_FINGERPRINT=0x${GDX_SHADER_FINGERPRINT_HEX}ull)
+message(STATUS "G-Diffuser shader cache fingerprint: 0x${GDX_SHADER_FINGERPRINT_HEX}")

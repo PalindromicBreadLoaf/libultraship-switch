@@ -4,7 +4,9 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <stdio.h>
+#include <cstring>
 
+#include <chrono>
 #include <map>
 #include <unordered_map>
 
@@ -71,6 +73,14 @@ void GfxRenderingAPIOGL::SetPerDrawUniforms() {
         // trimmed the array to one active element, which left texture_width[0] at 0 and
         // turned every three-point-filtered world sample black (division by zero size).
         for (int i = 0; i < 2; i++) {
+            // This loop covers BOTH slots whenever EITHER is used, so slot 1 is indexed even for a
+            // single-texture material and can still be carrying an id from an earlier draw. The
+            // textures vector only grows (NewTexture resizes, DeleteTexture does not shrink), so
+            // this is catching stale ids rather than gaps -- but stale is enough to index past the
+            // end. Same guard D3D11 applies before touching mTextures (gfx_direct3d11.cpp:761-763).
+            if (mCurrentTextureIds[i] >= textures.size()) {
+                continue;
+            }
             glUniform1i(mCurrentShaderProgram->texture_filtering_locations[i],
                         textures[mCurrentTextureIds[i]].filtering);
             glUniform1i(mCurrentShaderProgram->texture_width_locations[i], textures[mCurrentTextureIds[i]].width);
@@ -107,6 +117,16 @@ static const char* shader_item_to_str(uint32_t item, bool with_alpha, bool only_
                                       bool first_cycle, bool hint_single_element) {
     if (!only_alpha) {
         switch (item) {
+            // Folding unknown mux values into SHADER_0 is load-bearing, not defensive tidiness.
+            // Only SHADER_INPUT_1..4 are spelled below, but gfx_cc_get_features derives numInputs
+            // from combiner slots as high as SHADER_INPUT_7 (interpreter.cpp:7764), so the gap is
+            // reachable. Without a default the switch falls through to the `return ""` at the tail
+            // of this function and splices an empty string into the generated GLSL -- a syntactically
+            // invalid shader, which fails glCompileShader and lands on the abort() in
+            // CreateAndLoadNewShader. That turns a wrong-looking material into a killed process.
+            // gfx_direct3d11.cpp:1322 and :1365 already fold unknown values into SHADER_0 this way,
+            // so black is also the cross-backend answer.
+            default:
             case SHADER_0:
                 return with_alpha ? "vec4(0.0, 0.0, 0.0, 0.0)" : "vec3(0.0, 0.0, 0.0)";
             case SHADER_1:
@@ -149,6 +169,9 @@ static const char* shader_item_to_str(uint32_t item, bool with_alpha, bool only_
         }
     } else {
         switch (item) {
+            // Same reachable gap as the colour switch above, same fold into SHADER_0
+            // (gfx_direct3d11.cpp:1365).
+            default:
             case SHADER_0:
                 return "0.0";
             case SHADER_1:
@@ -402,6 +425,81 @@ static std::string BuildVsShader(const CCFeatures& cc_features) {
     return result;
 }
 
+/*
+ * [shader-cache] Program-binary entry points.
+ *
+ * glGetProgramBinary and friends are GL 4.1 core / ARB_get_program_binary, but this port targets
+ * "#version 130" on desktop GL and GLES 3.0 elsewhere, so they cannot be assumed present and must
+ * not be linked against directly -- a missing symbol at load time would take the whole process
+ * down over an optimisation. Resolved through SDL at Init instead, with absence meaning "compile
+ * every run", exactly as before the cache existed.
+ */
+#ifndef GL_PROGRAM_BINARY_LENGTH
+#define GL_PROGRAM_BINARY_LENGTH 0x8741
+#endif
+#ifndef GL_NUM_PROGRAM_BINARY_FORMATS
+#define GL_NUM_PROGRAM_BINARY_FORMATS 0x87FE
+#endif
+#ifndef GL_PROGRAM_BINARY_RETRIEVABLE_HINT
+#define GL_PROGRAM_BINARY_RETRIEVABLE_HINT 0x8257
+#endif
+#ifndef APIENTRY
+#define APIENTRY
+#endif
+
+typedef void(APIENTRY* GdxGlGetProgramBinaryFn)(GLuint, GLsizei, GLsizei*, GLenum*, void*);
+typedef void(APIENTRY* GdxGlProgramBinaryFn)(GLuint, GLenum, const void*, GLsizei);
+typedef void(APIENTRY* GdxGlProgramParameteriFn)(GLuint, GLenum, GLint);
+
+static GdxGlGetProgramBinaryFn sGdxGlGetProgramBinary = nullptr;
+static GdxGlProgramBinaryFn sGdxGlProgramBinary = nullptr;
+static GdxGlProgramParameteriFn sGdxGlProgramParameteri = nullptr;
+static bool sGdxProgramBinarySupported = false;
+
+static void GdxResolveProgramBinaryEntryPoints() {
+    sGdxGlGetProgramBinary = (GdxGlGetProgramBinaryFn)SDL_GL_GetProcAddress("glGetProgramBinary");
+    sGdxGlProgramBinary = (GdxGlProgramBinaryFn)SDL_GL_GetProcAddress("glProgramBinary");
+    sGdxGlProgramParameteri = (GdxGlProgramParameteriFn)SDL_GL_GetProcAddress("glProgramParameteri");
+
+    // A driver is permitted to advertise the entry points and then support zero binary formats,
+    // in which case every glProgramBinary call fails. Ask up front rather than learning it one
+    // rejected binary at a time.
+    GLint formats = 0;
+    glGetIntegerv(GL_NUM_PROGRAM_BINARY_FORMATS, &formats);
+    while (glGetError() != GL_NO_ERROR) {
+        // Drain: on a driver without the enum this query itself raises GL_INVALID_ENUM, and
+        // leaving that on the error queue would misattribute to whatever draws next.
+    }
+
+    sGdxProgramBinarySupported = sGdxGlGetProgramBinary != nullptr && sGdxGlProgramBinary != nullptr &&
+                                 sGdxGlProgramParameteri != nullptr && formats > 0;
+}
+
+/**
+ * @brief Fold the driver identity into the cache fingerprint.
+ *
+ * A GL program binary is only loadable by the exact driver that produced it. Vendor, renderer and
+ * version are the strongest identity the API exposes, so a driver update or a swap to a different
+ * GPU invalidates the store wholesale instead of feeding binaries to a driver that will reject
+ * them -- or, worse, silently misinterpret them.
+ */
+static uint64_t GdxGlDriverFingerprint() {
+    uint64_t h = 1469598103934665603ull; // FNV-1a 64-bit offset basis
+    const GLenum fields[3] = { GL_VENDOR, GL_RENDERER, GL_VERSION };
+    for (GLenum field : fields) {
+        const char* s = (const char*)glGetString(field);
+        if (s != nullptr) {
+            for (; *s != '\0'; ++s) {
+                h ^= (uint64_t)(uint8_t)*s;
+                h *= 1099511628211ull;
+            }
+        }
+        h ^= 0xFFull; // field separator, so ("ab","c") and ("a","bc") differ
+        h *= 1099511628211ull;
+    }
+    return h;
+}
+
 void GfxRenderingAPIOGL::ClearShaderCache() {
     mShaderProgramPool.clear();
 }
@@ -409,44 +507,149 @@ void GfxRenderingAPIOGL::ClearShaderCache() {
 ShaderProgram* GfxRenderingAPIOGL::CreateAndLoadNewShader(uint64_t shader_id0, uint64_t shader_id1) {
     CCFeatures cc_features;
     gfx_cc_get_features(shader_id0, shader_id1, &cc_features);
-    const auto fs_buf = BuildFsShader(cc_features);
-    const auto vs_buf = BuildVsShader(cc_features);
-    const GLchar* sources[2] = { vs_buf.data(), fs_buf.data() };
-    const GLint lengths[2] = { (GLint)vs_buf.size(), (GLint)fs_buf.size() };
-    GLint success;
 
-    GLuint vertex_shader = glCreateShader(GL_VERTEX_SHADER);
-    glShaderSource(vertex_shader, 1, &sources[0], &lengths[0]);
-    glCompileShader(vertex_shader);
-    glGetShaderiv(vertex_shader, GL_COMPILE_STATUS, &success);
-    if (!success) {
-        GLint max_length = 0;
-        glGetShaderiv(vertex_shader, GL_INFO_LOG_LENGTH, &max_length);
-        char error_log[1024];
-        // fprintf(stderr, "Vertex shader compilation failed\n");
-        glGetShaderInfoLog(vertex_shader, max_length, &max_length, &error_log[0]);
-        // fprintf(stderr, "%s\n", &error_log[0]);
-        abort();
+    // Both of these change the generated GLSL without being part of the shader id, so they are
+    // part of the cache key or a filter-mode switch would resurrect the wrong program.
+    const uint32_t cacheFlags =
+        (mCurrentFilterMode == FILTER_THREE_POINT ? (uint32_t)SHADER_CACHE_FLAG_THREE_POINT : 0u) |
+        (mSrgbMode ? (uint32_t)SHADER_CACHE_FLAG_SRGB : 0u);
+
+    /*
+     * Cached payload layout, little-endian: numFloats u32, binaryFormat u32, binaryLength u32,
+     * then the program binary.
+     *
+     * numFloats has to ride along. It is accumulated into a file-static by the prism
+     * update_floats callback while BuildVsShader expands the template (see above), not derived
+     * from cc_features, so a cache hit -- which skips template expansion entirely -- has nowhere
+     * else to recover it from. Reading the stale static instead would silently mis-stride every
+     * vertex attribute for this program.
+     */
+    GLuint shader_program = 0;
+    size_t programNumFloats = 0;
+    static constexpr size_t kPayloadHeader = 12;
+
+    const std::vector<uint8_t>* cached = mShaderCache.Lookup(shader_id0, shader_id1, cacheFlags);
+    if (cached != nullptr && cached->size() > kPayloadHeader && sGdxProgramBinarySupported) {
+        uint32_t storedFloats = 0, storedFormat = 0, storedLength = 0;
+        memcpy(&storedFloats, cached->data(), sizeof(storedFloats));
+        memcpy(&storedFormat, cached->data() + 4, sizeof(storedFormat));
+        memcpy(&storedLength, cached->data() + 8, sizeof(storedLength));
+
+        if ((size_t)storedLength + kPayloadHeader == cached->size() && storedLength > 0) {
+            GLuint restored = glCreateProgram();
+            sGdxGlProgramBinary(restored, (GLenum)storedFormat, cached->data() + kPayloadHeader,
+                                (GLsizei)storedLength);
+
+            // glProgramBinary is explicitly allowed to reject a binary it once produced -- a
+            // driver update between runs is the common case -- and it signals that through
+            // GL_LINK_STATUS rather than an error. Falling through to a source compile is the
+            // documented recovery, so this is a normal path, not a failure.
+            GLint linked = GL_FALSE;
+            glGetProgramiv(restored, GL_LINK_STATUS, &linked);
+            while (glGetError() != GL_NO_ERROR) {
+            }
+            if (linked == GL_TRUE) {
+                shader_program = restored;
+                programNumFloats = storedFloats;
+            } else {
+                glDeleteProgram(restored);
+            }
+        }
     }
 
-    GLuint fragment_shader = glCreateShader(GL_FRAGMENT_SHADER);
-    glShaderSource(fragment_shader, 1, &sources[1], &lengths[1]);
-    glCompileShader(fragment_shader);
-    glGetShaderiv(fragment_shader, GL_COMPILE_STATUS, &success);
-    if (!success) {
-        GLint max_length = 0;
-        glGetShaderiv(fragment_shader, GL_INFO_LOG_LENGTH, &max_length);
-        char error_log[1024];
-        fprintf(stderr, "Fragment shader compilation failed\n");
-        glGetShaderInfoLog(fragment_shader, max_length, &max_length, &error_log[0]);
-        fprintf(stderr, "%s\n", &error_log[0]);
-        abort();
-    }
+    if (shader_program == 0) {
+        // [shader-compile] mirrors the D3D11 probe. Template expansion, glCompileShader and
+        // glLinkProgram are all reached from inside the draw call, so on this backend too a burst
+        // of new materials shows up as unattributable frame spikes. Driver behaviour differs (some
+        // defer the real work to first use), so the numbers are not expected to match D3D11 -- that
+        // difference is itself worth knowing. With the cache in place this only runs on a genuine
+        // miss, so these lines double as the cache's miss log.
+        const auto gdxShaderCompileStart = std::chrono::steady_clock::now();
+        static int sGdxShaderCompileCount = 0;
+        static double sGdxShaderCompileTotalMs = 0.0;
 
-    GLuint shader_program = glCreateProgram();
-    glAttachShader(shader_program, vertex_shader);
-    glAttachShader(shader_program, fragment_shader);
-    glLinkProgram(shader_program);
+        const auto fs_buf = BuildFsShader(cc_features);
+        const auto vs_buf = BuildVsShader(cc_features);
+        const GLchar* sources[2] = { vs_buf.data(), fs_buf.data() };
+        const GLint lengths[2] = { (GLint)vs_buf.size(), (GLint)fs_buf.size() };
+        GLint success;
+
+        GLuint vertex_shader = glCreateShader(GL_VERTEX_SHADER);
+        glShaderSource(vertex_shader, 1, &sources[0], &lengths[0]);
+        glCompileShader(vertex_shader);
+        glGetShaderiv(vertex_shader, GL_COMPILE_STATUS, &success);
+        if (!success) {
+            GLint max_length = 0;
+            glGetShaderiv(vertex_shader, GL_INFO_LOG_LENGTH, &max_length);
+            char error_log[1024];
+            // fprintf(stderr, "Vertex shader compilation failed\n");
+            glGetShaderInfoLog(vertex_shader, max_length, &max_length, &error_log[0]);
+            // fprintf(stderr, "%s\n", &error_log[0]);
+            abort();
+        }
+
+        GLuint fragment_shader = glCreateShader(GL_FRAGMENT_SHADER);
+        glShaderSource(fragment_shader, 1, &sources[1], &lengths[1]);
+        glCompileShader(fragment_shader);
+        glGetShaderiv(fragment_shader, GL_COMPILE_STATUS, &success);
+        if (!success) {
+            GLint max_length = 0;
+            glGetShaderiv(fragment_shader, GL_INFO_LOG_LENGTH, &max_length);
+            char error_log[1024];
+            fprintf(stderr, "Fragment shader compilation failed\n");
+            glGetShaderInfoLog(fragment_shader, max_length, &max_length, &error_log[0]);
+            fprintf(stderr, "%s\n", &error_log[0]);
+            abort();
+        }
+
+        shader_program = glCreateProgram();
+        glAttachShader(shader_program, vertex_shader);
+        glAttachShader(shader_program, fragment_shader);
+
+        // Must be set BEFORE linking: without the hint a driver is free to discard whatever it
+        // would need to hand a binary back, and glGetProgramBinary then legitimately returns
+        // nothing. Harmless when the cache is off, so it is unconditional.
+        if (sGdxProgramBinarySupported) {
+            sGdxGlProgramParameteri(shader_program, GL_PROGRAM_BINARY_RETRIEVABLE_HINT, GL_TRUE);
+        }
+
+        glLinkProgram(shader_program);
+        programNumFloats = numFloats;
+
+        {
+            const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
+                                                                        gdxShaderCompileStart)
+                                  .count();
+            ++sGdxShaderCompileCount;
+            sGdxShaderCompileTotalMs += ms;
+            SPDLOG_ERROR("[shader-compile] opengl #{} id0={:016X} id1={:016X} {:.2f}ms (total {:.1f}ms)",
+                         sGdxShaderCompileCount, shader_id0, shader_id1, ms, sGdxShaderCompileTotalMs);
+        }
+
+        if (sGdxProgramBinarySupported && mShaderCache.Enabled()) {
+            GLint binaryLength = 0;
+            glGetProgramiv(shader_program, GL_PROGRAM_BINARY_LENGTH, &binaryLength);
+            if (binaryLength > 0) {
+                std::vector<uint8_t> payload(kPayloadHeader + (size_t)binaryLength);
+                GLenum binaryFormat = 0;
+                GLsizei written = 0;
+                sGdxGlGetProgramBinary(shader_program, binaryLength, &written, &binaryFormat,
+                                       payload.data() + kPayloadHeader);
+                if (written > 0) {
+                    const uint32_t storedFloats = (uint32_t)programNumFloats;
+                    const uint32_t storedFormat = (uint32_t)binaryFormat;
+                    const uint32_t storedLength = (uint32_t)written;
+                    memcpy(payload.data(), &storedFloats, sizeof(storedFloats));
+                    memcpy(payload.data() + 4, &storedFormat, sizeof(storedFormat));
+                    memcpy(payload.data() + 8, &storedLength, sizeof(storedLength));
+                    payload.resize(kPayloadHeader + (size_t)written);
+                    mShaderCache.Store(shader_id0, shader_id1, cacheFlags, payload.data(), payload.size());
+                }
+            }
+            while (glGetError() != GL_NO_ERROR) {
+            }
+        }
+    }
 
     size_t cnt = 0;
 
@@ -502,7 +705,7 @@ ShaderProgram* GfxRenderingAPIOGL::CreateAndLoadNewShader(uint64_t shader_id0, u
     prg->usedTextures[3] = cc_features.used_masks[1];
     prg->usedTextures[4] = cc_features.used_blend[0];
     prg->usedTextures[5] = cc_features.used_blend[1];
-    prg->numFloats = numFloats;
+    prg->numFloats = programNumFloats;
     prg->numAttribs = cnt;
 
     prg->frameCountLocation = glGetUniformLocation(shader_program, "frame_count");
@@ -671,7 +874,22 @@ void GfxRenderingAPIOGL::SetUseAlpha(bool use_alpha) {
 }
 
 void GfxRenderingAPIOGL::DrawTriangles(float buf_vbo[], size_t buf_vbo_len, size_t buf_vbo_num_tris) {
-    if (mCurrentDepthTest != mLastDepthTest || mCurrentDepthMask != mLastDepthMask) {
+    // mCurrentZmodeDecal belongs in this key: the glDepthFunc below is derived from it as well as
+    // from depth test/mask. Interpreter::GfxSpTri1 pushes the test/mask pair and the decal bit
+    // through two INDEPENDENT dirty checks, each preceded by its own Flush()
+    // (interpreter.cpp:3141-3153), so a batch that flips only the decal bit reaches this function
+    // with the pair unchanged, skips this block entirely, and keeps the previous draw's
+    // GL_LESS/GL_LEQUAL -- while the polygon-offset block just below DOES update, because its guard
+    // already tests the decal bit. Depth compare and depth bias then disagree, and which stale
+    // compare a decal batch inherits depends on what was drawn before it, which is why the symptom
+    // reads as per-frame flicker rather than a static error. gfx_direct3d11.cpp:692-693 carries the
+    // same three-term key; upstream added the decal term to DepthFunc in "Fix depth test, preserving
+    // behavior for decals (#612)" without extending the key here.
+    //
+    // mLastZmodeDecal is deliberately NOT latched in this block: the polygon-offset block owns that
+    // latch and must still observe the transition, exactly as gfx_direct3d11.cpp:715 owns it there.
+    if (mCurrentDepthTest != mLastDepthTest || mCurrentDepthMask != mLastDepthMask ||
+        mCurrentZmodeDecal != mLastZmodeDecal) {
         mLastDepthTest = mCurrentDepthTest;
         mLastDepthMask = mCurrentDepthMask;
 
@@ -744,7 +962,23 @@ void GfxRenderingAPIOGL::Init() {
     glEnable(GL_DEPTH_CLAMP);
 #endif
     glDepthFunc(GL_LEQUAL);
-    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    // Separate alpha factors, matching the per-shader blend state D3D11 builds for every
+    // alpha-enabled combiner (gfx_direct3d11.cpp:501-507): colour blends conventionally, but the
+    // destination ALPHA is preserved (ZERO/ONE) instead of being overwritten by the source's.
+    // Render targets are cleared to alpha 1.0 (see ClearFramebuffer) and everything downstream
+    // assumes they stay opaque; the single-function form let every blended draw erode that alpha,
+    // which was a GL-only divergence from the D3D11 reference.
+    glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ZERO, GL_ONE);
+
+    // Bring the driver and the cached scissor flag into agreement before the first draw.
+    // mLastScissorEnabled starts at -1 ("unknown") and every path that disables the scissor for a
+    // blit re-enables it afterwards, so scissor-enabled is this backend's steady state -- but until
+    // one of those paths happened to run, the cache asserted nothing while GL had the test off, and
+    // a cache that later reads 1 will never issue the glEnable it believes is redundant. D3D11 has
+    // no such window: ScissorEnable is true in the very first rasterizer state it creates
+    // (gfx_direct3d11.cpp:746).
+    glEnable(GL_SCISSOR_TEST);
+    mLastScissorEnabled = 1;
 
     mFrameBuffers.resize(1); // for the default screen buffer
 
@@ -761,6 +995,19 @@ void GfxRenderingAPIOGL::Init() {
     mPixelDepthRbSize = 1;
 
     glGetIntegerv(GL_MAX_SAMPLES, &mMaxMsaaLevel);
+
+    // Compiled-shader store. Must come after glewInit above, since the driver strings and the
+    // program-binary entry points are only reachable on a live context. Unlike D3D11 there is no
+    // shipped seed: a GL program binary is loadable only by the exact driver that produced it, so
+    // the driver identity is folded into the fingerprint and every machine builds its own store on
+    // first run. A driver without ARB_get_program_binary simply keeps compiling every launch.
+    GdxResolveProgramBinaryEntryPoints();
+    if (sGdxProgramBinarySupported) {
+        mShaderCache.Init(SHADER_CACHE_TAG_OPENGL, GdxGlDriverFingerprint(), nullptr,
+                          "gdiffuser-shadercache-opengl.bin");
+    } else {
+        SPDLOG_WARN("[shader-cache] opengl: no usable program-binary support; shaders compile every run");
+    }
 }
 
 void GfxRenderingAPIOGL::OnResize() {
@@ -785,6 +1032,16 @@ int GfxRenderingAPIOGL::CreateFramebuffer() {
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     glBindTexture(GL_TEXTURE_2D, 0);
+    // The bind/unbind pair above lands on whichever unit SelectTexture last activated, so the
+    // cached name for that unit is now stale: it still claims some texture id while the driver has
+    // the default (0) bound. SelectTexture early-outs on a cache hit, so the very next
+    // SelectTexture(thatTile, thatSameId) would skip its glBindTexture and the draw would sample
+    // the incomplete default texture instead. Invalidate the entry the unbind actually invalidated.
+    // D3D11 has no analogue -- CreateTexture2D binds nothing and mLastResourceViews is only written
+    // in DrawTriangles -- which is why this is another GL-only divergence.
+    if (mLastActiveTexture >= 0 && mLastActiveTexture < SHADER_MAX_TEXTURES) {
+        mLastBoundTextures[mLastActiveTexture] = 0;
+    }
 
     GLuint clrbufMsaa;
     glGenRenderbuffers(1, &clrbufMsaa);
@@ -826,6 +1083,15 @@ void GfxRenderingAPIOGL::UpdateFramebufferParameters(int fb_id, uint32_t width, 
                 glBindTexture(GL_TEXTURE_2D, fb.clrbuf);
                 glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB8, width, height, 0, GL_RGB, GL_UNSIGNED_BYTE, NULL);
                 glBindTexture(GL_TEXTURE_2D, 0);
+                // Same cache invalidation as in CreateFramebuffer above: this unbind lands on the
+                // unit SelectTexture last activated, so its cached name no longer matches the
+                // driver and a later SelectTexture with that same id would early-out and leave the
+                // default texture bound. This path is gated on a size/MSAA change, so the symptom
+                // is a one-frame wrong-texture glitch after a window resize (or at framebuffer
+                // creation), not a per-frame artefact -- which is exactly what made it survive.
+                if (mLastActiveTexture >= 0 && mLastActiveTexture < SHADER_MAX_TEXTURES) {
+                    mLastBoundTextures[mLastActiveTexture] = 0;
+                }
                 glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, fb.clrbuf, 0);
             } else {
                 glBindRenderbuffer(GL_RENDERBUFFER, fb.clrbufMsaa);
@@ -858,6 +1124,26 @@ void GfxRenderingAPIOGL::UpdateFramebufferParameters(int fb_id, uint32_t width, 
     fb.has_depth_buffer = has_depth_buffer;
     fb.msaa_level = msaa_level;
     fb.invertY = opengl_invertY;
+
+    // Restore the draw target this call found bound. The glBindFramebuffer near the top is a means
+    // to an end -- glFramebufferTexture2D/glFramebufferRenderbuffer attach to whatever is currently
+    // bound to GL_FRAMEBUFFER -- and not a request to change where rendering goes. Every sibling
+    // entry point that binds a framebuffer for its own purposes already restores this same way
+    // (CopyFramebuffer and ReadFramebufferToCPU below both end on exactly this line), and D3D11's
+    // equivalent never touches its output merger at all: GfxRenderingAPIDX11::UpdateFramebufferParameters
+    // (gfx_direct3d11.cpp:892-964) only creates textures, SRVs and RTVs. So this is backend parity,
+    // not a new behaviour.
+    //
+    // Leaving the binding behind was fatal in this port's frame loop rather than merely untidy.
+    // Interpreter::StartFrame calls this unconditionally for mGameFb whenever mRendersToFb is true
+    // (interpreter.cpp:7291/7296, plus mGameFbMsaaResolved at 7307), and the host runs the ENTIRE
+    // game frame inside gdx_vi_tick() (port/main.cpp:1232) BEFORE Gui::StartDraw() and
+    // Fast3dWindow::StartFrame() (main.cpp:1252-1253). The stray offscreen binding therefore
+    // survived all the way into gui->EndDraw(); ImGui's GL3 backend issues no glBindFramebuffer of
+    // its own, so the enhancement menu -- and the composited game image with it -- was rendered into
+    // the offscreen texture while the window presented nothing but its bare black clear. Menu
+    // content invisible on GL, correct on DX11, from this one missing line.
+    glBindFramebuffer(GL_FRAMEBUFFER, mFrameBuffers[mCurrentFrameBuffer].fbo);
 }
 
 void GfxRenderingAPIOGL::StartDrawToFramebuffer(int fb_id, float noise_scale) {
@@ -871,13 +1157,26 @@ void GfxRenderingAPIOGL::StartDrawToFramebuffer(int fb_id, float noise_scale) {
 }
 
 void GfxRenderingAPIOGL::ClearFramebuffer(bool color, bool depth) {
+    // Clear the framebuffer this backend is actually drawing to rather than whatever happens to be
+    // bound. Every call site already pairs StartDrawToFramebuffer immediately before this one
+    // (Interpreter::Run and RunGuiOnly prologues, Interpreter::SetFrameBuffer at
+    // interpreter.cpp:7556-7559, and the port's own prologue in n64_gfx_bridge.cpp), so the two have
+    // always agreed -- this makes that incidental agreement structural, and mirrors
+    // GfxRenderingAPIDX11::ClearFramebuffer (gfx_direct3d11.cpp:986-995), which indexes
+    // mCurrentFramebuffer explicitly and so cannot be steered by an unrelated bind.
+    const FramebufferOGL& fb = mFrameBuffers[mCurrentFrameBuffer];
+    glBindFramebuffer(GL_FRAMEBUFFER, fb.fbo);
+
     if (mLastScissorEnabled != 0) {
         mLastScissorEnabled = 0;
         glDisable(GL_SCISSOR_TEST);
     }
     glDepthMask(GL_TRUE);
     glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
-    glClear((color ? GL_COLOR_BUFFER_BIT : 0) | (depth ? GL_DEPTH_BUFFER_BIT : 0));
+    // The depth bit is gated on the attachment the way D3D11 gates its ClearDepthStencilView call
+    // (gfx_direct3d11.cpp:992): a depth clear against a target that carries no depth attachment
+    // means nothing, and asking for it only obscures which targets really have one.
+    glClear((color ? GL_COLOR_BUFFER_BIT : 0) | (depth && fb.has_depth_buffer ? GL_DEPTH_BUFFER_BIT : 0));
     glDepthMask(mCurrentDepthMask ? GL_TRUE : GL_FALSE);
     if (mLastScissorEnabled != 1) {
         mLastScissorEnabled = 1;
@@ -918,7 +1217,10 @@ void GfxRenderingAPIOGL::ResolveMSAAColorBuffer(int fb_id_target, int fb_id_sour
 
     glBlitFramebuffer(0, 0, fb_src.width, fb_src.height, 0, 0, fb_dst.width, fb_dst.height, GL_COLOR_BUFFER_BIT,
                       GL_NEAREST);
-    glBindFramebuffer(GL_FRAMEBUFFER, mCurrentFrameBuffer);
+    // mCurrentFrameBuffer is an INDEX into mFrameBuffers, not a GL framebuffer name; passing it
+    // straight to glBindFramebuffer only did the right thing when the index happened to be 0. Same
+    // form the other restore sites already use (CopyFramebuffer and ReadFramebufferToCPU below).
+    glBindFramebuffer(GL_FRAMEBUFFER, mFrameBuffers[mCurrentFrameBuffer].fbo);
 
     if (mLastScissorEnabled != 1) {
         mLastScissorEnabled = 1;
@@ -933,7 +1235,8 @@ void* GfxRenderingAPIOGL::GetFramebufferTextureId(int fb_id) {
 void GfxRenderingAPIOGL::SelectTextureFb(int fb_id) {
     // glDisable(GL_DEPTH_TEST);
     int tile = 0;
-    GLuint texId = mFrameBuffers[fb_id].clrbuf;
+    const FramebufferOGL& fb = mFrameBuffers[fb_id];
+    GLuint texId = fb.clrbuf;
     // Ensure the textures metadata vector can hold this FB texture handle.
     // FB color buffers are created outside NewTexture(), so the vector may
     // not have been resized for them yet.
@@ -941,6 +1244,35 @@ void GfxRenderingAPIOGL::SelectTextureFb(int fb_id) {
         textures.resize((size_t)texId + 1);
     }
     SelectTexture(tile, texId);
+
+    // Give the framebuffer texture the sampler state and metadata that SetSamplerParameters gives
+    // every ordinary tile -- it never runs for this texture, because no tile descriptor describes
+    // it. Until now it kept the GL_LINEAR set once in CreateFramebuffer AND a default-constructed
+    // TextureInfo, whose zeroed filtering field reads as FILTER_THREE_POINT (gfx_rendering_api.h:17)
+    // with width and height 0. So the shader ran its three-point filter -- dividing by a zero texel
+    // size -- on top of hardware bilinear taps, a double filter D3D11 never applies: its
+    // CreateFramebuffer calls SetSamplerParameters once (gfx_direct3d11.cpp:883-887) and
+    // UpdateFramebufferParameters keeps tex.width/height current (gfx_direct3d11.cpp:947-948).
+    //
+    // The values below are exactly what SetSamplerParameters(tile, /*linear_filter=*/true,
+    // G_TX_WRAP, G_TX_WRAP) would produce -- the same call D3D11 makes for its framebuffer
+    // textures. Note the pairing it encodes: FILTER_THREE_POINT here means "let the shader do the
+    // filtering", which is only correct because the hardware filter drops to GL_NEAREST in that
+    // mode.
+    //
+    // This deliberately stays in SelectTextureFb rather than moving to CreateFramebuffer:
+    // GetFramebufferTextureId hands this very texture to ImGui for the final present, and ImGui's
+    // GL backend samples it with the texture object's own parameters, so the GL_LINEAR minification
+    // set at creation has to survive for the framebuffers that are only ever presented and never
+    // sampled by the game.
+    const GLint filter = mCurrentFilterMode == FILTER_LINEAR ? GL_LINEAR : GL_NEAREST;
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, filter);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, filter);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
+    textures[texId].width = (uint16_t)fb.width;
+    textures[texId].height = (uint16_t)fb.height;
+    textures[texId].filtering = FILTER_THREE_POINT;
 }
 
 void GfxRenderingAPIOGL::CopyFramebuffer(int fb_dst_id, int fb_src_id, int srcX0, int srcY0, int srcX1, int srcY1,
@@ -972,13 +1304,33 @@ void GfxRenderingAPIOGL::CopyFramebuffer(int fb_dst_id, int fb_src_id, int srcX0
 
     // For msaa enabled buffers we can't perform a scaled blit to a simple sample buffer
     // First do an unscaled blit to a msaa resolved buffer
-    if (src.height != dst.height && src.width != dst.width && src.msaa_level > 1) {
+    //
+    // The size test is OR, not AND: glBlitFramebuffer rejects ANY scaled blit whose read
+    // framebuffer is multisampled, and a blit is scaled the moment a single axis differs. With AND,
+    // a source that matched the destination on exactly one axis skipped this pre-resolve, and the
+    // blit below then failed with GL_INVALID_OPERATION and copied nothing at all.
+    if ((src.height != dst.height || src.width != dst.width) && src.msaa_level > 1) {
         // Start with the main buffer (0) as the msaa resolved buffer
         int fb_resolve_id = 0;
         FramebufferOGL fb_resolve = mFrameBuffers[fb_resolve_id];
 
         // If the size doesn't match our source, then we need to use our separate color msaa resolved buffer (2)
         if (fb_resolve.height != src.height || fb_resolve.width != src.width) {
+            if (mFrameBuffers.size() <= 2) {
+                // Index 2 is the interpreter's mGameFbMsaaResolved (interpreter.cpp:7167-7168
+                // creates mGameFb and then it), so it exists for the whole life of an initialised
+                // interpreter and this never fires today. It is here because widening the size test
+                // above to OR makes this block reachable for sources it previously skipped, and an
+                // unconditional mFrameBuffers[2] is only ever one caller away from reading past the
+                // end. With no single-sampled staging target there is nothing to pre-resolve into
+                // and the scaled blit would fail on the multisampled read buffer regardless, so
+                // restore the scissor state disabled just above and give up.
+                if (mLastScissorEnabled != 1) {
+                    mLastScissorEnabled = 1;
+                    glEnable(GL_SCISSOR_TEST);
+                }
+                return;
+            }
             fb_resolve_id = 2;
             fb_resolve = mFrameBuffers[fb_resolve_id];
         }
@@ -1007,7 +1359,13 @@ void GfxRenderingAPIOGL::CopyFramebuffer(int fb_dst_id, int fb_src_id, int srcX0
 
     glBindFramebuffer(GL_FRAMEBUFFER, mFrameBuffers[mCurrentFrameBuffer].fbo);
 
-    glReadBuffer(GL_BACK);
+    // Read-buffer state is per framebuffer object, and GL_BACK names a buffer only the DEFAULT
+    // framebuffer has: issuing this while a user FBO is bound -- the common case here, since the
+    // game renders offscreen -- raises an error and changes nothing. Restore it only when the bind
+    // above actually put us back on the window.
+    if (mCurrentFrameBuffer == 0) {
+        glReadBuffer(GL_BACK);
+    }
 
     if (mLastScissorEnabled != 1) {
         mLastScissorEnabled = 1;
@@ -1060,9 +1418,15 @@ void GfxRenderingAPIOGL::ReadFramebufferToCPU(int fb_id, uint32_t width, uint32_
         glReadPixels(0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE, rgba8.data());
 
         for (uint32_t i = 0; i < width * height; i++) {
-            uint8_t r = (rgba8[i * 4 + 0] >> 3) & 0x1F;
-            uint8_t g = (rgba8[i * 4 + 1] >> 3) & 0x1F;
-            uint8_t b = (rgba8[i * 4 + 2] >> 3) & 0x1F;
+            // Rounded 8->5-bit reduction, matching the DX11 readback (gfx_direct3d11.cpp:1171-1173).
+            // A truncating `v >> 3` biases every channel down by up to half a step, so the same
+            // scene captured on GL came back systematically darker than on DX11 -- visible once the
+            // capture is redrawn as the transition wipe's source image. The +4 bias saturates on its
+            // own (255 -> 31, 0 -> 0, never above 31), so the old & 0x1F mask is redundant. Widened
+            // to uint32_t so the * 0x1F cannot overflow the promoted operand.
+            uint8_t r = (uint8_t)((((uint32_t)rgba8[i * 4 + 0] + 4) * 0x1F) / 0xFF);
+            uint8_t g = (uint8_t)((((uint32_t)rgba8[i * 4 + 1] + 4) * 0x1F) / 0xFF);
+            uint8_t b = (uint8_t)((((uint32_t)rgba8[i * 4 + 2] + 4) * 0x1F) / 0xFF);
             rgba16_buf[i] = (r << 11) | (g << 6) | (b << 1) | 1;
         }
     } else {
@@ -1102,9 +1466,12 @@ void GfxRenderingAPIOGL::ReadFramebufferToCPU(int fb_id, uint32_t width, uint32_
                         ++count;
                     }
                 }
-                uint8_t r = count ? (uint8_t)((accR / count) >> 3) & 0x1F : 0;
-                uint8_t g = count ? (uint8_t)((accG / count) >> 3) & 0x1F : 0;
-                uint8_t b = count ? (uint8_t)((accB / count) >> 3) & 0x1F : 0;
+                // Same rounded 8->5-bit reduction as the fast path above, applied to the averaged
+                // channel exactly as DX11 does (gfx_direct3d11.cpp:1171-1173). The accumulators are
+                // already uint32_t, and (255 + 4) * 0x1F is far inside their range.
+                uint8_t r = count ? (uint8_t)((((accR / count) + 4) * 0x1F) / 0xFF) : 0;
+                uint8_t g = count ? (uint8_t)((((accG / count) + 4) * 0x1F) / 0xFF) : 0;
+                uint8_t b = count ? (uint8_t)((((accB / count) + 4) * 0x1F) / 0xFF) : 0;
                 rgba16_buf[i + j * width] = (r << 11) | (g << 6) | (b << 1) | 1;
             }
         }
@@ -1148,7 +1515,14 @@ GfxRenderingAPIOGL::GetPixelDepth(int fb_id, const std::set<std::pair<float, flo
         glBindFramebuffer(GL_READ_FRAMEBUFFER, fb.fbo);
         glBindFramebuffer(GL_DRAW_FRAMEBUFFER, mPixelDepthFb);
 
-        glDisable(GL_SCISSOR_TEST); // needed for the blit operation
+        // Routed through the cached flag the way ClearFramebuffer and CopyFramebuffer do. A bare
+        // glDisable left mLastScissorEnabled still reading 1 while the test was actually off, and
+        // nothing here turned it back on -- so every later draw silently ignored its scissor rect,
+        // because the cache believed the glEnable it would have issued was redundant.
+        if (mLastScissorEnabled != 0) {
+            mLastScissorEnabled = 0;
+            glDisable(GL_SCISSOR_TEST); // needed for the blit operation
+        }
 
         {
             size_t i = 0;
@@ -1177,7 +1551,15 @@ GfxRenderingAPIOGL::GetPixelDepth(int fb_id, const std::set<std::pair<float, flo
         }
     }
 
-    glBindFramebuffer(GL_FRAMEBUFFER, mCurrentFrameBuffer);
+    // Index, not GL name -- same bug and same fix as in ResolveMSAAColorBuffer above.
+    glBindFramebuffer(GL_FRAMEBUFFER, mFrameBuffers[mCurrentFrameBuffer].fbo);
+
+    // Restore the scissor state the blit path above disabled. A no-op for the single-coordinate
+    // direct-read path, which never touches it, and identical in shape to CopyFramebuffer's tail.
+    if (mLastScissorEnabled != 1) {
+        mLastScissorEnabled = 1;
+        glEnable(GL_SCISSOR_TEST);
+    }
 
     return res;
 }

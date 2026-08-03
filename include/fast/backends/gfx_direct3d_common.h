@@ -6,7 +6,9 @@
 #include "../interpreter.h"
 #include <cstdint>
 #include <string>
+#include <unordered_map>
 #include "gfx_rendering_api.h"
+#include "gfx_shader_cache.h"
 #include "d3d11.h"
 #include "d3dcompiler.h"
 
@@ -144,6 +146,16 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
 
     Microsoft::WRL::ComPtr<ID3D11RasterizerState> mRasterizerState;
     Microsoft::WRL::ComPtr<ID3D11DepthStencilState> mDepthStencilState;
+    // D3D11 state objects are immutable, so the same handful of descriptors recur for the whole
+    // run. Creating them per depth/decal flip is device-object construction on the draw path, and
+    // frame interpolation multiplies every flip by the sub-frame count. Cache by descriptor
+    // inputs instead. The OpenGL backend needs no equivalent: it sets glDepthMask/glDepthFunc/
+    // glPolygonOffset directly, with no object to build (gfx_opengl.cpp:709-716).
+    //   depth key : bit0 test, bit1 mask, bit2 decal
+    //   raster key: bit0 decal, then z-fighting mode and render-target height, which both feed
+    //               SlopeScaledDepthBias
+    std::unordered_map<uint8_t, Microsoft::WRL::ComPtr<ID3D11DepthStencilState>> mDepthStencilCache;
+    std::unordered_map<uint64_t, Microsoft::WRL::ComPtr<ID3D11RasterizerState>> mRasterizerCache;
     Microsoft::WRL::ComPtr<ID3D11Buffer> mVertexBuffer;
     Microsoft::WRL::ComPtr<ID3D11Buffer> mPerFrameCb;
     Microsoft::WRL::ComPtr<ID3D11Buffer> mPerDrawCb;
@@ -169,6 +181,10 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     PerAlphaThresholdCB mPerAlphaThresholdCbData;
 
     std::map<std::pair<uint64_t, uint32_t>, struct ShaderProgramD3D11> mShaderProgramPool;
+    // Survives across runs, unlike mShaderProgramPool: holds the compiled DXBC so a variant seen
+    // on any previous launch (or shipped in the port archive) skips D3DCompile entirely. See
+    // gfx_shader_cache.h for why the 9-15ms-per-variant compile was worth removing.
+    ShaderBlobCache mShaderCache;
 
     std::vector<struct TextureData> mTextures;
     int mCurrentTile;

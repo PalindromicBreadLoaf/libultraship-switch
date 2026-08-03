@@ -31,7 +31,7 @@ struct GdxDecompOSIoMesg {
 extern uint8_t* gdx_rom_buffer;
 extern size_t gdx_rom_size;
 
-/* Single byte-source shim (port/gdx_segment_source.c, contract C-R1.3/C-R2.2).
+/* Single byte-source shim (port/gdx_segment_source.c).
    Declared here without its header because this file compiles in the
    libultraship target, which has no include path onto port/ -- the same
    cross-module extern pattern used for gdx_audio_thread_active below. Sources a
@@ -116,19 +116,17 @@ int32_t osEPiStartDma(OSPiHandle* pihandle, OSIoMesg* mb, int32_t direction) {
                the default AudioLoad DMA handler — zero-filling them produced
                fully silent synthesis output.
 
-               Delivery swap (C-R2.2): the bytes are now sourced through the R1
-               single byte-source shim (GdxSegmentSourceRead) instead of a direct
-               gdx_rom_buffer copy. This sink now serves EVERY DMA from the shared
-               shim: the shim's one containment table covers ALL blob families
-               (R1 segment_blob geometry + the three R2 audio_blob families), and
-               any read not inside a blob span falls through to the raw ROM inside
-               the shim -- so audio and non-audio reads alike resolve through one
-               place, archive-first with a byte-identical raw-ROM fallback. The
-               shim's fallback bounds check (romOffset+size > gdx_rom_size, or a
-               null ROM image) is exactly the old guard, so it returns 0 in
-               precisely the cases the old code zero-filled; preserve that
-               zero-fill here so out-of-range/absent reads still see deterministic
-               contents. */
+               The bytes are sourced through the single byte-source shim
+               (GdxSegmentSourceRead) rather than copied straight out of
+               gdx_rom_buffer, so audio and non-audio reads alike resolve in one
+               place: the shim's containment table covers every blob family
+               (segment_blob geometry plus the three audio_blob families) and any
+               read outside a blob span falls through to the raw ROM inside the
+               shim -- archive-first, with a byte-identical raw-ROM fallback. Its
+               bounds check (romOffset+size > gdx_rom_size, or a null ROM image) is
+               exactly the old guard and returns 0 in precisely the cases the old
+               code zero-filled, so preserve that zero-fill here and out-of-range
+               or absent reads still see deterministic contents. */
             const uint32_t romOffset = decompMesg->devAddr & 0x0FFFFFFFu;
             if (!GdxSegmentSourceRead(romOffset, decompMesg->size, decompMesg->dramAddr)) {
                 memset(decompMesg->dramAddr, 0, decompMesg->size);
@@ -143,20 +141,19 @@ int32_t osEPiStartDma(OSPiHandle* pihandle, OSIoMesg* mb, int32_t direction) {
     return 0;
 }
 
-// Phase 3 (port/gdx_audio_thread.cpp): queried below without a header include -- this file is
-// compiled as part of the libultraship target, which has no include path onto port/. Same
+// Defined in port/gdx_audio_thread.cpp and queried below without a header include -- this file
+// is compiled as part of the libultraship target, which has no include path onto port/. Same
 // cross-module extern-declaration-without-header pattern already used elsewhere in this port
 // (e.g. port/n64_sched.c's own forward declaration of gdx_audio_hle_run).
 extern "C" int gdx_audio_thread_active(void);
 
 uint32_t osAiGetLength() {
-    // R7 (audio slice): real hardware returns the byte count still queued in the AI FIFO.
-    // We approximate it with the host audio backend's queued-sample count (already-buffered
-    // interleaved s16 stereo frames) converted to bytes (4 bytes per L/R sample pair), so
-    // AudioThread_CreateTaskImpl's adaptive fill math (decomp/src/audio/disk/lib/thread.c:52,
-    // "samplesRemainingInAi = osAiGetLength() / 4") throttles against real buffer occupancy
-    // instead of always assuming an empty AI (which would make it always over-produce).
-    // This does not by itself make sound audible — see osAiSetNextBuffer below.
+    // Real hardware returns the byte count still queued in the AI FIFO. We approximate it with
+    // the host audio backend's queued-sample count (already-buffered interleaved s16 stereo
+    // frames) converted to bytes (4 bytes per L/R sample pair), so AudioThread_CreateTaskImpl's
+    // adaptive fill math (decomp/src/audio/disk/lib/thread.c, "samplesRemainingInAi =
+    // osAiGetLength() / 4") throttles against real buffer occupancy instead of always assuming an
+    // empty AI, which would make it over-produce forever.
     auto audio = Ship::Context::GetInstance() != nullptr ? Ship::Context::GetInstance()->GetAudio() : nullptr;
     std::shared_ptr<Ship::AudioPlayer> player = audio != nullptr ? audio->GetAudioPlayer() : nullptr;
     if (player == nullptr || !player->IsInitialized()) {
@@ -172,18 +169,16 @@ uint32_t osAiGetLength() {
     // frames = 64ms at 32kHz; must stay well under SDLAudioPlayer::DoPlay's
     // drop threshold. Tunable via GDX_AI_CUSHION (frames).
     //
-    // Phase 3 (port/gdx_audio_thread.cpp): this cushion only papered over ordinary host
-    // scheduling jitter for the legacy per-VI-tick fiber producer, which has no independent
-    // catch-up mechanism of its own — it could never survive a real stall (a long synchronous
-    // game-thread load blocks that same fiber outright; measured up to ~131ms hitches, far
-    // longer than any cushion could cover). The dedicated audio thread replaces this with a
-    // real catch-up loop (`while (Buffered() < DesiredBuffered) produce()`, driven off the
-    // ACTUAL buffered amount) that is immune to game-thread stalls by construction (real OS
-    // thread, not a fiber sharing the stalled thread) — under-reporting here would just make
-    // it over-produce for no reason. Report honestly whenever the dedicated thread is active;
-    // restore the exact old under-report cushion when the kill switch (GDX_AUDIO_THREAD=0)
-    // reverts to the fiber path, so that path's behavior is completely unchanged for a clean
-    // A/B comparison.
+    // The cushion only covers ordinary host scheduling jitter, and only for the legacy per-VI-tick
+    // fiber producer, which has no catch-up mechanism of its own and cannot survive a real stall
+    // (a long synchronous game-thread load blocks that same fiber outright; hitches up to ~131ms,
+    // far longer than any cushion could cover). The dedicated audio thread
+    // (port/gdx_audio_thread.cpp) instead runs `while (Buffered() < DesiredBuffered) produce()`
+    // off the ACTUAL buffered amount, and is immune to game-thread stalls by construction (a real
+    // OS thread, not a fiber sharing the stalled one), so under-reporting would only make it
+    // over-produce. Report honestly while that thread is active, and restore the exact old cushion
+    // when the kill switch (GDX_AUDIO_THREAD=0) reverts to the fiber path, leaving that path's
+    // behavior unchanged.
     static int32_t sCushionFrames = -1;
     if (sCushionFrames < 0) {
         if (gdx_audio_thread_active()) {
@@ -203,13 +198,11 @@ uint32_t osAiGetLength() {
 }
 
 int32_t osAiSetNextBuffer(void* buff, size_t len) {
-    // R7 (audio slice): forward the AI buffer submitted by AudioThread_CreateTaskImpl
-    // (decomp/src/audio/disk/lib/thread.c:56, gAudioCtx.aiBuffers[index]) to the host audio
-    // backend. This is the AI->host wiring only: on its own it plays back whatever bytes are
-    // in that buffer. Producing real PCM there still requires an aspMain ABI interpreter (the
-    // decomp's audio pipeline only ever builds RSP command lists — see the audio slice
-    // engram record 'slice/audio' for exact scope); until that exists, this call is safe but
-    // will play silence/stale buffer contents rather than music/SFX.
+    // Forward the AI buffer submitted by AudioThread_CreateTaskImpl
+    // (decomp/src/audio/disk/lib/thread.c, gAudioCtx.aiBuffers[index]) to the host audio backend.
+    // This is the AI->host wiring only: it plays back whatever bytes are in that buffer. The PCM
+    // itself comes from the port's aspMain ABI interpreter (port/n64_audio_hle.c), because the
+    // decomp's audio pipeline only ever builds RSP command lists.
     if (buff == nullptr || len == 0) {
         return 0;
     }
@@ -229,42 +222,32 @@ int32_t osAiSetNextBuffer(void* buff, size_t len) {
 
     // AI buffer underrun resilience: when the GAME thread runs a long
     // synchronous operation (course/segment asset loads, large mio0
-    // decompresses) without yielding, the cooperative fiber scheduler can't
-    // run the AUDIO fiber for that whole stretch (see port/n64_sched.c and
-    // the engram discovery 'long-sync-load-audio-starve') -- AudioSynth_Update
-    // never got a chance to build a real command list for the missed tick(s),
-    // so the buffer reaching us here comes through all-zero. That was
-    // measured during the audio investigation as repeating few-ms silence bursts during course
-    // loads. Emitting that silence verbatim is an
-    // audible drop-out/click on the real device; repeat the last buffer that
-    // actually had audio in it instead, halving its gain on each consecutive
-    // miss so a longer stall decays toward true silence rather than looping
-    // one snippet at full volume forever. This is a resilience measure, not a
-    // fix for the underlying starvation -- the cooperative yields added to
-    // Dma_LoadAssets (decomp/src/sys/dma.c) and mio0_decode
-    // (torch/lib/libmio0/mio0.c) address that; this only softens whatever
-    // underrun still slips through.
+    // decompresses) without yielding, the cooperative fiber scheduler cannot
+    // run the AUDIO fiber for that whole stretch (see port/n64_sched.c), so
+    // AudioSynth_Update never builds a command list for the missed tick(s) and
+    // the buffer arriving here is all-zero -- measured as repeating few-ms
+    // silence bursts during course loads. Emitting that silence verbatim is an
+    // audible drop-out/click, so repeat the last buffer that actually had audio
+    // in it, halving its gain on each consecutive miss so a longer stall decays
+    // toward true silence instead of looping one snippet at full volume forever.
+    // This softens the symptom only; the starvation itself is addressed by the
+    // cooperative yields in Dma_LoadAssets (decomp/src/sys/dma.c) and mio0_decode
+    // (torch/lib/libmio0/mio0.c).
     static std::vector<uint8_t> sLastGoodAiBuffer;
     static uint32_t sConsecutiveZeroAiBuffers = 0;
     std::vector<uint8_t> fadedSubstitute;
     const uint8_t* playBuf = static_cast<const uint8_t*>(buff);
     size_t playLen = len;
 
-    // Gate this hack off when the dedicated audio thread (Phase 3, gdx_audio_thread.cpp) is
-    // driving playback. It predates that thread: it exists to paper over the cooperative fiber
-    // scheduler starving the AUDIO fiber during a long synchronous game-thread load, which left
-    // AudioSynth_Update no chance to build a real command list for the missed tick(s) -- see the
-    // comment block above. The dedicated thread does not share that starvation mode (it owns its
-    // own timing independent of the game/fiber scheduler), so an all-zero buffer reaching this
-    // function under the thread is a LEGITIMATE silence (e.g. no BGM/SFX playing between menu
-    // sounds), not an underrun. Substituting a decaying copy of whatever old audio last played
-    // turns that legitimate silence into audible ghost notes/beeps -- exactly the intermittent
-    // "beeps/crackles" symptom reported with the thread on. Skip the substitution entirely in
-    // that mode; just play the true (silent) buffer. NOTE: the "last good buffer" bookkeeping
-    // below is keyed on `!allZero` (not on this gate), so a gated-off all-zero buffer neither
-    // resets the miss counter nor overwrites the cached "last good" audio with silence -- if the
-    // thread is ever disabled at runtime (kill switch), the fallback still has real audio to
-    // decay from instead of a cache poisoned by legitimate silence.
+    // Gate the substitution off when the dedicated audio thread (port/gdx_audio_thread.cpp) is
+    // driving playback. That thread owns its timing independently of the game/fiber scheduler and
+    // so does not share the starvation mode above: an all-zero buffer arriving under it is
+    // LEGITIMATE silence (no BGM/SFX between menu sounds), not an underrun. Substituting a decaying
+    // copy of whatever last played turns that silence into audible ghost notes -- the intermittent
+    // beeps/crackles seen with the thread on. Play the true (silent) buffer instead. The "last good
+    // buffer" bookkeeping below is keyed on `!allZero`, not on this gate, so a gated-off all-zero
+    // buffer neither resets the miss counter nor caches silence as "last good": if the kill switch
+    // disables the thread at runtime, the fallback still has real audio to decay from.
     const bool substituteFade = allZero && !gdx_audio_thread_active();
     if (substituteFade) {
         if (!sLastGoodAiBuffer.empty() && sLastGoodAiBuffer.size() == len && (len % sizeof(int16_t)) == 0) {
@@ -360,17 +343,14 @@ int32_t osAiSetNextBuffer(void* buff, size_t len) {
         }
     }
     // Master volume (FINAL output stage). CVar gEnhancements.Audio.MasterVolume (0..100, default
-    // 100), registered by the port's GdxMenuBar ctor. Read live each buffer on the audio thread --
-    // exactly the low-pass's pattern above -- so a menu edit applies without a restart (a benign int
-    // race with the main-thread ImGui write: worst case one buffer sees the old value). Placed AFTER
-    // the reconstruction low-pass so gain is the very last thing done to the PCM before the device.
-    //
-    // BIT-EXACT BY DEFAULT: at vol==100 the multiply is skipped ENTIRELY, so playBuf is left
-    // untouched and a fresh config is sample-for-sample identical to today. Applied to a COPY (its
-    // own static scratch vector) reading from playBuf and repointing it -- it never mutates the raw
-    // source buffer or the low-pass buffer in place. Guarded on (playLen % 4)==0 like the low-pass
-    // so a ragged length is never misread as
-    // whole stereo s16 frames.
+    // 100), registered by the port's GdxMenuBar ctor. Read live each buffer on the audio thread,
+    // exactly like the low-pass above, so a menu edit applies without a restart (a benign int race
+    // with the main-thread ImGui write: worst case one buffer sees the old value). Placed AFTER the
+    // reconstruction low-pass so gain is the last thing done to the PCM before the device. At
+    // vol==100 the multiply is skipped ENTIRELY, leaving playBuf untouched, so a default config is
+    // sample-for-sample unmodified. Applied to a COPY (its own static scratch vector), never in
+    // place on the source or the low-pass buffer, and guarded on (playLen % 4)==0 like the low-pass
+    // so a ragged length is never misread as whole stereo s16 frames.
     {
         static std::vector<int16_t> sVolBuf;
         int vol = CVarGetInteger("gEnhancements.Audio.MasterVolume", 100);

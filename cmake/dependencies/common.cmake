@@ -52,7 +52,30 @@ endif()
 
 #=================== STB ===================
 set(STB_DIR ${CMAKE_BINARY_DIR}/_deps/stb)
-file(DOWNLOAD "https://github.com/nothings/stb/raw/0bc88af4de5fb022db643c2d8e549a0927749354/stb_image.h" "${STB_DIR}/stb_image.h")
+
+# Unlike FetchContent, file(DOWNLOAD) does not fail the configure step when the transfer
+# fails -- it leaves whatever it managed to write (often a zero-byte file) on the include
+# path and carries on.  Compilation then dies much later with "stbi_load was not declared",
+# nowhere near the actual cause.  EXPECTED_HASH turns a bad transfer into a configure-time
+# error, and doubles as a cache check: CMake skips the download entirely when the file on
+# disk already matches, so this stops re-fetching on every configure.
+set(STB_IMAGE_SHA256 c54b15a689e6a1f32c75e2ec23afa442e3e0e37e894b73c1974d08679b20dd5c)
+file(DOWNLOAD
+    "https://github.com/nothings/stb/raw/0bc88af4de5fb022db643c2d8e549a0927749354/stb_image.h"
+    "${STB_DIR}/stb_image.h"
+    EXPECTED_HASH SHA256=${STB_IMAGE_SHA256}
+    STATUS stb_image_download_status
+)
+list(GET stb_image_download_status 0 stb_image_download_code)
+if(NOT stb_image_download_code EQUAL 0)
+    list(GET stb_image_download_status 1 stb_image_download_error)
+    file(REMOVE "${STB_DIR}/stb_image.h")
+    message(FATAL_ERROR
+        "Failed to download stb_image.h: ${stb_image_download_error}\n"
+        "Fetch it manually to ${STB_DIR}/stb_image.h and re-run CMake; it must hash to "
+        "SHA256 ${STB_IMAGE_SHA256}.")
+endif()
+
 file(WRITE "${STB_DIR}/stb_impl.c" "#define STB_IMAGE_IMPLEMENTATION\n#include \"stb_image.h\"")
 
 add_library(stb STATIC)

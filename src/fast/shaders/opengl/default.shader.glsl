@@ -216,10 +216,26 @@
             @end
         @end
 
+        // texel has to start out defined: the cycle-0 formula appended below is allowed to read it
+        // before anything has written it. shader_item_to_str emits "texel", "texel.rgb" and
+        // "texel.a" for SHADER_COMBINED without ever consulting first_cycle (gfx_opengl.cpp:144-145
+        // and :172-173), and Interpreter::GenerateCC maps mux slot value 0 (G_CCMUX_COMBINED,
+        // G_ACMUX_COMBINED) to SHADER_COMBINED for cycle 0 with no guard (interpreter.cpp:435-437,
+        // :476). The engine produces exactly that shape on its own: the COPY-mode texrect and
+        // FILL-rect fallbacks pass a literal 0 for the a/b/c slots (interpreter.cpp:4986, :5150),
+        // and raw mux 0 means COMBINED rather than the constant zero, so cycle 0 comes out as
+        // "texel = (texel - texel) * texel + texVal0". FXC rejects that read outright, which is why
+        // the D3D11 shader carries the same initializer (default.shader.hlsl:265-269) and resolves
+        // the expression to a clean (0 - 0) * 0 + d. GLSL compilers accept it silently and hand
+        // back whatever the register happened to hold, which varies with driver register allocation
+        // and with the previously shaded fragment; a NaN or Inf in there poisons the whole formula.
+        // Those two fallbacks are how menu and HUD rectangles reach the combiner, which is where
+        // the two backends visibly disagreed. The value itself is arbitrary - no RDP behavior is
+        // being modelled here - it is pinned to the D3D11 constant so both backends start level.
         @if(o_alpha) 
-            vec4 texel;
+            vec4 texel = vec4(0.0, 0.0, 0.0, 1.0);
         @else 
-            vec3 texel;
+            vec3 texel = vec3(0.0, 0.0, 0.0);
         @end
 
         @if(o_2cyc)

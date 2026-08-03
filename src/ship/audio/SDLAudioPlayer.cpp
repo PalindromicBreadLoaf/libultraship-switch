@@ -55,16 +55,14 @@ int SDLAudioPlayer::Buffered() {
 
 void SDLAudioPlayer::DoPlay(const uint8_t* buf, size_t len) {
     // Backpressure: drop this submission once the device queue is already well past the
-    // configured target (GetDesiredBuffered() -- 4096 frames with the Phase 3 dedicated audio
-    // thread active, port/gdx_audio_thread.cpp; the struct default of 2480 otherwise). Was
-    // previously a hard, config-independent 6000-frame constant: harmless while
-    // DesiredBuffered was 2480 (huge margin), but silently wrong once DesiredBuffered was
-    // raised to 4096 (barely 1900 frames of margin left before an over-full queue starts
-    // silently dropping submissions) or for any future lower-latency profile. The margin below
-    // covers one extra production batch on top of the target so a producer slightly ahead of
-    // schedule isn't punished (SAMPLES_HIGH in decomp/src/audio/disk/lib/thread.c's
-    // audioBufferParameters is a few hundred frames per tick; 1024 comfortably covers both the
-    // legacy fiber path's per-VI-tick batch and the dedicated thread's catch-up loop).
+    // configured target (GetDesiredBuffered() -- 4096 frames with the dedicated audio thread
+    // active, port/gdx_audio_thread.cpp; the struct default of 2480 otherwise). This was a hard,
+    // config-independent 6000-frame constant, which is harmless at a 2480 target but leaves barely
+    // 1900 frames of margin at 4096 -- and an over-full queue silently drops submissions. The
+    // margin below covers one extra production batch on top of the target so a producer slightly
+    // ahead of schedule isn't punished: one tick's batch is a few hundred frames (SAMPLES_HIGH in
+    // decomp/src/audio/disk/lib/thread.c's audioBufferParameters), so 1024 covers both the legacy
+    // fiber path's per-VI-tick batch and the dedicated thread's catch-up loop.
     static const int32_t kBacklogMargin = 1024;
     if (Buffered() < GetDesiredBuffered() + kBacklogMargin) {
         SDL_QueueAudio(mDevice, buf, len);

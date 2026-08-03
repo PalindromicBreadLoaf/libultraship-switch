@@ -2,6 +2,7 @@
 #pragma once
 
 #include "gfx_rendering_api.h"
+#include "gfx_shader_cache.h"
 #include "../interpreter.h"
 
 #ifdef _MSC_VER
@@ -147,6 +148,12 @@ class GfxRenderingAPIOGL final : public GfxRenderingAPI {
     GLuint mPixelDepthRb = 0;
     GLuint mPixelDepthFb = 0;
     size_t mPixelDepthRbSize = 0;
+
+    // Survives across runs, unlike mShaderProgramPool: holds linked program binaries so a variant
+    // seen on a previous launch skips prism template expansion, glCompileShader and glLinkProgram.
+    // Sidecar only -- GL program binaries are specific to the vendor, GPU and driver version, so
+    // unlike D3D11's DXBC there is nothing here that could be shipped to another machine.
+    ShaderBlobCache mShaderCache;
 };
 
 } // namespace Fast

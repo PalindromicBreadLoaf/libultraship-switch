@@ -4,6 +4,7 @@
 #include <vector>
 #include <cmath>
 
+#include <chrono>
 #include <map>
 #include <unordered_map>
 
@@ -21,6 +22,7 @@
 
 #include "fast/backends/gfx_window_manager_api.h"
 #include "fast/backends/gfx_direct3d_common.h"
+#include "fast/backends/gfx_shader_cache.h"
 
 #define DECLARE_GFX_DXGI_FUNCTIONS
 #include "fast/backends/gfx_dxgi.h"
@@ -191,6 +193,12 @@ static bool CreateDeviceFunc(class GfxRenderingAPIDX11* self, bool SoftwareRende
 };
 
 void GfxRenderingAPIDX11::Init() {
+    // Cached state objects belong to the device that created them. This is the only device-creation
+    // path, so dropping them here keeps a re-Init from handing the new context objects owned by a
+    // dead device.
+    mDepthStencilCache.clear();
+    mRasterizerCache.clear();
+
     // Load d3d11.dll
     mDX11Module = LoadLibraryW(L"d3d11.dll");
     if (mDX11Module == nullptr) {
@@ -360,6 +368,16 @@ void CSMain(uint3 DTid : SV_DispatchThreadID) {
         throw Ship::HResultException(hr, "MSAA compute shader compilation failed");
     }
 
+    // Compiled-shader store. Opened here, after InitResourceManager and InitConsoleVariables have
+    // both run (see port/main.cpp), so the archive seed is reachable and a rejected seed is
+    // reported before the first frame rather than mid-race. DXBC is driver-independent bytecode,
+    // so this backend adds no fingerprint bits of its own: the build hash alone decides validity,
+    // and a seed recorded on one machine is valid on every other. The two compute shaders compiled
+    // just above are deliberately not cached -- they are boot-time and fixed-source, so they never
+    // land inside a frame.
+    mShaderCache.Init(SHADER_CACHE_TAG_D3D11, 0ull, "shadercache/d3d11.gdxshc",
+                      "gdiffuser-shadercache-d3d11.bin");
+
     // Create ImGui
 
     Fast::GuiWindowInitData window_impl;
@@ -394,48 +412,118 @@ struct ShaderProgram* GfxRenderingAPIDX11::CreateAndLoadNewShader(uint64_t shade
     CCFeatures cc_features;
     gfx_cc_get_features(shader_id0, shader_id1, &cc_features);
 
-    char* buf;
-    size_t len, numFloats;
+    // Both of these change the generated HLSL without being part of the shader id, so they are
+    // part of the cache key or a filter-mode switch would resurrect the wrong bytecode.
+    const uint32_t cacheFlags =
+        (mCurrentFilterMode == FILTER_THREE_POINT ? (uint32_t)SHADER_CACHE_FLAG_THREE_POINT : 0u) |
+        (mSrgbMode ? (uint32_t)SHADER_CACHE_FLAG_SRGB : 0u);
 
-    auto shader = gfx_direct3d_common_build_shader(numFloats, cc_features, false,
-                                                   mCurrentFilterMode == FILTER_THREE_POINT, mSrgbMode);
-
-    buf = shader.data();
-    len = shader.size();
-
+    /*
+     * Cached payload layout, little-endian: numFloats u32, vsSize u32, psSize u32, then the two
+     * DXBC blobs back to back.
+     *
+     * numFloats has to ride along. It is an out-param of gfx_direct3d_common_build_shader rather
+     * than a function of cc_features, and a cache hit skips source generation entirely, so there
+     * is nowhere else to recover it from. Everything below this point -- input layout, blend
+     * state, the usedTextures fan-out -- derives from cc_features and needs no storing.
+     */
+    size_t numFloats = 0;
+    const uint8_t* vsBytes = nullptr;
+    const uint8_t* psBytes = nullptr;
+    size_t vsSize = 0;
+    size_t psSize = 0;
     ComPtr<ID3DBlob> vs, ps;
-    ComPtr<ID3DBlob> error_blob;
 
-#if DEBUG_D3D
-    UINT compile_flags = D3DCOMPILE_DEBUG;
-#else
-    UINT compile_flags = D3DCOMPILE_OPTIMIZATION_LEVEL2;
-#endif
-
-    HRESULT hr = mD3dCompile(buf, len, nullptr, nullptr, nullptr, "VSMain", "vs_4_0", compile_flags, 0,
-                             vs.GetAddressOf(), error_blob.GetAddressOf());
-
-    if (FAILED(hr)) {
-        char* err = (char*)error_blob->GetBufferPointer();
-        MessageBoxA(mWindowBackend->GetWindowHandle(), err, "Error", MB_OK | MB_ICONERROR);
-        throw Ship::HResultException(hr, "Vertex shader compilation failed");
+    static constexpr size_t kPayloadHeader = 12;
+    const std::vector<uint8_t>* cached = mShaderCache.Lookup(shader_id0, shader_id1, cacheFlags);
+    if (cached != nullptr && cached->size() > kPayloadHeader) {
+        uint32_t storedFloats = 0, storedVs = 0, storedPs = 0;
+        memcpy(&storedFloats, cached->data(), sizeof(storedFloats));
+        memcpy(&storedVs, cached->data() + 4, sizeof(storedVs));
+        memcpy(&storedPs, cached->data() + 8, sizeof(storedPs));
+        if ((size_t)storedVs + storedPs + kPayloadHeader == cached->size() && storedVs > 0 && storedPs > 0) {
+            numFloats = storedFloats;
+            vsBytes = cached->data() + kPayloadHeader;
+            vsSize = storedVs;
+            psBytes = vsBytes + storedVs;
+            psSize = storedPs;
+        }
     }
 
-    hr = mD3dCompile(buf, len, nullptr, nullptr, nullptr, "PSMain", "ps_4_0", compile_flags, 0, ps.GetAddressOf(),
-                     error_blob.GetAddressOf());
+    if (vsBytes == nullptr) {
+        auto shader = gfx_direct3d_common_build_shader(numFloats, cc_features, false,
+                                                       mCurrentFilterMode == FILTER_THREE_POINT, mSrgbMode);
 
-    if (FAILED(hr)) {
-        char* err = (char*)error_blob->GetBufferPointer();
-        MessageBoxA(mWindowBackend->GetWindowHandle(), err, "Error", MB_OK | MB_ICONERROR);
-        throw Ship::HResultException(hr, "Pixel shader compilation failed");
+        char* buf = shader.data();
+        size_t len = shader.size();
+
+        ComPtr<ID3DBlob> error_blob;
+
+#if DEBUG_D3D
+        UINT compile_flags = D3DCOMPILE_DEBUG;
+#else
+        UINT compile_flags = D3DCOMPILE_OPTIMIZATION_LEVEL2;
+#endif
+
+        // [shader-compile] A RUNTIME HLSL compile, reached once per unseen (shader_id0,
+        // shader_id1) pair from inside the draw call. It was entirely uninstrumented, which is why
+        // 100-180ms frame spikes with logic at ~5ms had no attributable cause: the cost was
+        // invisible to every existing probe. Measurement said 9-15ms each, arriving in bursts --
+        // eleven inside one tick for a 181ms stall. Now that the cache exists this path only runs
+        // on a genuine miss, so these lines double as the cache's miss log.
+        const auto gdxShaderCompileStart = std::chrono::steady_clock::now();
+        static int sGdxShaderCompileCount = 0;
+        static double sGdxShaderCompileTotalMs = 0.0;
+
+        HRESULT hr = mD3dCompile(buf, len, nullptr, nullptr, nullptr, "VSMain", "vs_4_0", compile_flags, 0,
+                                 vs.GetAddressOf(), error_blob.GetAddressOf());
+
+        if (FAILED(hr)) {
+            char* err = (char*)error_blob->GetBufferPointer();
+            MessageBoxA(mWindowBackend->GetWindowHandle(), err, "Error", MB_OK | MB_ICONERROR);
+            throw Ship::HResultException(hr, "Vertex shader compilation failed");
+        }
+
+        hr = mD3dCompile(buf, len, nullptr, nullptr, nullptr, "PSMain", "ps_4_0", compile_flags, 0, ps.GetAddressOf(),
+                         error_blob.GetAddressOf());
+
+        if (FAILED(hr)) {
+            char* err = (char*)error_blob->GetBufferPointer();
+            MessageBoxA(mWindowBackend->GetWindowHandle(), err, "Error", MB_OK | MB_ICONERROR);
+            throw Ship::HResultException(hr, "Pixel shader compilation failed");
+        }
+
+        vsBytes = (const uint8_t*)vs->GetBufferPointer();
+        vsSize = vs->GetBufferSize();
+        psBytes = (const uint8_t*)ps->GetBufferPointer();
+        psSize = ps->GetBufferSize();
+
+        {
+            const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
+                                                                        gdxShaderCompileStart)
+                                  .count();
+            ++sGdxShaderCompileCount;
+            sGdxShaderCompileTotalMs += ms;
+            SPDLOG_ERROR("[shader-compile] d3d11 #{} id0={:016X} id1={:016X} {:.2f}ms (total {:.1f}ms)",
+                         sGdxShaderCompileCount, shader_id0, shader_id1, ms, sGdxShaderCompileTotalMs);
+        }
+
+        std::vector<uint8_t> payload(kPayloadHeader + vsSize + psSize);
+        const uint32_t storedFloats = (uint32_t)numFloats;
+        const uint32_t storedVs = (uint32_t)vsSize;
+        const uint32_t storedPs = (uint32_t)psSize;
+        memcpy(payload.data(), &storedFloats, sizeof(storedFloats));
+        memcpy(payload.data() + 4, &storedVs, sizeof(storedVs));
+        memcpy(payload.data() + 8, &storedPs, sizeof(storedPs));
+        memcpy(payload.data() + kPayloadHeader, vsBytes, vsSize);
+        memcpy(payload.data() + kPayloadHeader + vsSize, psBytes, psSize);
+        mShaderCache.Store(shader_id0, shader_id1, cacheFlags, payload.data(), payload.size());
     }
 
     struct ShaderProgramD3D11* prg = &mShaderProgramPool[std::make_pair(shader_id0, shader_id1)];
 
-    ThrowIfFailed(mDevice->CreateVertexShader(vs->GetBufferPointer(), vs->GetBufferSize(), nullptr,
-                                              prg->vertex_shader.GetAddressOf()));
-    ThrowIfFailed(mDevice->CreatePixelShader(ps->GetBufferPointer(), ps->GetBufferSize(), nullptr,
-                                             prg->pixel_shader.GetAddressOf()));
+    ThrowIfFailed(mDevice->CreateVertexShader(vsBytes, vsSize, nullptr, prg->vertex_shader.GetAddressOf()));
+    ThrowIfFailed(mDevice->CreatePixelShader(psBytes, psSize, nullptr, prg->pixel_shader.GetAddressOf()));
 
     // Input Layout
 
@@ -488,8 +576,7 @@ struct ShaderProgram* GfxRenderingAPIDX11::CreateAndLoadNewShader(uint64_t shade
         ied[ied_index++] = { "INPUT", i, format, 0, D3D11_APPEND_ALIGNED_ELEMENT, D3D11_INPUT_PER_VERTEX_DATA, 0 };
     }
 
-    ThrowIfFailed(mDevice->CreateInputLayout(ied, ied_index, vs->GetBufferPointer(), vs->GetBufferSize(),
-                                             prg->input_layout.GetAddressOf()));
+    ThrowIfFailed(mDevice->CreateInputLayout(ied, ied_index, vsBytes, vsSize, prg->input_layout.GetAddressOf()));
 
     // Blend state
 
@@ -682,64 +769,91 @@ void GfxRenderingAPIDX11::SetUseAlpha(bool use_alpha) {
 
 void GfxRenderingAPIDX11::DrawTriangles(float buf_vbo[], size_t buf_vbo_len, size_t buf_vbo_num_tris) {
 
-    if (mLastDepthTest != mCurrentDepthTest || mLastDepthMask != mCurrentDepthMask) {
+    // mCurrentZmodeDecal belongs in this key: DepthFunc below is derived from it as
+    // well as from depth test/mask. Without it, a draw that flips only the decal bit
+    // (e.g. ZB_OVL_SURF -> ZB_XLU_SURF, both Z_CMP and neither Z_UPD) skips this block
+    // and keeps a stale DepthFunc, while the rasterizer's SlopeScaledDepthBias below
+    // DOES update -- its guard already tests the decal bit. That split leaves depth
+    // state internally inconsistent. Upstream added the decal term to DepthFunc in
+    // "Fix depth test, preserving behavior for decals (#612)" without extending the key.
+    if (mLastDepthTest != mCurrentDepthTest || mLastDepthMask != mCurrentDepthMask ||
+        mLastZmodeDecal != mCurrentZmodeDecal) {
         mLastDepthTest = mCurrentDepthTest;
         mLastDepthMask = mCurrentDepthMask;
 
-        mDepthStencilState.Reset();
+        // Only eight descriptors are reachable, so the cache is warm within the first frames and
+        // every later flip is a hash lookup instead of a CreateDepthStencilState.
+        const uint8_t depthKey = (uint8_t)((mCurrentDepthTest ? 1u : 0u) | (mCurrentDepthMask ? 2u : 0u) |
+                                           (mCurrentZmodeDecal ? 4u : 0u));
+        auto depthIt = mDepthStencilCache.find(depthKey);
+        if (depthIt == mDepthStencilCache.end()) {
+            D3D11_DEPTH_STENCIL_DESC depth_stencil_desc;
+            ZeroMemory(&depth_stencil_desc, sizeof(D3D11_DEPTH_STENCIL_DESC));
 
-        D3D11_DEPTH_STENCIL_DESC depth_stencil_desc;
-        ZeroMemory(&depth_stencil_desc, sizeof(D3D11_DEPTH_STENCIL_DESC));
+            depth_stencil_desc.DepthEnable = mCurrentDepthTest || mCurrentDepthMask;
+            depth_stencil_desc.DepthWriteMask =
+                mCurrentDepthMask ? D3D11_DEPTH_WRITE_MASK_ALL : D3D11_DEPTH_WRITE_MASK_ZERO;
+            depth_stencil_desc.DepthFunc =
+                mCurrentDepthTest ? (mCurrentZmodeDecal ? D3D11_COMPARISON_LESS_EQUAL : D3D11_COMPARISON_LESS)
+                                  : D3D11_COMPARISON_ALWAYS;
+            depth_stencil_desc.StencilEnable = false;
 
-        depth_stencil_desc.DepthEnable = mCurrentDepthTest || mCurrentDepthMask;
-        depth_stencil_desc.DepthWriteMask =
-            mCurrentDepthMask ? D3D11_DEPTH_WRITE_MASK_ALL : D3D11_DEPTH_WRITE_MASK_ZERO;
-        depth_stencil_desc.DepthFunc = mCurrentDepthTest
-                                           ? (mCurrentZmodeDecal ? D3D11_COMPARISON_LESS_EQUAL : D3D11_COMPARISON_LESS)
-                                           : D3D11_COMPARISON_ALWAYS;
-        depth_stencil_desc.StencilEnable = false;
-
-        ThrowIfFailed(mDevice->CreateDepthStencilState(&depth_stencil_desc, mDepthStencilState.GetAddressOf()));
+            Microsoft::WRL::ComPtr<ID3D11DepthStencilState> created;
+            ThrowIfFailed(mDevice->CreateDepthStencilState(&depth_stencil_desc, created.GetAddressOf()));
+            depthIt = mDepthStencilCache.emplace(depthKey, std::move(created)).first;
+        }
+        mDepthStencilState = depthIt->second;
         mContext->OMSetDepthStencilState(mDepthStencilState.Get(), 0);
     }
 
     if (mLastZmodeDecal != mCurrentZmodeDecal) {
         mLastZmodeDecal = mCurrentZmodeDecal;
 
-        mRasterizerState.Reset();
+        // The CVar read stays outside the cache lookup: it is part of the key, so a mid-run
+        // z-fighting-mode change still produces a fresh state object rather than a stale hit.
+        const int zFightingMode =
+            Ship::Context::GetInstance()->GetConsoleVariables()->GetInteger(CVAR_Z_FIGHTING_MODE, 0);
+        const uint64_t rasterKey = (uint64_t)(mCurrentZmodeDecal ? 1u : 0u) |
+                                   ((uint64_t)(uint32_t)zFightingMode << 1) |
+                                   ((uint64_t)(uint32_t)mRenderTargetHeight << 33);
+        auto rasterIt = mRasterizerCache.find(rasterKey);
+        if (rasterIt == mRasterizerCache.end()) {
+            D3D11_RASTERIZER_DESC rasterizer_desc;
+            ZeroMemory(&rasterizer_desc, sizeof(D3D11_RASTERIZER_DESC));
 
-        D3D11_RASTERIZER_DESC rasterizer_desc;
-        ZeroMemory(&rasterizer_desc, sizeof(D3D11_RASTERIZER_DESC));
+            rasterizer_desc.FillMode = D3D11_FILL_SOLID;
+            rasterizer_desc.CullMode = D3D11_CULL_NONE;
+            rasterizer_desc.FrontCounterClockwise = true;
+            rasterizer_desc.DepthBias = 0;
+            // SSDB = SlopeScaledDepthBias 120 leads to -2 at 240p which is the same as N64 mode which has very little
+            // fighting
+            const int n64modeFactor = 120;
+            const int noVanishFactor = 100;
+            float SSDB = -2;
 
-        rasterizer_desc.FillMode = D3D11_FILL_SOLID;
-        rasterizer_desc.CullMode = D3D11_CULL_NONE;
-        rasterizer_desc.FrontCounterClockwise = true;
-        rasterizer_desc.DepthBias = 0;
-        // SSDB = SlopeScaledDepthBias 120 leads to -2 at 240p which is the same as N64 mode which has very little
-        // fighting
-        const int n64modeFactor = 120;
-        const int noVanishFactor = 100;
-        float SSDB = -2;
+            switch (zFightingMode) {
+                case 1: // scaled z-fighting (N64 mode like)
+                    SSDB = -1.0f * (float)mRenderTargetHeight / n64modeFactor;
+                    break;
+                case 2: // no vanishing paths
+                    SSDB = -1.0f * (float)mRenderTargetHeight / noVanishFactor;
+                    break;
+                case 0: // disabled
+                default:
+                    SSDB = -2;
+            }
+            rasterizer_desc.SlopeScaledDepthBias = mCurrentZmodeDecal ? SSDB : 0.0f;
+            rasterizer_desc.DepthBiasClamp = 0.0f;
+            rasterizer_desc.DepthClipEnable = false;
+            rasterizer_desc.ScissorEnable = true;
+            rasterizer_desc.MultisampleEnable = false;
+            rasterizer_desc.AntialiasedLineEnable = false;
 
-        switch (Ship::Context::GetInstance()->GetConsoleVariables()->GetInteger(CVAR_Z_FIGHTING_MODE, 0)) {
-            case 1: // scaled z-fighting (N64 mode like)
-                SSDB = -1.0f * (float)mRenderTargetHeight / n64modeFactor;
-                break;
-            case 2: // no vanishing paths
-                SSDB = -1.0f * (float)mRenderTargetHeight / noVanishFactor;
-                break;
-            case 0: // disabled
-            default:
-                SSDB = -2;
+            Microsoft::WRL::ComPtr<ID3D11RasterizerState> created;
+            ThrowIfFailed(mDevice->CreateRasterizerState(&rasterizer_desc, created.GetAddressOf()));
+            rasterIt = mRasterizerCache.emplace(rasterKey, std::move(created)).first;
         }
-        rasterizer_desc.SlopeScaledDepthBias = mCurrentZmodeDecal ? SSDB : 0.0f;
-        rasterizer_desc.DepthBiasClamp = 0.0f;
-        rasterizer_desc.DepthClipEnable = false;
-        rasterizer_desc.ScissorEnable = true;
-        rasterizer_desc.MultisampleEnable = false;
-        rasterizer_desc.AntialiasedLineEnable = false;
-
-        ThrowIfFailed(mDevice->CreateRasterizerState(&rasterizer_desc, mRasterizerState.GetAddressOf()));
+        mRasterizerState = rasterIt->second;
         mContext->RSSetState(mRasterizerState.Get());
     }
 
@@ -1121,11 +1235,11 @@ void GfxRenderingAPIDX11::ReadFramebufferToCPU(int fb_id, uint32_t width, uint32
     // Convert RGBA32 → RGBA16 (5551) with a BOX-FILTER AVERAGE downscale from actual texture
     // dimensions to requested output dimensions, respecting RowPitch for row stride.
     //
-    // Issue C (fade-transition garbled horizontal-dash band): the previous NEAREST-neighbor
+    // Fade-transition garbled horizontal-dash band: the previous NEAREST-neighbor
     // resample sampled exactly one of every srcW/width source columns. At a widescreen source
     // (1920x1080 → 320x240 is 6:1 horizontally) that decimation keeps only every 6th column, so
     // high-frequency title-screen art is shredded into disconnected vertical/horizontal dashes —
-    // the owner's band. Averaging each destination pixel's full source footprint preserves the
+    // the reported band. Averaging each destination pixel's full source footprint preserves the
     // coherent image (soft/downsampled but correct). No aspect crop is done here: the transition
     // redraws the 320x240 capture STRETCHED back across the full widescreen viewport
     // (decomp ovl_i2/transition.c, G_EX_WIDESCREEN_STRETCH), so the squeeze→stretch round-trips

@@ -48,9 +48,9 @@
 
 std::stack<std::string> currentDir;
 
-/* GDX-DEBUG-2026-07-15: run-log printf shim (port_log.h) for the bounded diagnostics in
+/* Run-log printf shim (port_log.h) for the bounded diagnostics in
    this file. Declared at global scope because C++ forbids an extern "C" linkage spec inside
-   a block. Remove together with the [GDX-DBG ...] probes below. */
+   a block. */
 extern "C" void gdx_dbg_logf(const char* fmt, ...);
 
 #define SEG_ADDR(seg, addr) (addr | (seg << 24) | 1)
@@ -155,8 +155,29 @@ void Interpreter::Flush() {
     }
 }
 
+// [interp-geo] FNV-1a over raw float bits. Hashing the BITS, not the value, is deliberate: the
+// question is whether two replays produced the identical transform, and a tolerance would hide
+// exactly the sub-ULP drift that flips a triangle across a clip plane.
+static inline void GdxHashFloat(uint64_t& h, float f) {
+    uint32_t bits;
+    memcpy(&bits, &f, sizeof(bits));
+    h ^= static_cast<uint64_t>(bits);
+    h *= 0x100000001B3ull;
+}
+
+// Gated on the same env var that enables the [interp-geo] census, because the fingerprint runs per
+// VERTEX per PASS -- at ~5k vertices and M=2.4 that is ~700k hashes/sec charged to ordinary play for
+// a number nobody is reading. Diagnostics that cost frame time corrupt the very measurements they
+// exist to inform.
+static const bool sGdxVertexHashEnabled = [] {
+    const char* e = std::getenv("GDX_INTERP_GEO");
+    return e != nullptr && e[0] != '\0' && strcmp(e, "0") != 0;
+}();
+
 void Interpreter::ResetGeometryDiagnostics() {
     mGeometryDiagnostics = {};
+    mGeometryDiagnostics.vertexHash = 0xCBF29CE484222325ull;  // FNV-1a offset basis
+    mGeometryDiagnostics.mpFirstHash = 0xCBF29CE484222325ull;
     mGeometryDiagnostics.minNdcX = std::numeric_limits<float>::infinity();
     mGeometryDiagnostics.minNdcY = std::numeric_limits<float>::infinity();
     mGeometryDiagnostics.minNdcZ = std::numeric_limits<float>::infinity();
@@ -558,6 +579,57 @@ void Interpreter::ShaderCacheClear() {
     mRapi->ClearShaderCache();
 }
 
+/* [interp-idem] Texture-bind signature, for proving whether replaying one tick's display list is
+   IDEMPOTENT. Frame interpolation executes the same retained command buffer M times per game tick,
+   and the floor flicker was measured to appear the instant M > 1 and vanish at M == 1 -- with phase
+   timing ruled out (a true 120 Hz panel gives M == 2 exactly, every phase 16.67ms, and it still
+   strobes). So the suspicion is state that survives Run(): mRdp->loaded_texture is Interpreter
+   state, and StoreLoadedTexture (:4421) is explicitly path-dependent -- an upload ERASES any
+   overlapping earlier entry and re-materializes only its own range. Replay 2 therefore starts from
+   replay 1's end-state, not from replay 1's start-state.
+
+   This hashes every texture id actually bound during a Run. The bridge resets it before each
+   sub-frame and compares: identical hashes across replays of one tick means the DL is idempotent
+   and the fault is elsewhere; differing hashes means replay 2 drew with different textures, which
+   is the flicker and very likely the same root as the open white-buildings defect. */
+static uint64_t sGdxTexBindHash = 1469598103934665603ull;
+
+extern "C" void gdx_gfx_texbind_hash_reset(void) {
+    sGdxTexBindHash = 1469598103934665603ull;
+}
+
+extern "C" unsigned long long gdx_gfx_texbind_hash(void) {
+    return (unsigned long long) sGdxTexBindHash;
+}
+
+/* Hash the CACHE KEY, not the texture_id. texture_id is an allocation handle recycled through
+   mTextureCache.free_texture_ids after an LRU eviction, so the same content can legitimately come
+   back under a different id -- hashing it reports divergence where the picture is identical. The
+   key is what identifies content (source address, palette, fmt/siz, tile geometry, clamp/mirror),
+   so equal key sequences across two replays means both replays drew the same textures. */
+static inline void GdxNoteTexBind(int slot, const TextureCacheKey& key) {
+    const auto mix = [](uint64_t h, uint64_t v) {
+        h ^= v;
+        return h * 1099511628211ull;
+    };
+    sGdxTexBindHash = mix(sGdxTexBindHash, (uint64_t) slot);
+    sGdxTexBindHash = mix(sGdxTexBindHash, (uint64_t) (uintptr_t) key.texture_addr);
+    sGdxTexBindHash = mix(sGdxTexBindHash, (uint64_t) (uintptr_t) key.palette_addrs[0]);
+    sGdxTexBindHash = mix(sGdxTexBindHash, (uint64_t) (uintptr_t) key.palette_addrs[1]);
+    sGdxTexBindHash = mix(sGdxTexBindHash, ((uint64_t) key.fmt << 8) | key.siz);
+    sGdxTexBindHash = mix(sGdxTexBindHash, (uint64_t) key.palette_index);
+    sGdxTexBindHash = mix(sGdxTexBindHash, (uint64_t) key.size_bytes);
+    sGdxTexBindHash = mix(sGdxTexBindHash, (uint64_t) key.line_size_bytes);
+    sGdxTexBindHash = mix(sGdxTexBindHash, ((uint64_t) key.tile_width << 16) | key.tile_height);
+}
+
+/* NOTE: there is deliberately no separate "miss" hash. An earlier version had one, on the false
+   claim that the miss path had no key in scope -- the key is this function's own parameter and is
+   live throughout. Hashing misses differently made a texture that MISSES on pass 0 (cold cache) and
+   HITS on pass 1 (warm) diverge by construction, which reported ~100% divergence on every frame
+   that loaded anything. Hit and miss for the same content must contribute identically; only a
+   genuinely different texture may change the hash. */
+
 bool Interpreter::TextureCacheLookup(int i, const TextureCacheKey& key) {
     TextureCacheMap::iterator it = mTextureCache.map.find(key);
     TextureCacheNode** n = &mRenderingState.mTextures[i];
@@ -579,6 +651,7 @@ bool Interpreter::TextureCacheLookup(int i, const TextureCacheKey& key) {
                     SPDLOG_WARN("[ci-latch] refusing never-uploaded cache entry");
                 }
             }
+            GdxNoteTexBind(i, key);
             mRapi->SelectTexture(i, it->second.texture_id);
             *n = &*it;
             mRenderingState.sampler_valid[i] = true;
@@ -590,6 +663,7 @@ bool Interpreter::TextureCacheLookup(int i, const TextureCacheKey& key) {
             return false;
         }
 
+        GdxNoteTexBind(i, key);
         mRapi->SelectTexture(i, it->second.texture_id);
         *n = &*it;
         mGeometryDiagnostics.rgba16OpaquePixels += it->second.rgba16_opaque_pixels;
@@ -625,6 +699,7 @@ bool Interpreter::TextureCacheLookup(int i, const TextureCacheKey& key) {
     node->second.texture_id = texture_id;
     node->second.lru_location = mTextureCache.lru.insert(mTextureCache.lru.end(), { it });
 
+    GdxNoteTexBind(i, key);
     mRapi->SelectTexture(i, texture_id);
     mRapi->SetSamplerParameters(i, false, 0, 0);
     mRenderingState.sampler_valid[i] = true;
@@ -663,6 +738,72 @@ void Interpreter::TextureCacheDelete(const uint8_t* origAddr) {
         }
         if (!again) {
             break;
+        }
+    }
+
+    // A refreshed buffer may be a TLUT rather than (or as well as) an index-data
+    // source. Palette-keyed entries live in unrelated buckets, so they need their
+    // own pass -- see TextureCacheDeletePalette. Gated on mSeenPaletteAddrs so a
+    // plain texture refresh costs one hash lookup, not a full-cache scan.
+    TextureCacheDeletePalette(origAddr);
+}
+
+// Erase every cache entry whose CI palette key names `paletteAddr`.
+//
+// WHY THIS EXISTS -- "Mute City 2 flashing building windows do not animate":
+//
+// ImportTexture keys a CI4/CI8 decode on {index-data address, palette DRAM address}
+// (see the `fmt == G_IM_FMT_CI` branch of ImportTexture). The address distinguishes
+// different palettes, but NOT an in-place rewrite of the palette CONTENT at the same
+// address. The night-course background sprites do exactly that: background.c:1371-1377
+// writes a cycling flash colour into the white slot and stages all 16 entries into the
+// live GfxPool every frame, and the display list binds that pool slot as the TLUT
+// (background.c:1438). The port's MakePersistentRawTextureCopy DOES notice the change
+// and re-copies the bytes in place (port/n64_gfx_bridge.cpp:2545-2565), then queues
+// TextureCacheDelete on the copy buffer -- but that call only matched
+// key.texture_addr, and the palette buffer appears in key.palette_addrs. So nothing
+// was ever evicted: the sprite kept the decode minted on its first frame in the course
+// and the windows never flashed. (Entering a DIFFERENT night course looked fixed only
+// because the sprite's own index-data address changes with the asset, minting a fresh
+// key.)
+//
+// Deliberately NOT done by folding palette content into the cache key: that is the
+// GDX_CI_PALETTE_HASH route above, kept opt-in because a prior attempt to make CI
+// content-keyed caused the "frozen menu fades" regression. Invalidation leaves the key
+// space untouched -- one entry is dropped and re-decoded from the already-refreshed
+// bytes -- so it cannot multiply entries or race the decode.
+void Interpreter::TextureCacheDeletePalette(const uint8_t* paletteAddr) {
+    if (paletteAddr == nullptr || mSeenPaletteAddrs.find(paletteAddr) == mSeenPaletteAddrs.end()) {
+        return;
+    }
+
+    // getenv rather than the gdx_dev_gates table, for the reason already documented at the
+    // GDX_DIAG_BLENDMODE gate below: that layer is not visible from libultraship's TU.
+    static const bool sDiagPaletteEvict = std::getenv("GDX_DIAG_PALETTE_EVICT") != nullptr;
+    size_t evicted = 0;
+
+    for (auto it = mTextureCache.map.begin(); it != mTextureCache.map.end();) {
+        if (it->first.palette_addrs[0] != paletteAddr && it->first.palette_addrs[1] != paletteAddr) {
+            ++it;
+            continue;
+        }
+        for (int j = 0; j < SHADER_MAX_TEXTURES; j++) {
+            if (mRenderingState.mTextures[j] == &*it) {
+                mRenderingState.mTextures[j] = nullptr;
+            }
+        }
+        mTextureCache.lru.erase(it->second.lru_location);
+        mTextureCache.free_texture_ids.push_back(it->second.texture_id);
+        it = mTextureCache.map.erase(it);
+        ++evicted;
+    }
+
+    if (sDiagPaletteEvict && evicted != 0) {
+        static int sPaletteEvictLogs = 0;
+        if (sPaletteEvictLogs < 200) {
+            ++sPaletteEvictLogs;
+            SPDLOG_WARN("[pal-evict] palette={} evicted={} cache={}", fmt::ptr(paletteAddr), evicted,
+                        mTextureCache.map.size());
         }
     }
 }
@@ -1309,7 +1450,7 @@ void Interpreter::ImportTextureI4(int tile, bool importReplacement) {
     }
     ApplyTileMaskExtent(mRdp, tile, width, height);
 
-    // Bounds guard (2026-07-09): the loop below reads
+    // Bounds guard: the loop below reads
     // ((height-1)*(fullImageLineSizeBytes*2)+(width-1))/2 bytes from addr. A
     // render tile whose implied extent exceeds the recorded load walks past
     // the backing buffer (observed as a heap access violation mid-race).
@@ -1361,6 +1502,38 @@ void Interpreter::ImportTextureI4(int tile, bool importReplacement) {
         }
     }
 
+    /* GDX_DIAG_FONT_MACHINE probe B:
+       checksum the decoded RGBA before GPU upload. A zero checksum here means the
+       decode itself produced blackness (TMEM-side fault); a nonzero checksum with
+       still-invisible output convicts the GPU upload/bind layer downstream. */
+    {
+        static const bool sDiagFontMachine = std::getenv("GDX_DIAG_FONT_MACHINE") != nullptr;
+        if (sDiagFontMachine) {
+            static int sI4ProbeLogs = 0;
+            if (sI4ProbeLogs < 32) {
+                ++sI4ProbeLogs;
+                uint32_t sum = 0;
+                const size_t n = (size_t)width * height * 4;
+                for (size_t k = 0; k < n; k++) {
+                    sum = sum * 31 + mTexUploadBuffer[k];
+                }
+                gdx_dbg_logf("[fontmach] I4 decode tile=%d tmem=0x%X w=%u h=%u sum=%08X\n",
+                             tile, mRdp->texture_tile[tile].tmem_index, width, height, sum);
+                /* Probe B2: decision inputs for the extent math above.
+                   The h=32-vs-48 question is undecidable from the summary line
+                   alone; this names which branch produced the extent (slot sizes
+                   vs tile stride vs crop vs mask vs clamp guard). */
+                gdx_dbg_logf("[fontmach] I4 in: sizeB=%u origB=%u lineB=%u fullB=%u tileLineB=%u "
+                             "tileWH=%ux%u mask=%u/%u cm=%u/%u addr=%p\n",
+                             mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].size_bytes,
+                             mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].orig_size_bytes,
+                             lineSizeBytes, fullImageLineSizeBytes, mRdp->texture_tile[tile].line_size_bytes,
+                             tileWidth, tileHeight, mRdp->texture_tile[tile].masks, mRdp->texture_tile[tile].maskt,
+                             mRdp->texture_tile[tile].cms, mRdp->texture_tile[tile].cmt,
+                             static_cast<const void*>(addr));
+            }
+        }
+    }
     GdxDumpDecodedRgba32(tile, mTexUploadBuffer, width, height);
     mRapi->UploadTexture(mTexUploadBuffer, width, height);
 }
@@ -1735,7 +1908,7 @@ void Interpreter::ImportTexture(int i, int tile, bool importReplacement) {
     // it (same env gate as the SETTIMG race trace).
     {
         const bool sTmemTrace = std::getenv("GDX_DIAG_SETTIMG") != nullptr; // live read, see store log
-        // Effect/glyph tiles (1-4) are the Phase 1 investigation targets: log them
+        // Effect/glyph tiles (1-4) are the investigation targets: log them
         // race-gated but UNGATED by the env flag and with their own budget, so the
         // verdict "does ImportTexture ever run for these tiles" cannot be lost to
         // env-ordering or budget accidents again.
@@ -1860,8 +2033,8 @@ void Interpreter::ImportTexture(int i, int tile, bool importReplacement) {
     key.line_size_bytes = mRdp->loaded_texture[tmemIdex].line_size_bytes;
     key.full_image_line_size_bytes = mRdp->loaded_texture[tmemIdex].full_image_line_size_bytes;
 
-    // CI palette-content hash (opt-in: GDX_CI_PALETTE_HASH). MASTER_SCOPE Track B,
-    // "frozen menu fades" half: the CI key above carries the palette DRAM ADDRESS
+    // CI palette-content hash (opt-in: GDX_CI_PALETTE_HASH), the "frozen menu
+    // fades" half: the CI key above carries the palette DRAM ADDRESS
     // (palette_addrs), which distinguishes different palettes but NOT an in-place
     // fade that rewrites the palette CONTENT at the same address every frame -- so
     // the fade returns the stale decode and freezes. Fold the bound TLUT's bytes
@@ -2367,6 +2540,23 @@ void Interpreter::GfxSpVertex(size_t n_vertices, size_t dest_index, const F3DVtx
         float w = v->ob[0] * mRsp->MP_matrix[0][3] + v->ob[1] * mRsp->MP_matrix[1][3] +
                   v->ob[2] * mRsp->MP_matrix[2][3] + mRsp->MP_matrix[3][3];
 
+        // [interp-geo] Fingerprint the transform, not just its cardinality. Capture MP_matrix on the
+        // pass's first vertex so an already-divergent matrix is distinguishable from one that drifts
+        // partway through the walk.
+        if (sGdxVertexHashEnabled) {
+            if (mGeometryDiagnostics.verticesLoaded == 0) {
+                for (size_t r = 0; r < 4; ++r) {
+                    for (size_t c = 0; c < 4; ++c) {
+                        GdxHashFloat(mGeometryDiagnostics.mpFirstHash, mRsp->MP_matrix[r][c]);
+                    }
+                }
+            }
+            GdxHashFloat(mGeometryDiagnostics.vertexHash, x);
+            GdxHashFloat(mGeometryDiagnostics.vertexHash, y);
+            GdxHashFloat(mGeometryDiagnostics.vertexHash, z);
+            GdxHashFloat(mGeometryDiagnostics.vertexHash, w);
+        }
+
         mGeometryDiagnostics.verticesLoaded++;
         if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z) || !std::isfinite(w)) {
             mGeometryDiagnostics.invalidVertices++;
@@ -2698,6 +2888,32 @@ static void UpdateLoadedVertexClipFlags(LoadedVertex& vertex) {
     }
 }
 
+// GDX_RECT_HALF_TEXEL=1 applies the BILERP half-texel offset to texture rectangles as
+// well as ordinary triangles. DEFAULT OFF, i.e. rects keep the long-standing behaviour
+// of withholding it.
+//
+// It was briefly default-on, on the theory that a rect's first pixel gets a zero filter
+// fraction on hardware while a GPU LINEAR sampler fed uls/W blends in texel -1. Turned
+// off again for three reasons, in increasing order of weight:
+//
+//   1. It did not fix the defect it was added for (Create Machine name-box glyph debris
+//      survived it unchanged), so its only justification is gone.
+//   2. That defect's tile keeps G_TX_CLAMP all the way to the sampler, and under clamp
+//      addressing texel -1 IS texel 0 -- the described bleed cannot occur there at all.
+//   3. It is very likely double-counting. Rect quads are emitted at exact pixel edges
+//      with vertex UV uls->lrs, so the rasteriser already lands pixel centres on
+//      uls+0.5 ... uls+n-0.5 -- already on GPU texel centres. Adding another half texel
+//      moves every sample onto a texel BOUNDARY, making each output pixel a 50/50 blend
+//      of two texels: a uniform half-texel blur across every BILERP texture rectangle
+//      in the game, which is to say the entire 2D UI, the HUD and all Expansion Kit text.
+//
+// Kept behind the switch rather than deleted so the hypothesis can be re-tested cheaply
+// if a genuine rect misalignment ever turns up.
+static const bool sGdxRectHalfTexelDisabled = [] {
+    const char* v = std::getenv("GDX_RECT_HALF_TEXEL");
+    return !(v != nullptr && v[0] == '1');
+}();
+
 void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx, bool is_rect) {
     // A/B isolation: skip every triangle drawn with the combine mode given in
     // GDX_DIAG_SKIP_COMBINE (hex). Whatever vanishes from the frame identifies
@@ -2723,6 +2939,75 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
 
     if (!is_rect) {
         mGeometryDiagnostics.trianglesSubmitted++;
+    }
+
+    /* [fontmach] probe E: the Create
+       Machine preview renders as uniform ENV color and the combiner algebra
+       convicts vertex SHADE == 0 on those draws. Log one line per DISTINCT
+       lighting/shade input state on non-rect draws so the zeroed source is
+       named directly: light colors (MOVEMEM payload), ambient, or the vertex
+       color path itself. Healthy screens (attract, race) provide the
+       reference lines in the same run. */
+    if (!is_rect) {
+        static const bool sDiagFontMachineE = std::getenv("GDX_DIAG_FONT_MACHINE") != nullptr;
+        if (sDiagFontMachineE) {
+            const bool lit = (mRsp->geometry_mode & G_LIGHTING) != 0;
+            const int numLights = mRsp->current_num_lights;
+            const int ambIdx = numLights > 0 ? numLights - 1 : 0;
+            const F3DLight_t& amb = mRsp->current_lights[ambIdx].l;
+            const F3DLight_t& l0 = mRsp->current_lights[0].l;
+            /* Key on material identity (lighting inputs + env + combiner), NOT
+               per-vertex shade: keying on vertex color exhausts the ledger on
+               one mesh's shading gradient before other materials ever log. */
+            const uint64_t shadeKey = (static_cast<uint64_t>(lit) << 63) |
+                                      (static_cast<uint64_t>(numLights & 0xF) << 58) |
+                                      (static_cast<uint64_t>(amb.col[0] & 0xF8) << 47) |
+                                      (static_cast<uint64_t>(amb.col[2] & 0xF8) << 42) |
+                                      (static_cast<uint64_t>(l0.col[0] & 0xF8) << 37) |
+                                      (static_cast<uint64_t>(l0.col[2] & 0xF8) << 32) |
+                                      (static_cast<uint64_t>(mRdp->env_color.r) << 24) |
+                                      (static_cast<uint64_t>(mRdp->env_color.g) << 16) |
+                                      (static_cast<uint64_t>(mRdp->env_color.b) << 8) |
+                                      ((mRdp->combine_mode ^ (mRdp->combine_mode >> 32)) & 0xFF);
+            static uint64_t sSeenShadeStates[64] = {};
+            static int sSeenShadeCount = 0;
+            bool seenShade = false;
+            for (int s = 0; s < sSeenShadeCount; s++) {
+                if (sSeenShadeStates[s] == shadeKey) {
+                    seenShade = true;
+                    break;
+                }
+            }
+            if (!seenShade && sSeenShadeCount < 64) {
+                sSeenShadeStates[sSeenShadeCount++] = shadeKey;
+                /* Sampled-content discriminator: sum the first 64 source bytes
+                   of the first tile's TMEM slot at DRAW time. Zero sum with a
+                   legible upload elsewhere convicts slot replacement between
+                   load and draw; nonzero shifts suspicion to UV/handle. */
+                const int probeTile = mRdp->first_tile_index;
+                const uint32_t probeTmem = mRdp->texture_tile[probeTile].tmem_index;
+                const uint8_t* probeSrc = mRdp->loaded_texture[probeTmem].addr;
+                const uint32_t probeSize = mRdp->loaded_texture[probeTmem].size_bytes;
+                uint32_t srcSum = 0;
+                if (probeSrc != nullptr) {
+                    const uint32_t n = probeSize < 64 ? probeSize : 64;
+                    for (uint32_t k = 0; k < n; k++) {
+                        srcSum = srcSum * 31 + probeSrc[k];
+                    }
+                }
+                gdx_dbg_logf("[fontmach] shade-src tile=%d tmem=0x%X addr=%p sizeB=%u sum=%08X\n",
+                             probeTile, probeTmem, static_cast<const void*>(probeSrc), probeSize, srcSum);
+                gdx_dbg_logf("[fontmach] shade lit=%d n=%d v0=(%u,%u,%u,%u) amb=(%u,%u,%u) "
+                             "l0=(%u,%u,%u dir %d,%d,%d) env=(%u,%u,%u,%u) cc=%016llX "
+                             "tile=%u st0=(%.1f,%.1f) st1=(%.1f,%.1f) st2=(%.1f,%.1f)\n",
+                             lit ? 1 : 0, numLights, v1->color.r, v1->color.g, v1->color.b, v1->color.a,
+                             amb.col[0], amb.col[1], amb.col[2], l0.col[0], l0.col[1], l0.col[2],
+                             (int)l0.dir[0], (int)l0.dir[1], (int)l0.dir[2], mRdp->env_color.r,
+                             mRdp->env_color.g, mRdp->env_color.b, mRdp->env_color.a,
+                             (unsigned long long)mRdp->combine_mode, (unsigned)mRdp->first_tile_index,
+                             v1->u, v1->v, v2->u, v2->v, v3->u, v3->v);
+            }
+        }
     }
 
     // The F3DEX2.Rej ucode family (F3DLX2.Rej, F3DFLX2.Rej) does not clip.
@@ -2973,25 +3258,6 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
         mRdp->viewport_or_scissor_changed = false;
     }
 
-    // [prim-depth-flush] fully-convicted fix: prim_depth (G_ZS_PRIM) is a
-    // lazily-sampled per-flush uniform -- Flush() reads mRdp->prim_depth at
-    // drain time, not at G_SETPRIMDEPTH time. This port's gDPPipeSync is a
-    // no-op stub (RDP_G_RDPPIPESYNC -> gfx_stubbed_command_handler), so
-    // nothing forced a drain before the game overwrote mRdp->prim_depth with
-    // the NEXT prim-depth draw's value. racer.c's rival icon / 1st-2nd-3rd
-    // position marker loop (G_ZS_PRIM prim-depth texrects, ~6893-6980) is the
-    // only multi-value prim-depth user in the whole game, so every marker was
-    // depth-tested against the FOLLOWING marker's uncorrelated depth and
-    // always failed the compare -- none of them ever rendered. Flush any
-    // pending batch here, before this draw's triangles are appended, whenever
-    // a prim-depth draw's value differs from the value the buffered batch
-    // will read on flush. Gated on prim_depth_enabled (already computed above
-    // for depth_test) so non-prim-depth draws pay only a bool test.
-    if (prim_depth_enabled && mRdp->prim_depth != mRenderingState.lastFlushedPrimDepth) {
-        Flush();
-        mRenderingState.lastFlushedPrimDepth = mRdp->prim_depth;
-    }
-
     uint64_t cc_id = mRdp->combine_mode;
     uint64_t cc_options = 0;
     bool use_alpha = ((mRdp->other_mode_l & (3 << 20)) == (G_BL_CLR_MEM << 20) &&
@@ -3020,6 +3286,37 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
     if (bypassFog) {
         use_fog = false;
     }
+    // Create Machine flat-navy preview. The trigger is proven -- skipping
+    // gDPSetRenderMode(G_RM_ZB_OVL_SURF, ...) at machine_create_draw.c:655 makes the
+    // machine render correctly -- but the mechanism is not. Blend-enable was ruled
+    // OUT above: use_alpha is true for this mode (CLR_MEM/1MA land in both cycle
+    // fields). That leaves the combiner's ALPHA half or decal depth. Log one line
+    // per distinct (other_mode_l, cc_id, use_alpha, zmode_decal) tuple so the Create
+    // Machine draw can be diffed against the machine-settings screen, which runs the
+    // same display lists correctly. Diagnostic only, zero cost unless gated on.
+    // getenv rather than the gdx_dev_gates table: that layer is not visible from
+    // libultraship's TU, and this file's ~33 existing diagnostics use the same idiom.
+    static const bool diagnosticBlendMode = std::getenv("GDX_DIAG_BLENDMODE") != nullptr;
+    if (diagnosticBlendMode) {
+        static std::set<std::pair<uint64_t, uint64_t>> sSeenModes;
+        static int sModeLogs = 0;
+        const auto key = std::make_pair(static_cast<uint64_t>(mRdp->other_mode_l), cc_id);
+
+        if (sModeLogs < 48 && sSeenModes.insert(key).second) {
+            ++sModeLogs;
+            // cc_id packs colour in the low 16 bits and ALPHA above it, which is the
+            // half under suspicion: an alpha of 1 makes src*1 + dst*0 = opaque src,
+            // and src here is the stale cockpit ENV.
+            gdx_dbg_logf("[blendmode] other_l=%08X cc=%016llX ccAlpha=%04X use_alpha=%d decal=%d "
+                         "forceBl=%d zmode=%X\n",
+                         (unsigned) mRdp->other_mode_l, (unsigned long long) cc_id,
+                         (unsigned) ((cc_id >> 16) & 0xFFFF), use_alpha ? 1 : 0,
+                         ((mRdp->other_mode_l & ZMODE_DEC) == ZMODE_DEC) ? 1 : 0,
+                         (mRdp->other_mode_l & FORCE_BL) ? 1 : 0,
+                         (unsigned) ((mRdp->other_mode_l >> 10) & 3));
+        }
+    }
+
     static const bool diagnosticForcePreFlxSimpleMaterial =
         std::getenv("GDX_DIAG_FORCE_PREFLX_SIMPLE_MATERIAL") != nullptr;
     const bool forceSimpleMaterial =
@@ -3126,7 +3423,7 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
 
     ColorCombiner* comb = LookupOrCreateColorCombiner(key);
 
-    // Course-effect draw-state probe (2026-07-09, defect B: PIT/HEAL strip
+    // Course-effect draw-state probe (PIT/HEAL strip
     // renders as a flat tan region with dash marks). TMEM identity for these
     // tiles is already proven correct (EFFECT-TILE probe resolves the right
     // addr+size for tiles 1-4 of aSetupCourseEffectTextureDL), and
@@ -3264,6 +3561,44 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
                 tex_height[i] = tex_height2[i];
             }
             ApplyTileMaskExtent(mRdp, tile, tex_width[i], tex_height[i], /*maskAuthoritative=*/true);
+            /* [fontmach] draw-extent ledger (probe D): one line per
+               DISTINCT draw-time UV-extent state, so the machine-paint tiles and
+               the EK font texrects are captured regardless of how much menu
+               traffic precedes them. tex_w/h feed texcoord normalization; a
+               mismatch against the uploaded decode extent is the UV-scale bug. */
+            {
+                static const bool sDiagFontMachineD = std::getenv("GDX_DIAG_FONT_MACHINE") != nullptr;
+                if (sDiagFontMachineD) {
+                    const uint64_t drawKey =
+                        (static_cast<uint64_t>(tile) << 56) |
+                        (static_cast<uint64_t>(mRdp->texture_tile[tile].tmem_index) << 40) |
+                        (static_cast<uint64_t>(mRdp->texture_tile[tile].fmt) << 37) |
+                        (static_cast<uint64_t>(mRdp->texture_tile[tile].siz) << 35) |
+                        (static_cast<uint64_t>(tex_width[i] & 0x7FF) << 24) |
+                        (static_cast<uint64_t>(tex_height[i] & 0x7FF) << 13) |
+                        (static_cast<uint64_t>(tex_width2[i] & 0x3F) << 7) | (tex_height2[i] & 0x7F);
+                    static uint64_t sSeenDraws[128] = {};
+                    static int sSeenDrawCount = 0;
+                    bool seenDraw = false;
+                    for (int s = 0; s < sSeenDrawCount; s++) {
+                        if (sSeenDraws[s] == drawKey) {
+                            seenDraw = true;
+                            break;
+                        }
+                    }
+                    if (!seenDraw && sSeenDrawCount < 128) {
+                        sSeenDraws[sSeenDrawCount++] = drawKey;
+                        gdx_dbg_logf("[fontmach] draw tile=%u tmem=0x%X fmt=%u siz=%u texWH=%ux%u "
+                                     "tileWH=%ux%u mask=%u/%u shift=%u/%u cm=%u/%u rect=%d scaleST=%X/%X\n",
+                                     tile, mRdp->texture_tile[tile].tmem_index, mRdp->texture_tile[tile].fmt,
+                                     mRdp->texture_tile[tile].siz, tex_width[i], tex_height[i], tex_width2[i],
+                                     tex_height2[i], mRdp->texture_tile[tile].masks, mRdp->texture_tile[tile].maskt,
+                                     mRdp->texture_tile[tile].shifts, mRdp->texture_tile[tile].shiftt,
+                                     mRdp->texture_tile[tile].cms, mRdp->texture_tile[tile].cmt, is_rect ? 1 : 0,
+                                     mRsp->texture_scaling_factor.s, mRsp->texture_scaling_factor.t);
+                    }
+                }
+            }
             // Degenerate load bookkeeping (a TMEM slot whose recorded byte count is
             // smaller than one line, e.g. after a smaller unrelated load reused the
             // slot) yields a zero extent here, and the texcoord normalization below
@@ -3304,6 +3639,26 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
             }
 
             if (mRenderingState.mTextures[i] == nullptr) {
+                /* GDX_DIAG_FONT_MACHINE probe A: a draw silently skipping
+                   sampler setup because the GPU
+                   texture handle is null — despite TMEM holding real bytes — is the
+                   suspected mechanism. Log which tile/tmem hits this. */
+                static const bool sDiagFontMachineA = std::getenv("GDX_DIAG_FONT_MACHINE") != nullptr;
+                if (sDiagFontMachineA) {
+                    static int sNullTexLogs = 0;
+                    if (sNullTexLogs < 32) {
+                        ++sNullTexLogs;
+                        gdx_dbg_logf("[fontmach] NULL mTextures[%d] tile=%u tmem=0x%X fmt=%u siz=%u\n",
+                                      i, (unsigned)(i == 0 ? mRdp->first_tile_index
+                                                           : ((mRdp->first_tile_index + 1) & 7)),
+                                      mRdp->texture_tile[i == 0 ? mRdp->first_tile_index
+                                                                : ((mRdp->first_tile_index + 1) & 7)].tmem_index,
+                                      mRdp->texture_tile[i == 0 ? mRdp->first_tile_index
+                                                                : ((mRdp->first_tile_index + 1) & 7)].fmt,
+                                      mRdp->texture_tile[i == 0 ? mRdp->first_tile_index
+                                                                : ((mRdp->first_tile_index + 1) & 7)].siz);
+                    }
+                }
                 continue;
             }
 
@@ -3384,7 +3739,7 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
 
     struct GfxClipParameters clip_parameters = mRapi->GetClipParameters();
 
-    // B1 probe (revamp v2 spec, 2026-07-09): pit/heal strip UV probe. Facts:
+    // B1 probe: pit/heal strip UV probe. Facts:
     // the texture imports correctly and draws single-cycle TEXEL0 RGBA16 wrap,
     // yet the strip renders as a flat tan region with dash marks. Race-gated,
     // tiles 1-4 only (the course-effect tiles: PIT/DIRT/DASH/ICE), first 24
@@ -3452,8 +3807,34 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
 
             // Must agree with the sampler filter policy above (only G_TF_BILERP is linear).
             if ((mRdp->other_mode_h & (3U << G_MDSFT_TEXTFILT)) == G_TF_BILERP) {
-                // Linear filter adds 0.5f to the coordinates
-                if (!is_rect) {
+                // Linear filter adds 0.5f to the coordinates.
+                //
+                // This offset converts an N64 texel INDEX into a GPU texel CENTRE, and it is
+                // needed for texture rectangles for exactly the same reason it is needed for
+                // triangles. Per pixel the RDP evaluates S = uls + dsdx*(x - ulx), so the
+                // rect's first pixel gets S = uls with a zero filter fraction: hardware
+                // outputs texel `uls` unblended. A GPU LINEAR sampler fed the normalised
+                // coordinate uls/W samples HALF A TEXEL BEFORE texel 0's centre (centres sit
+                // at (k+0.5)/W) and blends texel -1 with texel 0. Whatever the wrap mode
+                // yields for texel -1 then bleeds into the rect's leading row/column.
+                //
+                // That is the EK name-entry defect ("row of garbage pixels above each letter
+                // in the machine-name box"): A6340.c:441 selects G_TF_BILERP and
+                // A6340.c:484-489 draws each entered character as a 16x16 LoadTile out of the
+                // 160x120 CI8 sheet with T = yPos*16, i.e. v = 0 at the top scanline -- so the
+                // top row of every glyph was 50% row -1. The on-screen KEYBOARD is unaffected
+                // because A6340.c:463-467 loads that same sheet one 160x1 strip at a time
+                // (tex_height == 1, nothing to bleed in), which is why only the name box was
+                // wrong.
+                //
+                // Kept switchable without a rebuild (GDX_RECT_HALF_TEXEL=0 restores the old
+                // rect behaviour) because it touches every BILERP texture rectangle in the
+                // game, not just the name box. POINT-filtered rects are untouched: they never
+                // enter this branch, and floor() would absorb the offset anyway. The flag is a
+                // file-scope global (sGdxRectHalfTexelDisabled) rather than a function-local
+                // static so this per-vertex, per-texture-unit path pays no thread-safe-static
+                // guard check.
+                if (!is_rect || !sGdxRectHalfTexelDisabled) {
                     u += 0.5f;
                     v += 0.5f;
                 }
@@ -3699,9 +4080,9 @@ void Interpreter::GfxSpLine3DGdx(uint8_t vtx1Idx, uint8_t vtx2Idx, uint8_t halfW
     const struct LoadedVertex a = mRsp->loaded_vertices[vtx1Idx];
     const struct LoadedVertex b = mRsp->loaded_vertices[vtx2Idx];
 
-    /* GDX-DEBUG-2026-07-15: confirm the L3DEX2 line handler fires at all in Course Edit and
+    /* Confirm the L3DEX2 line handler fires at all in Course Edit and
        whether the w<=0 near-plane early-out is what suppresses the spline lines. Bounded to
-       32 lines total (hits + early-outs combined). Remove after #2 line-render is confirmed. */
+       32 lines total (hits + early-outs combined). */
     {
         static int sGdxLineDbg = 0;
         if (sGdxLineDbg < 32) {
@@ -4055,6 +4436,17 @@ void Interpreter::GfxDpLoadTlut(uint8_t tile, uint32_t high_index) {
     uint32_t entryCount = high_index + 1;
     uint32_t byteCount = entryCount * 2;
 
+    // Remember every address that is ever bound as a TLUT source. This is the O(1) gate
+    // TextureCacheDeletePalette uses: without it, an in-place palette refresh could only be
+    // honoured by scanning the whole texture cache on EVERY TextureCacheDelete call, most of
+    // which are ordinary texture-buffer refreshes that can never match a palette key. Both
+    // halves are recorded because a CI8 load stores palette_dram_addr[1] = src + 256 and the
+    // refresh path names only the buffer base -- the base is what the scan matches against
+    // palette_addrs[0], which a CI8 key always holds, so recording `src` alone is sufficient.
+    if (src != nullptr) {
+        mSeenPaletteAddrs.insert(src);
+    }
+
     if (tmem >= 256) {
         // N64 TMEM palette area starts at tmem word 256. Each CI4 palette = 16 entries = 16 tmem words.
         uint32_t paletteByteOffset = (tmem - 256) * 2;
@@ -4299,6 +4691,37 @@ void Interpreter::GfxDpLoadBlock(uint8_t tile, uint32_t uls, uint32_t ult, uint3
             if (copyBytes != 0) {
                 memcpy(mRdp->tmem + tmemByteOffset, loaded.addr, copyBytes);
                 mRdp->tmem_generation++;
+            }
+        }
+    }
+
+    /* [fontmach] LoadBlock ledger (probe C): one line per DISTINCT
+       (tmem, siz, lrs, dxt) so menu traffic cannot exhaust the budget before the
+       screens under investigation. Pairs with probe B2 in ImportTextureI4: if a
+       decode's slot sizes disagree with what this LOADBLOCK stored, the slot was
+       replaced/trimmed between load and import. */
+    {
+        static const bool sDiagFontMachineC = std::getenv("GDX_DIAG_FONT_MACHINE") != nullptr;
+        if (sDiagFontMachineC) {
+            const uint64_t comboKey = (static_cast<uint64_t>(tmemIndex) << 40) |
+                                      (static_cast<uint64_t>(mRdp->texture_to_load.siz) << 32) |
+                                      (static_cast<uint64_t>(lrs) << 12) | dxt;
+            static uint64_t sSeenCombos[96] = {};
+            static int sSeenComboCount = 0;
+            bool seen = false;
+            for (int s = 0; s < sSeenComboCount; s++) {
+                if (sSeenCombos[s] == comboKey) {
+                    seen = true;
+                    break;
+                }
+            }
+            if (!seen && sSeenComboCount < 96) {
+                sSeenCombos[sSeenComboCount++] = comboKey;
+                gdx_dbg_logf("[fontmach] loadblock tile=%u tmem=0x%X siz=%u w=%u lrs=%u dxt=%u "
+                             "sizeB=%u lineB=%u addr=%p\n",
+                             tile, tmemIndex, mRdp->texture_to_load.siz, mRdp->texture_to_load.width,
+                             lrs, dxt, loaded.size_bytes, loaded.line_size_bytes,
+                             static_cast<const void*>(loaded.addr));
             }
         }
     }
@@ -4756,12 +5179,57 @@ void Interpreter::GfxDpImageRectangle(int32_t tile, int32_t w, int32_t h, int32_
     mRdp->first_tile_index = saved_tile;
 }
 
+// [fillrect] Per-task census of the fill-rect path, for the Mute City background regression.
+//
+// The failing region is a gradient built from hundreds of gDPFillRectangle calls (the same
+// construct documented at gfx_rdp_pipe_sync_handler_rdp), and it alternates between drawn and
+// black every 60Hz tick. Three outcomes are indistinguishable from a screenshot but not from
+// here, so the counters are split to separate them:
+//
+//   submitted alternates (e.g. 224 -> 0)  the rects never reach the rasterizer at all; the fault
+//                                         is upstream, in the display list or the batching.
+//   submitted steady, colours go black    the rects are drawn with the wrong fill colour; the
+//                                         fault is G_SETFILLCOLOR decode or RDP state.
+//   submitted steady, colours steady      the rects are drawn correctly and something downstream
+//                                         (blend, alpha threshold, depth) is discarding them.
+//
+// Colours are recorded as a small distinct set rather than a running total because the question is
+// "was pink ever submitted this tick", which a sum would hide.
+static const bool sGdxFillRectDiag = [] {
+    const char* e = std::getenv("GDX_DIAG_FILLRECT");
+    return e != nullptr && e[0] != '\0' && strcmp(e, "0") != 0;
+}();
+static uint32_t sGdxFrSubmitted = 0;   // GfxDpFillRectangle entered
+static uint32_t sGdxFrZFullClear = 0;  // dropped as a redundant fullscreen Z clear
+static uint32_t sGdxFrZRegion = 0;     // routed to ClearDepthRegion (never a colour draw)
+static uint32_t sGdxFrDrawn = 0;       // reached GfxDrawRectangle, i.e. actually queued
+static uint32_t sGdxFrColors[8] = {};  // distinct packed RGBA fill colours seen
+static int sGdxFrColorCount = 0;
+static uint32_t sGdxFrCycleFill = 0;   // of the drawn ones, how many were G_CYC_FILL
+
+static void GdxFillRectNoteColor(uint32_t rgba) {
+    for (int i = 0; i < sGdxFrColorCount; i++) {
+        if (sGdxFrColors[i] == rgba) {
+            return;
+        }
+    }
+    if (sGdxFrColorCount < 8) {
+        sGdxFrColors[sGdxFrColorCount++] = rgba;
+    }
+}
+
 void Interpreter::GfxDpFillRectangle(int32_t ulx, int32_t uly, int32_t lrx, int32_t lry) {
+    if (sGdxFillRectDiag) {
+        ++sGdxFrSubmitted;
+    }
     if (mRdp->color_image_address == mRdp->z_buf_address) {
         // Fullscreen Z clears are redundant — already done by glClear at frame start.
         bool isFullScreen = (ulx <= 0 && uly <= 0 && lrx >= (int32_t)(mNativeDimensions.width - 1) * 4 &&
                              lry >= (int32_t)(mNativeDimensions.height - 1) * 4);
         if (isFullScreen) {
+            if (sGdxFillRectDiag) {
+                ++sGdxFrZFullClear;
+            }
             return;
         }
 
@@ -4784,6 +5252,9 @@ void Interpreter::GfxDpFillRectangle(int32_t ulx, int32_t uly, int32_t lrx, int3
         area.height = (uint32_t)h;
         AdjustVIewportOrScissor(&area);
 
+        if (sGdxFillRectDiag) {
+            ++sGdxFrZRegion;
+        }
         mRapi->ClearDepthRegion(area.x, area.y, area.width, area.height);
         return;
     }
@@ -4817,6 +5288,17 @@ void Interpreter::GfxDpFillRectangle(int32_t ulx, int32_t uly, int32_t lrx, int3
 
     if (mode == G_CYC_FILL) {
         GfxDpSetCombineMode(color_comb(0, 0, 0, G_CCMUX_SHADE), alpha_comb(0, 0, 0, G_ACMUX_SHADE), 0, 0);
+    }
+
+    if (sGdxFillRectDiag) {
+        ++sGdxFrDrawn;
+        if (mode == G_CYC_FILL) {
+            ++sGdxFrCycleFill;
+        }
+        // Sampled here rather than at the G_SETFILLCOLOR handler: this is the value the vertices
+        // were actually stamped with two lines above, which is what reaches the GPU.
+        GdxFillRectNoteColor(((uint32_t)mRdp->fill_color.r << 24) | ((uint32_t)mRdp->fill_color.g << 16) |
+                             ((uint32_t)mRdp->fill_color.b << 8) | (uint32_t)mRdp->fill_color.a);
     }
 
     GfxDrawRectangle(ulx, uly, lrx, lry);
@@ -5602,7 +6084,31 @@ bool gfx_end_dl_handler_common(F3DGfx** cmd0) {
 bool gfx_set_prim_depth_handler_rdp(F3DGfx** cmd) {
     Interpreter* gfx = mInstance.lock().get();
     uint32_t w1 = (*cmd)->words.w1;
-    gfx->mRdp->prim_depth = (uint16_t)((w1 >> 16) & 0x7FFF); // Mask to 15 bits
+    const uint16_t newPrimDepth = (uint16_t)((w1 >> 16) & 0x7FFF); // Mask to 15 bits
+    // [prim-depth-flush] handler-side layer, independently
+    // correct on its own: Flush() samples mRdp->prim_depth lazily at drain
+    // time (see Flush()'s SetCurrentPrimDepth call), so any triangles/rects
+    // still buffered when a NEW G_SETPRIMDEPTH value arrives must be drained
+    // BEFORE the register is overwritten here -- otherwise they would later
+    // flush with the NEW value instead of the one they were built with (the
+    // racer.c rival-icon/position-marker bug). Detecting the change in
+    // GfxSpTri1 instead (the previous approach) was too late: by the time
+    // GfxSpTri1 runs, this handler has already overwritten the register, so
+    // it could only ever observe the post-overwrite value. Flush() is already
+    // a no-op when nothing is buffered (see its own mBufVboLen guard), so
+    // this costs one cheap branch on the common no-change/empty-buffer case.
+    //
+    // GDX_NO_PRIM_DEPTH_FLUSH=1 suppresses the drain, so this guard can be attributed by A/B
+    // without a rebuild. It exists to answer "which of the two source-side guards was the Mute
+    // City sky regression", and a suppressed guard must reproduce the fault to earn the claim.
+    static const bool sNoPrimDepthFlush = [] {
+        const char* e = std::getenv("GDX_NO_PRIM_DEPTH_FLUSH");
+        return e != nullptr && e[0] != '\0' && strcmp(e, "0") != 0;
+    }();
+    if (!sNoPrimDepthFlush && newPrimDepth != gfx->mRdp->prim_depth) {
+        gfx->Flush();
+    }
+    gfx->mRdp->prim_depth = newPrimDepth;
     return false;
 }
 
@@ -6194,6 +6700,25 @@ bool gfx_set_blend_color_handler_rdp(F3DGfx** cmd0) {
     Interpreter* gfx = mInstance.lock().get();
     F3DGfx* cmd = *cmd0;
 
+    // [blend-alpha-flush] the second half of the same hazard [prim-depth-flush] guards above.
+    // Flush() samples mRdp->blend_color.a lazily at drain time for
+    // SetCurrentAlphaCompareThreshold, so buffered geometry must drain BEFORE the register is
+    // overwritten or it flushes with an alpha threshold it was never built with. Only the alpha
+    // component matters -- r/g/b never reach Flush().
+    //
+    // GDX_NO_BLEND_ALPHA_FLUSH=1 suppresses the drain, for the same attribution A/B described at
+    // [prim-depth-flush]. This is the prime suspect for the Mute City sky: the game rewrites the
+    // blend colour every 60Hz tick for its flicker-blend transparencies, so without this drain a
+    // buffered fill-rect gradient flushes with the NEXT tick's alpha-compare threshold -- which
+    // would alpha-test the gradient away on alternate ticks, exactly the observed period.
+    const uint8_t newBlendAlpha = (uint8_t)C1(0, 8);
+    static const bool sNoBlendAlphaFlush = [] {
+        const char* e = std::getenv("GDX_NO_BLEND_ALPHA_FLUSH");
+        return e != nullptr && e[0] != '\0' && strcmp(e, "0") != 0;
+    }();
+    if (!sNoBlendAlphaFlush && newBlendAlpha != gfx->mRdp->blend_color.a) {
+        gfx->Flush();
+    }
     gfx->GfxDpSetBlendColor(C1(24, 8), C1(16, 8), C1(8, 8), C1(0, 8));
     return false;
 }
@@ -6406,15 +6931,42 @@ bool gfx_stubbed_command_handler(F3DGfx** cmd0) {
     return false;
 }
 
-// gDPPipeSync: real hardware drains its pipeline here, so state changes made
-// after this point (e.g. a subsequent G_SETPRIMDEPTH) cannot retroactively
-// affect draws already queued before it. Mirror that by forcing a Flush().
-// No extra buffered-triangles guard is needed: Flush() (see its definition
-// above) is already a no-op whenever mBufVboLen == 0, so a gDPPipeSync with
-// nothing pending costs one cheap branch, not a draw call.
+// gDPPipeSync: real hardware drains its pipeline here so later state changes cannot retroactively
+// affect already-queued draws. This used to mirror that with an unconditional Flush(), on the
+// stated assumption that "an empty flush costs one cheap branch, not a draw call".
+//
+// That assumption fails for the one shape that matters: MachineSelect_BackgroundDraw
+// (decomp/src/overlays/ovl_i4/machine.c:1137-1147) emits gDPPipeSync + gDPSetFillColor +
+// gDPFillRectangle 224 times for a background gradient. Each fill queues two triangles, so the
+// next sync always found a non-empty buffer -- 224 forced DrawTriangles calls per frame, then
+// multiplied again by every interpolation sub-frame.
+//
+// The drain is no longer needed here because the hazard is now guarded at both of its sources.
+// Flush() applies exactly two pieces of drain-time RDP state, and each one drains itself when it
+// changes: prim_depth at [prim-depth-flush] (gfx_set_prim_depth_handler_rdp) and blend_color.a at
+// [blend-alpha-flush] (gfx_set_blend_color_handler_rdp). Every other state a batch depends on --
+// texture, combiner, viewport, scissor, framebuffer -- already flushes at its own change site.
+// Fill colour needs no drain at all: it is baked per-vertex (v->color = mRdp->fill_color), so
+// rects of differing colours batch correctly.
+//
+// Net effect: strictly more correct than before (change-detecting rather than unconditional) and
+// the gradient collapses from 224 draw calls to one batch. To revert, restore gfx->Flush() here.
+// REVERTED 2026-08-02 pending investigation. Removing this drain coincided with the Mute City sky
+// alternating between drawn and absent every other 60 Hz tick, while the track stayed bit-identical
+// -- and a 2026-07-30 binary, which still had the Flush, is clean. The affected region is a
+// fill-rect gradient, the exact construct this optimisation targeted. Every other candidate for that
+// regression was falsified by its own diagnostic gate ([pal-evict], [pool-tex], [mtx-failsafe],
+// [mtx-clamp], [mtx-dropped], [e2-reject] all fired ZERO times across a scripted Mute City race).
+// GDX_NO_PIPESYNC_FLUSH=1 restores the optimised no-drain behaviour for A/B without a rebuild.
 bool gfx_rdp_pipe_sync_handler_rdp(F3DGfx** cmd0) {
-    Interpreter* gfx = mInstance.lock().get();
-    gfx->Flush();
+    static const bool sNoFlush = [] {
+        const char* e = std::getenv("GDX_NO_PIPESYNC_FLUSH");
+        return e != nullptr && e[0] != 0 && !(e[0] == '0' && e[1] == 0);
+    }();
+    if (!sNoFlush) {
+        Interpreter* gfx = mInstance.lock().get();
+        gfx->Flush();
+    }
     return false;
 }
 
@@ -6454,15 +7006,22 @@ static constexpr UcodeHandler rdpHandlers = {
     { RDP_G_TEXRECT, { "G_TEXRECT", gfx_tex_rect_and_flip_handler_rdp } },           // G_TEXRECT (-28)
     { RDP_G_TEXRECTFLIP, { "G_TEXRECTFLIP", gfx_tex_rect_and_flip_handler_rdp } },   // G_TEXRECTFLIP (-27)
     { RDP_G_RDPLOADSYNC, { "mRdpLOADSYNC", gfx_stubbed_command_handler } },          // mRdpLOADSYNC (-26)
-    // Wired to a real Flush() (owner decision, 2026-07): real hardware drains
+    // Wired to a real Flush(): real hardware drains
     // its pipeline at gDPPipeSync, and this port's prim_depth staleness bug
-    // (see [prim-depth-flush] in GfxSpTri1) was one symptom of the no-op stub
-    // that used to sit here -- state changes made after a sync point (e.g. a
-    // later G_SETPRIMDEPTH) could retroactively affect draws already queued
-    // before it. GfxSpTri1's prim_depth-diff check already fixes that specific
-    // bug on its own and stays exactly as landed (belt); this restores
-    // hardware-matching drain semantics as defense against the whole class of
-    // stale-per-batch-state bugs game-wide (suspenders). gDPPipeSync fires for
+    // ([prim-depth-flush], racer.c's rival icon / 1st-2nd-3rd position marker
+    // texrects) was one symptom of the no-op stub that used to sit here --
+    // state changes made after a sync point (e.g. a later G_SETPRIMDEPTH)
+    // could retroactively affect draws already queued before it. The two
+    // REAL, independently-correct layers are: (1)
+    // gfx_set_prim_depth_handler_rdp flushes any pending batch BEFORE
+    // overwriting mRdp->prim_depth, so a buffered batch always drains with the
+    // value it was built with -- this alone fixes the bug regardless of
+    // gDPPipeSync; (2) this real PIPESYNC flush restores hardware-matching
+    // drain semantics as defense against the whole class of stale-per-batch-
+    // state bugs game-wide. (A GfxSpTri1-side flush-on-change check was tried
+    // first but was provably too late -- the register is already overwritten
+    // by the time GfxSpTri1 observes it -- so it was removed as dead state,
+    // same cleanup principle as mPendingTextureUpload.) gDPPipeSync fires for
     // many display lists, but gfx_rdp_pipe_sync_handler_rdp's Flush() call is
     // already a no-op whenever mBufVboLen == 0 (see Flush()'s own guard), so
     // an empty flush costs one cheap branch, not a draw call.
@@ -7032,7 +7591,7 @@ void Interpreter::Run(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtx_r
     // Re-latch the fixed-aspect flag per task: the game can flip its mode (and republish the
     // flag from the flip site) BETWEEN this frame's StartFrame and the gfx task that renders
     // the new mode, so the StartFrame latch alone would apply the old mode's aspect to the new
-    // mode's first frame (the owner-visible one-frame 4:3 squeeze on editor exit).
+    // mode's first frame -- a one-frame 4:3 squeeze on editor exit.
     mForceFixedAspectCache = sGdxForceFixedAspect != 0;
 
     // PORT (G-Diffuser): re-evaluate the render-target decision alongside the fixed-aspect re-latch
@@ -7116,6 +7675,37 @@ void Interpreter::Run(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtx_r
     }
 
     Flush();
+
+    // [fillrect] Emitted here rather than from the fill-rect path itself: one line per TASK is what
+    // makes tick-to-tick alternation legible, and hundreds of per-rect lines would not be. Reset
+    // after emitting so each line is that task's own totals, not a running sum. See the counters'
+    // definition above GfxDpFillRectangle for how to read the three outcomes apart.
+    if (sGdxFillRectDiag) {
+        static uint64_t sGdxFrTask = 0;
+        static const char kHex[] = "0123456789ABCDEF";
+        std::string colors;
+        for (int i = 0; i < sGdxFrColorCount; i++) {
+            if (i != 0) {
+                colors += ',';
+            }
+            for (int s = 28; s >= 0; s -= 4) {
+                colors += kHex[(sGdxFrColors[i] >> s) & 0xF];
+            }
+        }
+        if (colors.empty()) {
+            colors = "-";
+        }
+        SPDLOG_WARN("[fillrect] task={} submitted={} drawn={} cycfill={} zfull={} zregion={} colors={} [{}]",
+                    sGdxFrTask++, sGdxFrSubmitted, sGdxFrDrawn, sGdxFrCycleFill, sGdxFrZFullClear, sGdxFrZRegion,
+                    sGdxFrColorCount, colors);
+        sGdxFrSubmitted = 0;
+        sGdxFrDrawn = 0;
+        sGdxFrCycleFill = 0;
+        sGdxFrZFullClear = 0;
+        sGdxFrZRegion = 0;
+        sGdxFrColorCount = 0;
+    }
+
     mGfxFrameBuffer = 0;
     currentDir = std::stack<std::string>();
 

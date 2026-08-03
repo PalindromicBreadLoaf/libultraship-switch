@@ -3,6 +3,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <unordered_map>
+#include <unordered_set>
 #include <map>
 #include <list>
 #include <limits>
@@ -207,8 +208,7 @@ struct TextureCacheKey {
     // so an address-only key returns the stale decode and the fade freezes.
     // Hashing the bound palette content makes an in-place fade miss the cache and
     // re-decode. Left 0 (disabled) unless GDX_CI_PALETTE_HASH is set, so the
-    // proven default path is untouched until this is validated (MASTER_SCOPE
-    // Track B: re-add the palette-content cache key alone and test separately).
+    // proven default path is untouched until this is validated.
     uint32_t palette_content_hash = 0;
 
     bool operator==(const TextureCacheKey&) const noexcept = default;
@@ -422,17 +422,6 @@ struct RenderingState {
     bool sampler_linear_filter[SHADER_MAX_TEXTURES];
     uint8_t sampler_cms[SHADER_MAX_TEXTURES];
     uint8_t sampler_cmt[SHADER_MAX_TEXTURES];
-    // prim_depth (G_ZS_PRIM) is a lazily-sampled per-flush uniform: Flush() reads
-    // mRdp->prim_depth at drain time, not at G_SETPRIMDEPTH time (see Flush()'s
-    // SetCurrentPrimDepth call). Since this port's gDPPipeSync is a no-op stub,
-    // nothing else forces a drain between two draws that use different prim_depth
-    // values, so a later G_SETPRIMDEPTH can silently invalidate an earlier draw's
-    // still-buffered batch before it flushes. Track the prim_depth value the
-    // currently-buffered batch will read on flush, and force a Flush() in
-    // GfxSpTri1 whenever a prim-depth draw's value differs from it. 0xFFFFFFFF is
-    // a sentinel outside the 15-bit N64 prim_depth range (0..0x7FFF) so the very
-    // first prim-depth draw always flushes.
-    uint32_t lastFlushedPrimDepth = 0xFFFFFFFFu;
 };
 
 struct FBInfo {
@@ -460,6 +449,17 @@ struct GeometryDiagnostics {
     float maxNdcY = 0.0f;
     float minNdcZ = 0.0f;
     float maxNdcZ = 0.0f;
+    // [interp-geo] Content fingerprints for sub-frame replay comparison. Replaying one tick's
+    // display list with the interpolation fraction pinned must be idempotent; measured, it is not
+    // -- pass 0 clip-rejects ~15 fewer triangles than every later pass, and passes 1..M-1 are bit
+    // identical to each other. Triangle counters say geometry is lost but not why, because
+    // clip_rej is derived from the TRANSFORMED position: identical vertex COUNTS say nothing about
+    // vertex CONTENT. These two split the remaining space. vertexHash accumulates every transformed
+    // vertex and its clip flags, so it answers "did the transform change at all"; mpFirstHash
+    // captures MP_matrix at the pass's first vertex, so it answers "was it already different before
+    // the walk started, or did it drift during it".
+    uint64_t vertexHash = 0;
+    uint64_t mpFirstHash = 0;
     uint64_t trianglesSubmitted = 0;
     uint64_t trianglesClipRejected = 0;
     uint64_t trianglesCullRejected = 0;
@@ -631,6 +631,12 @@ class Interpreter {
     void GdxDumpDecodedRgba32(int tile, const uint8_t* rgba32, uint32_t width, uint32_t height);
     bool TextureCacheLookup(int i, const TextureCacheKey& key);
     void TextureCacheDelete(const uint8_t* origAddr);
+    // Palette-keyed companion to TextureCacheDelete. A CI4/CI8 cache entry is keyed on
+    // {index-data address, palette DRAM address}: refreshing the palette CONTENT at an
+    // unchanged address leaves every decode keyed against it stale. Erases the entries
+    // whose key.palette_addrs[] names this address. Cheap no-op unless the address was
+    // actually seen as a TLUT source (see mSeenPaletteAddrs).
+    void TextureCacheDeletePalette(const uint8_t* paletteAddr);
     void ImportTextureRgba16(int textureUnit, int tile, bool importReplacement, bool forceOpaqueAlpha);
     void ImportTextureRgba32(int tile, bool importReplacement);
     void ImportTextureIA4(int tile, bool importReplacement);
@@ -714,6 +720,12 @@ class Interpreter {
     RenderingState mRenderingState{};
 
     GfxTextureCache mTextureCache{};
+    // Every DRAM address GfxDpLoadTlut has ever bound as a TLUT source. TextureCacheDeletePalette
+    // has to scan the whole cache (the map is bucketed by texture_addr, not by palette), so this
+    // set is the O(1) gate that keeps the common case -- a plain texture-buffer refresh, which is
+    // never a palette -- from paying for that scan. Bounded in practice: F-Zero X binds a few tens
+    // of distinct TLUT sources per session (asset palettes plus the two per-pool staging slots).
+    std::unordered_set<const uint8_t*> mSeenPaletteAddrs;
     std::map<ColorCombinerKey, ColorCombiner> mColorCombinerPool; // color_combiner_pool;
     std::map<ColorCombinerKey, ColorCombiner>::iterator mPrevCombiner = mColorCombinerPool.end();
     uint8_t* mTexUploadBuffer = nullptr;
