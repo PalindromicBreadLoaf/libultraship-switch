@@ -553,7 +553,30 @@ void GfxWindowBackendDXGI::Init(const char* game_name, const char* gfx_api_name,
     qpc_freq = lqpc_freq.QuadPart;
 
     mTargetFps = 60;
-    mMaxFrameLatency = 2;
+    // Sized for a BURST of presents, not one present per tick.
+    //
+    // The frame-latency waitable object is a semaphore that starts at mMaxFrameLatency, and
+    // ApplyMaxFrameLatency(first) consumes one token at creation and never returns it, so the usable
+    // depth is mMaxFrameLatency - 1. At the old value of 2 that left ONE un-retired present: with
+    // SwapBuffersBegin presenting and SwapBuffersEnd waiting, the second present of any burst
+    // blocked until the first retired on a vblank.
+    //
+    // That is fatal for frame interpolation, which presents M sub-frames (2-3 at a 144 Hz target)
+    // inside a single 60 Hz tick, on the same thread that runs the simulation. Blocking presents #2
+    // and #3 cost >= 2 x 6.944 ms of a 16.683 ms tick, the tick overran, and since one host-loop
+    // iteration advances the sim exactly once with no catch-up, that time was lost permanently --
+    // the GAME ran in slow motion (measured: sim down to 8.6 Hz, 14% speed, on a 144 Hz panel).
+    //
+    // 4 gives a usable depth of 3, enough for the largest burst the rational accumulator produces at
+    // 144 Hz, so the thread can submit the burst and return while the display drains it across the
+    // tick boundary. Producer and consumer stay balanced by construction: M averages target/60 and
+    // the sim runs at 60, so the queue absorbs burstiness without growing.
+    //
+    // Cost is up to 3 frames of present latency (~21 ms at 144 Hz) instead of 1. That is the correct
+    // trade -- input lag is a smoothness property, a slow game clock is a correctness fault. The
+    // non-interpolated path is unaffected in practice: it presents once per tick and is paced by the
+    // logic deadline, so it never queues far enough ahead to reach the deeper limit.
+    mMaxFrameLatency = 4;
 
     // Use high-resolution mTimer by default on Windows 10 (so that NtSetTimerResolution (...) hacks are not needed)
     mTimer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
@@ -1376,7 +1399,13 @@ void GfxWindowBackendDXGI::CreateSwapChain(IUnknown* mDevice, std::function<void
     bool dxgi_13 = CreateDXGIFactory2 != nullptr; // DXGI 1.3 introduced waitable object
 
     DXGI_SWAP_CHAIN_DESC1 swap_chain_desc = {};
-    swap_chain_desc.BufferCount = 3;
+    // 4, not 3: the flip models count the buffer currently on screen, so BufferCount N caps the
+    // queue at N-1 un-retired presents. Frame interpolation submits bursts of up to 3 sub-frames
+    // inside one 60 Hz tick, and at 3 buffers the third present had nowhere to go regardless of what
+    // SetMaximumFrameLatency allowed -- the deeper semaphore below would have been capped here.
+    // See the mMaxFrameLatency comment in Init for why blocking that burst made the game clock,
+    // not just the frame rate, run slow. Cost is one extra backbuffer (~8 MB at 1080p).
+    swap_chain_desc.BufferCount = 4;
     swap_chain_desc.Width = 0;
     swap_chain_desc.Height = 0;
     swap_chain_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;

@@ -221,6 +221,17 @@ extern "C" void gdx_fast3d_set_subframe_present(int on) {
     gGdxSubframePresent = (on != 0);
 }
 
+// Sub-phase seams owned by the port (port/gdx_perf.h). Declared locally rather than including that
+// header, which lives outside libultraship — the same minimal-include idiom gdx_gfx_post_run_capture
+// above uses. Both are a cached-bool early return when GDX_PERF is off, so this costs nothing in a
+// normal run. The enum values must match GdxPerfSub; they are asserted against it in gdx_perf.cpp.
+extern "C" void gdx_perf_sub_begin(int id);
+extern "C" void gdx_perf_sub_end(int id);
+#define GDX_PERF_SUB_GUI_ID 3
+#define GDX_PERF_SUB_SFRAME_ID 4
+#define GDX_PERF_SUB_IRUN_ID 5
+#define GDX_PERF_SUB_EFRAME_ID 6
+
 bool Fast3dWindow::DrawAndRunGraphicsCommands(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtxReplacements) {
     std::shared_ptr<Window> wnd = Ship::Context::GetInstance()->GetWindow();
 
@@ -234,11 +245,17 @@ bool Fast3dWindow::DrawAndRunGraphicsCommands(Gfx* commands, const std::unordere
     // Setup mouse state manager
     wnd->GetMouseStateManager()->StartFrame();
     // Setup of the backend frames and draw initial Window and GUI menus
+    gdx_perf_sub_begin(GDX_PERF_SUB_GUI_ID);
     gui->StartDraw();
+    gdx_perf_sub_end(GDX_PERF_SUB_GUI_ID);
     // Setup game framebuffers to match available window space
+    gdx_perf_sub_begin(GDX_PERF_SUB_SFRAME_ID);
     mInterpreter->StartFrame();
+    gdx_perf_sub_end(GDX_PERF_SUB_SFRAME_ID);
     // Execute the games gfx commands
+    gdx_perf_sub_begin(GDX_PERF_SUB_IRUN_ID);
     mInterpreter->Run(commands, mtxReplacements);
+    gdx_perf_sub_end(GDX_PERF_SUB_IRUN_ID);
     // [interp-shot] The ONLY sound point to capture a sub-frame's rendered image. The swap chain is
     // DXGI_SWAP_EFFECT_FLIP_DISCARD with BufferCount 3 (gfx_dxgi.cpp:1276-1284), so once EndFrame
     // below presents, the back buffer's contents are explicitly UNDEFINED -- capturing after
@@ -248,9 +265,13 @@ bool Fast3dWindow::DrawAndRunGraphicsCommands(Gfx* commands, const std::unordere
     // No-op unless the port armed it; see gdx_gfx_post_run_capture in port/n64_gfx_bridge.cpp.
     gdx_gfx_post_run_capture();
     // Renders the game frame buffer to the final window and finishes the GUI
+    gdx_perf_sub_begin(GDX_PERF_SUB_GUI_ID);
     gui->EndDraw();
+    gdx_perf_sub_end(GDX_PERF_SUB_GUI_ID);
     // Finalize swap buffers
+    gdx_perf_sub_begin(GDX_PERF_SUB_EFRAME_ID);
     mInterpreter->EndFrame();
+    gdx_perf_sub_end(GDX_PERF_SUB_EFRAME_ID);
 
     return true;
 }

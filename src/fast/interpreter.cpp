@@ -607,7 +607,25 @@ extern "C" unsigned long long gdx_gfx_texbind_hash(void) {
    back under a different id -- hashing it reports divergence where the picture is identical. The
    key is what identifies content (source address, palette, fmt/siz, tile geometry, clamp/mirror),
    so equal key sequences across two replays means both replays drew the same textures. */
+/* GATED OFF BY DEFAULT (GDX_DIAG_TEXBIND=1 to enable). This runs on EVERY texture bind, at three
+   call sites, inside the interpreter's hottest loop -- and frame interpolation replays that whole
+   loop M times per 60 Hz tick, so an ungated version cost nine 64-bit multiplies per bind per
+   sub-frame, permanently, in shipping builds. It was left compiled in while investigating replay
+   idempotency; that question has since been answered (idem_div = 0 over 15,446 ticks), so the
+   default is off and the cost is one predictable branch.
+
+   Kept rather than deleted because the strobing question it was built for is not fully closed, and
+   rebuilding it later would cost more than the branch does. If you enable it, remember the bridge
+   resets the accumulator per sub-frame -- comparing hashes only means anything within one tick. */
+static const bool sGdxTexBindHashEnabled = [] {
+    const char* e = std::getenv("GDX_DIAG_TEXBIND");
+    return e != nullptr && e[0] != '\0' && strcmp(e, "0") != 0;
+}();
+
 static inline void GdxNoteTexBind(int slot, const TextureCacheKey& key) {
+    if (!sGdxTexBindHashEnabled) {
+        return;
+    }
     const auto mix = [](uint64_t h, uint64_t v) {
         h ^= v;
         return h * 1099511628211ull;
