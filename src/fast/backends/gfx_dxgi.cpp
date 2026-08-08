@@ -553,29 +553,18 @@ void GfxWindowBackendDXGI::Init(const char* game_name, const char* gfx_api_name,
     qpc_freq = lqpc_freq.QuadPart;
 
     mTargetFps = 60;
-    // Sized for a BURST of presents, not one present per tick.
+    // Sized for a burst of presents, not one per tick. ApplyMaxFrameLatency consumes one token
+    // at creation and never returns it, so the usable depth is this minus one -- at the old value
+    // of 2, the second present of a burst blocked until the first retired on a vblank.
     //
-    // The frame-latency waitable object is a semaphore that starts at mMaxFrameLatency, and
-    // ApplyMaxFrameLatency(first) consumes one token at creation and never returns it, so the usable
-    // depth is mMaxFrameLatency - 1. At the old value of 2 that left ONE un-retired present: with
-    // SwapBuffersBegin presenting and SwapBuffersEnd waiting, the second present of any burst
-    // blocked until the first retired on a vblank.
+    // Frame interpolation presents 2-3 sub-frames per 60 Hz tick on the thread that also runs the
+    // simulation, so those blocks overran the tick, and one host-loop iteration advances the sim
+    // exactly once with no catch-up: the game clock itself ran slow (measured 8.6 Hz on a 144 Hz
+    // panel). A usable depth of 3 covers the largest burst the accumulator produces at 144 Hz.
     //
-    // That is fatal for frame interpolation, which presents M sub-frames (2-3 at a 144 Hz target)
-    // inside a single 60 Hz tick, on the same thread that runs the simulation. Blocking presents #2
-    // and #3 cost >= 2 x 6.944 ms of a 16.683 ms tick, the tick overran, and since one host-loop
-    // iteration advances the sim exactly once with no catch-up, that time was lost permanently --
-    // the GAME ran in slow motion (measured: sim down to 8.6 Hz, 14% speed, on a 144 Hz panel).
-    //
-    // 4 gives a usable depth of 3, enough for the largest burst the rational accumulator produces at
-    // 144 Hz, so the thread can submit the burst and return while the display drains it across the
-    // tick boundary. Producer and consumer stay balanced by construction: M averages target/60 and
-    // the sim runs at 60, so the queue absorbs burstiness without growing.
-    //
-    // Cost is up to 3 frames of present latency (~21 ms at 144 Hz) instead of 1. That is the correct
-    // trade -- input lag is a smoothness property, a slow game clock is a correctness fault. The
-    // non-interpolated path is unaffected in practice: it presents once per tick and is paced by the
-    // logic deadline, so it never queues far enough ahead to reach the deeper limit.
+    // Cost is up to 3 frames of present latency instead of 1, which is the right trade: input lag
+    // is a smoothness property, a slow game clock is a correctness fault. The non-interpolated
+    // path presents once per tick and never queues deep enough to reach this limit.
     mMaxFrameLatency = 4;
 
     // Use high-resolution mTimer by default on Windows 10 (so that NtSetTimerResolution (...) hacks are not needed)
@@ -815,20 +804,12 @@ static uint64_t qpc_to_100ns(uint64_t qpc) {
     return qpc / qpc_freq * _100NANOSECONDS_IN_SECOND + qpc % qpc_freq * _100NANOSECONDS_IN_SECOND / qpc_freq;
 }
 
-// [limiter-diag] GDX_DIAG_LIMITER=1 (any non-"0" value).
+// Diagnostic for the one place that refuses a present. The decision is
+// `vsyncs_to_wait = (desired_present_time - last_present_end) / vsync_interval`, refused when
+// non-positive, so the fields worth reporting are the schedule's drift from real time and the
+// number of presents DXGI still has queued, which pushes last_end forward.
 //
-// IsFrameReady is the single point that refuses a present, and with frame interpolation on it was
-// refusing EVERY sub-frame of ~35% of ticks -- including the first pass of the tick, which no
-// theory about spacing between passes can explain. Three such theories were built and killed
-// against measurements: burst-calling, VSync interaction, and tick budget. Rather than guess at a
-// fourth, this reports the function's OWN arithmetic at the moment it decides.
-//
-// The decision is `vsyncs_to_wait = (desired_present_time - last_present_end) / vsync_interval`,
-// refused when that is non-positive ("too late"). So the fields that matter are how far the
-// internal schedule has drifted from real time (delta_ms) and how many presents DXGI still has
-// queued, since queued vsyncs push last_end forward and can starve the schedule.
-//
-// Emitted once per 300 calls (~2 s at 144 Hz); the per-call cost when disabled is one bool test.
+// Gated on GDX_DIAG_LIMITER and emitted once per 300 calls; disabled cost is one bool test.
 namespace {
 struct GdxLimiterDiag {
     unsigned long long calls = 0, accepts = 0, dropLate = 0, dropRound = 0, noStats = 0, resync = 0;
@@ -919,15 +900,9 @@ bool GfxWindowBackendDXGI::IsFrameReady() {
             estimated_vsync_interval_ns = 16666666;
             estimated_vsync_interval = (double)estimated_vsync_interval_ns * qpc_freq / 1000000000;
         }
-        // [GDX] Anchor the estimate to the panel's ACTUAL refresh interval. Reverting this once
-        // coincided with a deterministic race-entry crash, so it is restored while that is
-        // understood; see the session notes before touching it again.
-        // GDX_NO_VSYNC_CLAMP=1 disables the clamp for A/B WITHOUT a rebuild. It is the prime
-        // suspect for the Mute City sky flicker because it is the only change in the interpolation
-        // effort that also affects the ordinary non-interpolated render path -- and the flicker was
-        // reported with interpolation switched off. Note removing this code entirely once coincided
-        // with a deterministic race-entry crash (3/3), so the toggle exists to test the clamp's
-        // EFFECT while leaving the code present.
+        // Anchor the estimate to the panel's actual refresh interval. Deleting this block
+        // reproduced a deterministic race-entry crash (3/3), so GDX_NO_VSYNC_CLAMP disables the
+        // clamp's effect for A/B testing while leaving the code in place.
         static const bool sNoClamp = [] {
             const char* e = getenv("GDX_NO_VSYNC_CLAMP");
             return e != nullptr && e[0] != 0 && !(e[0] == 0x30 && e[1] == 0);
@@ -1033,9 +1008,8 @@ bool GfxWindowBackendDXGI::IsFrameReady() {
             }
         }
     } else if (gdxDiag) {
-        // Fewer than two frame-statistics samples: the whole pacing block is skipped and the call
-        // is accepted unconditionally. Counted separately so "accepted" is never confused with
-        // "the limiter agreed" -- if this number is large the limiter is simply not engaging.
+        // Counted apart from ordinary accepts: with fewer than two samples the pacing block is
+        // skipped entirely, so a large count here means the limiter never engaged at all.
         ++gLimiterDiag.noStats;
     }
     if (gdxDiag) {
@@ -1044,24 +1018,16 @@ bool GfxWindowBackendDXGI::IsFrameReady() {
     return true;
 }
 
-/* GDX window-capture facility: dumps the fully-rendered D3D11 swapchain
-   backbuffer to numbered 24bpp BMP files just before Present, at the real
-   window resolution and aspect ratio. This closes the long-standing gap where
-   the only capture path (GDX_CAPTURE_FRAMES) read the 320x240 aspect-blind N64
-   frame mirror, which cannot show window-level artifacts such as the Cup Select
-   wipe judder. Env-gated and zero-cost when GDX_CAPTURE_WINDOW is unset.
+/* Window-level capture: dumps the swapchain backbuffer to numbered 24bpp BMPs just before
+   Present. The other capture path (GDX_CAPTURE_FRAMES) reads the 320x240 aspect-blind N64 frame
+   mirror, which cannot show window-level artifacts such as wipe judder.
 
-   Format: GDX_CAPTURE_WINDOW=<start>:<count> -- capture <count> presented
-   frames beginning at present index <start> (0-based). Output files are named
-   gdxwin_<index>.bmp next to the executable, where <index> is the absolute
-   present index so consecutive captures are trivially ordered. */
-// Decomp game-mode global, used by the capture facility's correlation aid so a
-// capture window can be aimed at a specific mode transition.
-extern "C" int gGameMode; // GET_MODE = gGameMode & 0x1F
+   GDX_CAPTURE_WINDOW=<start>:<count> captures <count> presented frames from present index
+   <start>, writing gdxwin_<index>.bmp next to the executable. Off when unset. */
+extern "C" int gGameMode; // decomp global; GET_MODE = gGameMode & 0x1F
 
 static void GdxMaybeCaptureWindowFrame(IDXGISwapChain1* swapChain, IUnknown* swapChainDevice) {
-    // Parse the env request exactly once. When unset or malformed the facility
-    // stays fully disabled and the per-present cost is a single bool test.
+    // Parsed once; unset or malformed leaves the facility off at a cost of one bool test.
     static int sState = 0; // 0 = unparsed, 1 = active, -1 = disabled
     static unsigned int sStart = 0;
     static unsigned int sCount = 0;
@@ -1085,10 +1051,8 @@ static void GdxMaybeCaptureWindowFrame(IDXGISwapChain1* swapChain, IUnknown* swa
 
     const unsigned int index = sPresentIndex++;
 
-    /* Correlation aid: while the facility is active, append the present index to
-       gdxwin-modes.txt whenever the decomp game mode changes, so a capture window
-       can be aimed at a specific transition (e.g. the 07->0A Cup Select wipe)
-       without guessing the present number. Bounded; only runs when capture is on. */
+    /* Log the present index at every game-mode change so a capture window can be aimed at a
+       specific transition without guessing the present number. */
     {
         static int sLastMode = -1;
         static int sModeLogs = 0;
@@ -1111,9 +1075,8 @@ static void GdxMaybeCaptureWindowFrame(IDXGISwapChain1* swapChain, IUnknown* swa
         return;
     }
 
-    // The swapchain device is a D3D11 device on the DX11 backend and a D3D12
-    // command queue on the DX12 backend. Only DX11 is supported here; a failed
-    // QueryInterface silently skips (DX12 present path does not reach this).
+    // The swapchain device is a D3D11 device on DX11 and a command queue on DX12. Only DX11 is
+    // handled, so a failed QueryInterface just skips.
     ComPtr<ID3D11Device> device;
     if (FAILED(swapChainDevice->QueryInterface(__uuidof(ID3D11Device), (void**)device.GetAddressOf()))) {
         return;
@@ -1153,8 +1116,7 @@ static void GdxMaybeCaptureWindowFrame(IDXGISwapChain1* swapChain, IUnknown* swa
 
     const unsigned int width = desc.Width;
     const unsigned int height = desc.Height;
-    // BGRA vs RGBA byte order in the mapped rows. The common flip-model
-    // backbuffer format is DXGI_FORMAT_B8G8R8A8_UNORM; R8G8B8A8 is handled too.
+    // Flip-model backbuffers are usually B8G8R8A8; R8G8B8A8 is handled too.
     const bool isBgra = (desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM ||
                          desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB);
 
@@ -1228,13 +1190,10 @@ void GfxWindowBackendDXGI::SwapBuffersBegin() {
     LARGE_INTEGER t;
     QueryPerformanceCounter(&t);
 
-    // When vsync is enabled and the requested target fps is within tolerance of the
-    // display's detected refresh rate, Present() below already blocks until the next
-    // vsync -- running this software wall-clock deadline wait as well means two
-    // independently-clocked pacers (this QPC deadline and the hardware refresh) beat
-    // against each other, which shows up as missed/duplicated vsync slots (judder,
-    // shimmer on high-frequency detail such as track rails). Tolerance absorbs
-    // NTSC/VRR drift (59.94 vs 60, 143.86 vs 144): max(1.0 Hz, 1.5% of refresh).
+    // With vsync on and the target within tolerance of the panel's refresh rate, Present()
+    // below already blocks on the hardware refresh; running this software deadline wait too
+    // gives two independently-clocked pacers beating against each other, which shows up as
+    // judder and shimmer on high-frequency detail. The tolerance absorbs NTSC/VRR drift.
     double vsyncTolerance = mDetectedHz > 0.0 ? std::max(1.0, mDetectedHz * 0.015) : 1.0;
     bool vsyncPaced = mVsyncEnabled != 0 && mDetectedHz > 0.0 &&
                       fabs((double)mTargetFps - mDetectedHz) <= vsyncTolerance;
@@ -1244,10 +1203,8 @@ void GfxWindowBackendDXGI::SwapBuffersBegin() {
         sWasVsyncPaced = vsyncPaced;
         sVsyncPacedLogged = true;
         // WARN, not INFO: Release builds initialise the logger at spdlog::level::warn (Context.h
-        // InitLogging default), so this transition line has never once appeared in a Release log.
-        // It carries mTargetFps and mDetectedHz -- the two values that decide whether the software
-        // limiter drops a present -- and its absence is why a 90-second stretch of ~20 presents/s
-        // could not be attributed from a full GDX_LOG capture.
+        // InitLogging default), and this line carries the two values that decide whether the
+        // software limiter drops a present.
         SPDLOG_WARN("[pacer] vsync-paced: {} software wait target={:.2f} refresh={:.2f}",
                     vsyncPaced ? "skipping" : "resuming", (double)mTargetFps, mDetectedHz);
     }
@@ -1272,14 +1229,11 @@ void GfxWindowBackendDXGI::SwapBuffersBegin() {
         }
         QueryPerformanceCounter(&t);
     }
-    // On the skip path, t is still the QPC sample taken at function entry (nothing
-    // expensive runs between it and Present below) -- keeping mPreviousPresentTime
-    // near-now here (instead of leaving it stale) means that if the target fps later
-    // drifts away from the refresh rate and the software wait re-engages, it resumes
-    // from a sane deadline instead of producing a catch-up burst.
+    // On the skip path t is still the entry sample. Keeping mPreviousPresentTime near-now
+    // rather than stale means the software wait resumes from a sane deadline, instead of a
+    // catch-up burst, if the target fps later drifts off the refresh rate.
     mPreviousPresentTime = t;
-    // Window-level backbuffer capture (env-gated, zero-cost when unset). Runs
-    // before Present so the dumped frame is exactly what is about to be shown.
+    // Before Present, so the dumped frame is exactly what is about to be shown.
     GdxMaybeCaptureWindowFrame(swap_chain.Get(), mSwapChainDevice.Get());
     if (mTearingSupport && !mVsyncEnabled) {
         // 512: DXGI_PRESENT_ALLOW_TEARING - allows for true V-Sync off with flip model
@@ -1399,12 +1353,10 @@ void GfxWindowBackendDXGI::CreateSwapChain(IUnknown* mDevice, std::function<void
     bool dxgi_13 = CreateDXGIFactory2 != nullptr; // DXGI 1.3 introduced waitable object
 
     DXGI_SWAP_CHAIN_DESC1 swap_chain_desc = {};
-    // 4, not 3: the flip models count the buffer currently on screen, so BufferCount N caps the
-    // queue at N-1 un-retired presents. Frame interpolation submits bursts of up to 3 sub-frames
-    // inside one 60 Hz tick, and at 3 buffers the third present had nowhere to go regardless of what
-    // SetMaximumFrameLatency allowed -- the deeper semaphore below would have been capped here.
-    // See the mMaxFrameLatency comment in Init for why blocking that burst made the game clock,
-    // not just the frame rate, run slow. Cost is one extra backbuffer (~8 MB at 1080p).
+    // 4, not 3: the flip models count the buffer on screen, so BufferCount N caps the queue at
+    // N-1 un-retired presents, and interpolation submits bursts of up to 3 per tick. At 3 the
+    // third present had nowhere to go no matter what SetMaximumFrameLatency allowed -- see the
+    // mMaxFrameLatency comment in Init for why that made the game clock run slow.
     swap_chain_desc.BufferCount = 4;
     swap_chain_desc.Width = 0;
     swap_chain_desc.Height = 0;

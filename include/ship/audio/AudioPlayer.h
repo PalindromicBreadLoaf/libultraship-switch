@@ -12,10 +12,9 @@ namespace Ship {
  * @brief Configuration parameters shared by all AudioPlayer backends.
  */
 struct AudioSettings {
-    /// Output sample rate in Hz. This fork feeds the device the N64 AI
-    /// stream directly (osAiSetNextBuffer, no resampling), and F-Zero X
-    /// synthesizes at 32000 Hz - a 44100 Hz device plays everything ~38%
-    /// fast and high-pitched and drains faster than the game produces.
+    /// Output sample rate in Hz. The port feeds the device the N64 AI stream directly
+    /// (osAiSetNextBuffer, no resampling) and F-Zero X synthesizes at 32000 Hz, so a
+    /// 44100 Hz device plays ~38% fast and drains faster than the game fills it.
     int32_t SampleRate = 32000;
     int32_t SampleLength = 1024;    ///< Number of samples per audio frame.
     int32_t DesiredBuffered = 2480; ///< Target number of frames to keep buffered.
@@ -125,10 +124,8 @@ class AudioPlayer {
     /**
      * @brief Returns a short, stable name for the concrete backend (e.g. "SDL", "WASAPI").
      *
-     * Used for honest status reporting: the active AudioPlayer subclass identifies itself
-     * rather than callers inferring the backend from a possibly-misleading source such as
-     * SDL_GetCurrentAudioDriver() (which reports "none" when a non-SDL backend is active).
-     * The base implementation returns "Unknown"; each concrete backend overrides it.
+     * Lets the active subclass identify itself instead of callers inferring it from
+     * SDL_GetCurrentAudioDriver(), which reports "none" when a non-SDL backend is active.
      */
     virtual const char* GetBackendName() const {
         return "Unknown";

@@ -193,9 +193,8 @@ static bool CreateDeviceFunc(class GfxRenderingAPIDX11* self, bool SoftwareRende
 };
 
 void GfxRenderingAPIDX11::Init() {
-    // Cached state objects belong to the device that created them. This is the only device-creation
-    // path, so dropping them here keeps a re-Init from handing the new context objects owned by a
-    // dead device.
+    // Cached state objects belong to the device that created them, and this is the only
+    // device-creation path, so a re-Init must not inherit objects owned by the dead device.
     mDepthStencilCache.clear();
     mRasterizerCache.clear();
 
@@ -305,9 +304,8 @@ void GfxRenderingAPIDX11::Init() {
     ThrowIfFailed(mDevice->CreateBuffer(&constant_buffer_desc, nullptr, mPerPrimDepthCb.GetAddressOf()),
                   mWindowBackend->GetWindowHandle(), "Failed to create per-prim-depth constant buffer.");
 
-    // Create per-alpha-compare-threshold constant buffer (G_AC_THRESHOLD), uploaded
-    // only when mAlphaCompareThresholdDirty. Real RDP compares texel alpha against
-    // the SETBLENDCOLOR alpha register, not a fixed constant.
+    // G_AC_THRESHOLD: the RDP compares texel alpha against the SETBLENDCOLOR alpha register,
+    // not a fixed constant, so the shader needs it as a uniform.
     constant_buffer_desc.ByteWidth = sizeof(PerAlphaThresholdCB);
     ThrowIfFailed(mDevice->CreateBuffer(&constant_buffer_desc, nullptr, mPerAlphaThresholdCb.GetAddressOf()),
                   mWindowBackend->GetWindowHandle(), "Failed to create per-alpha-threshold constant buffer.");
@@ -368,13 +366,11 @@ void CSMain(uint3 DTid : SV_DispatchThreadID) {
         throw Ship::HResultException(hr, "MSAA compute shader compilation failed");
     }
 
-    // Compiled-shader store. Opened here, after InitResourceManager and InitConsoleVariables have
-    // both run (see port/main.cpp), so the archive seed is reachable and a rejected seed is
-    // reported before the first frame rather than mid-race. DXBC is driver-independent bytecode,
-    // so this backend adds no fingerprint bits of its own: the build hash alone decides validity,
-    // and a seed recorded on one machine is valid on every other. The two compute shaders compiled
-    // just above are deliberately not cached -- they are boot-time and fixed-source, so they never
-    // land inside a frame.
+    // Must run after InitResourceManager and InitConsoleVariables (see port/main.cpp) so the
+    // archive seed is reachable and a rejected seed is reported before the first frame. DXBC is
+    // driver-independent, so no backend fingerprint bits are needed here and a seed recorded on
+    // one machine is valid everywhere. The compute shaders above stay uncached: fixed-source and
+    // boot-time, so they never land inside a frame.
     mShaderCache.Init(SHADER_CACHE_TAG_D3D11, 0ull, "shadercache/d3d11.gdxshc",
                       "gdiffuser-shadercache-d3d11.bin");
 
@@ -412,8 +408,8 @@ struct ShaderProgram* GfxRenderingAPIDX11::CreateAndLoadNewShader(uint64_t shade
     CCFeatures cc_features;
     gfx_cc_get_features(shader_id0, shader_id1, &cc_features);
 
-    // Both of these change the generated HLSL without being part of the shader id, so they are
-    // part of the cache key or a filter-mode switch would resurrect the wrong bytecode.
+    // Both change the generated HLSL without being part of the shader id, so they must be in
+    // the cache key or a filter-mode switch resurrects the wrong bytecode.
     const uint32_t cacheFlags =
         (mCurrentFilterMode == FILTER_THREE_POINT ? (uint32_t)SHADER_CACHE_FLAG_THREE_POINT : 0u) |
         (mSrgbMode ? (uint32_t)SHADER_CACHE_FLAG_SRGB : 0u);
@@ -422,10 +418,9 @@ struct ShaderProgram* GfxRenderingAPIDX11::CreateAndLoadNewShader(uint64_t shade
      * Cached payload layout, little-endian: numFloats u32, vsSize u32, psSize u32, then the two
      * DXBC blobs back to back.
      *
-     * numFloats has to ride along. It is an out-param of gfx_direct3d_common_build_shader rather
-     * than a function of cc_features, and a cache hit skips source generation entirely, so there
-     * is nowhere else to recover it from. Everything below this point -- input layout, blend
-     * state, the usedTextures fan-out -- derives from cc_features and needs no storing.
+     * numFloats has to ride along: it is an out-param of gfx_direct3d_common_build_shader, and a
+     * cache hit skips source generation, so there is nowhere else to recover it from. Everything
+     * else below derives from cc_features.
      */
     size_t numFloats = 0;
     const uint8_t* vsBytes = nullptr;
@@ -465,12 +460,9 @@ struct ShaderProgram* GfxRenderingAPIDX11::CreateAndLoadNewShader(uint64_t shade
         UINT compile_flags = D3DCOMPILE_OPTIMIZATION_LEVEL2;
 #endif
 
-        // [shader-compile] A RUNTIME HLSL compile, reached once per unseen (shader_id0,
-        // shader_id1) pair from inside the draw call. It was entirely uninstrumented, which is why
-        // 100-180ms frame spikes with logic at ~5ms had no attributable cause: the cost was
-        // invisible to every existing probe. Measurement said 9-15ms each, arriving in bursts --
-        // eleven inside one tick for a 181ms stall. Now that the cache exists this path only runs
-        // on a genuine miss, so these lines double as the cache's miss log.
+        // A runtime HLSL compile inside the draw call, 9-15ms each and arriving in bursts. It
+        // was uninstrumented, which is why 100-180ms frame spikes had no attributable cause.
+        // With the cache in place this only runs on a genuine miss, so it doubles as a miss log.
         const auto gdxShaderCompileStart = std::chrono::steady_clock::now();
         static int sGdxShaderCompileCount = 0;
         static double sGdxShaderCompileTotalMs = 0.0;
@@ -645,10 +637,9 @@ void GfxRenderingAPIDX11::SelectTexture(int tile, uint32_t texture_id) {
 
 static D3D11_TEXTURE_ADDRESS_MODE gfx_cm_to_d3d11(uint32_t val) {
     if (val & G_TX_CLAMP) {
-        // N64 MIRROR|CLAMP mirrors the coordinate once and then clamps
-        // (D3D11 MIRROR_ONCE), which selects the far edge row for
-        // out-of-range coordinates instead of row/column zero. Track
-        // guardrail strips rely on this to show their edge color.
+        // N64 MIRROR|CLAMP mirrors once and then clamps, which is MIRROR_ONCE, not MIRROR:
+        // out-of-range coordinates must land on the far edge row, not row zero. Track guardrail
+        // strips depend on it for their edge color.
         return (val & G_TX_MIRROR) ? D3D11_TEXTURE_ADDRESS_MIRROR_ONCE : D3D11_TEXTURE_ADDRESS_CLAMP;
     }
     return (val & G_TX_MIRROR) ? D3D11_TEXTURE_ADDRESS_MIRROR : D3D11_TEXTURE_ADDRESS_WRAP;
@@ -769,20 +760,16 @@ void GfxRenderingAPIDX11::SetUseAlpha(bool use_alpha) {
 
 void GfxRenderingAPIDX11::DrawTriangles(float buf_vbo[], size_t buf_vbo_len, size_t buf_vbo_num_tris) {
 
-    // mCurrentZmodeDecal belongs in this key: DepthFunc below is derived from it as
-    // well as from depth test/mask. Without it, a draw that flips only the decal bit
-    // (e.g. ZB_OVL_SURF -> ZB_XLU_SURF, both Z_CMP and neither Z_UPD) skips this block
-    // and keeps a stale DepthFunc, while the rasterizer's SlopeScaledDepthBias below
-    // DOES update -- its guard already tests the decal bit. That split leaves depth
-    // state internally inconsistent. Upstream added the decal term to DepthFunc in
-    // "Fix depth test, preserving behavior for decals (#612)" without extending the key.
+    // mCurrentZmodeDecal has to be in this key because DepthFunc below derives from it. Without
+    // it a draw that flips only the decal bit keeps a stale DepthFunc while the rasterizer's
+    // SlopeScaledDepthBias does update, leaving depth state internally inconsistent. Upstream
+    // added the decal term to DepthFunc in #612 without extending the key.
     if (mLastDepthTest != mCurrentDepthTest || mLastDepthMask != mCurrentDepthMask ||
         mLastZmodeDecal != mCurrentZmodeDecal) {
         mLastDepthTest = mCurrentDepthTest;
         mLastDepthMask = mCurrentDepthMask;
 
-        // Only eight descriptors are reachable, so the cache is warm within the first frames and
-        // every later flip is a hash lookup instead of a CreateDepthStencilState.
+        // Only eight descriptors are reachable, so this is warm within the first few frames.
         const uint8_t depthKey = (uint8_t)((mCurrentDepthTest ? 1u : 0u) | (mCurrentDepthMask ? 2u : 0u) |
                                            (mCurrentZmodeDecal ? 4u : 0u));
         auto depthIt = mDepthStencilCache.find(depthKey);
@@ -809,8 +796,8 @@ void GfxRenderingAPIDX11::DrawTriangles(float buf_vbo[], size_t buf_vbo_len, siz
     if (mLastZmodeDecal != mCurrentZmodeDecal) {
         mLastZmodeDecal = mCurrentZmodeDecal;
 
-        // The CVar read stays outside the cache lookup: it is part of the key, so a mid-run
-        // z-fighting-mode change still produces a fresh state object rather than a stale hit.
+        // Read outside the lookup because it is part of the key: a mid-run z-fighting-mode
+        // change must miss rather than return the state built for the old mode.
         const int zFightingMode =
             Ship::Context::GetInstance()->GetConsoleVariables()->GetInteger(CVAR_Z_FIGHTING_MODE, 0);
         const uint64_t rasterKey = (uint64_t)(mCurrentZmodeDecal ? 1u : 0u) |
@@ -1232,19 +1219,12 @@ void GfxRenderingAPIDX11::ReadFramebufferToCPU(int fb_id, uint32_t width, uint32
         return;
     }
 
-    // Convert RGBA32 → RGBA16 (5551) with a BOX-FILTER AVERAGE downscale from actual texture
-    // dimensions to requested output dimensions, respecting RowPitch for row stride.
-    //
-    // Fade-transition garbled horizontal-dash band: the previous NEAREST-neighbor
-    // resample sampled exactly one of every srcW/width source columns. At a widescreen source
-    // (1920x1080 → 320x240 is 6:1 horizontally) that decimation keeps only every 6th column, so
-    // high-frequency title-screen art is shredded into disconnected vertical/horizontal dashes —
-    // the reported band. Averaging each destination pixel's full source footprint preserves the
-    // coherent image (soft/downsampled but correct). No aspect crop is done here: the transition
-    // redraws the 320x240 capture STRETCHED back across the full widescreen viewport
-    // (decomp ovl_i2/transition.c, G_EX_WIDESCREEN_STRETCH), so the squeeze→stretch round-trips
-    // the geometry and only the filter quality matters. This runs once per screen transition over a
-    // 320x240 destination, so the extra source reads (~27 texels/dest at 6:1) are trivial.
+    // Box-filter average, not nearest-neighbor. Downscaling 1920x1080 to a 320x240 capture is
+    // 6:1 horizontally, and keeping only every 6th column shredded high-frequency title-screen
+    // art into the dash band seen during fade transitions. No aspect crop is needed: the
+    // transition redraws the capture stretched back across the full viewport (decomp
+    // ovl_i2/transition.c, G_EX_WIDESCREEN_STRETCH), so only filter quality matters. Runs once
+    // per screen transition, so the extra source reads are free.
     const uint32_t srcW = srcDesc.Width;
     const uint32_t srcH = srcDesc.Height;
     for (uint32_t j = 0; j < height; j++) {
@@ -1273,17 +1253,14 @@ void GfxRenderingAPIDX11::ReadFramebufferToCPU(int fb_id, uint32_t width, uint32
             const uint32_t avgR = count ? accR / count : 0;
             const uint32_t avgG = count ? accG / count : 0;
             const uint32_t avgB = count ? accB / count : 0;
-            // Same 8→5-bit rounding (+4 bias) the per-pixel path used, now on the averaged channel.
+            // Same 8->5-bit rounding (+4 bias) as the per-pixel path, on the averaged channel.
             uint8_t r = ((avgR + 4) * 0x1F) / 0xFF;
             uint8_t g = ((avgG + 4) * 0x1F) / 0xFF;
             uint8_t b = ((avgB + 4) * 0x1F) / 0xFF;
-            // Coverage bit, not host alpha: an N64 framebuffer's low bit is
-            // coverage, and a captured full frame is fully covered. The host
-            // render target's alpha channel is whatever the combiner last
-            // wrote (frequently 0 for opaque geometry), so deriving the bit
-            // from it zeroed the alpha of most captured pixels — every
-            // alpha-dependent redraw of the capture (screen-transition wipes)
-            // then discarded its texels and drew nothing.
+            // Coverage bit, not host alpha. On N64 the low bit is coverage and a captured full
+            // frame is fully covered; the host render target's alpha is whatever the combiner
+            // last wrote, usually 0 for opaque geometry, which made every alpha-dependent redraw
+            // of the capture discard its texels and draw nothing.
             uint8_t a = 1;
 
             rgba16_buf[i + (j * width)] = (r << 11) | (g << 6) | (b << 1) | a;

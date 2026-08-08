@@ -79,12 +79,9 @@ class GfxRenderingAPI {
     virtual void SetSrgbMode() = 0;
     virtual ImTextureID GetTextureById(int id) = 0;
     virtual void SetCurrentPrimDepth(float depth) = 0;
-    // Real RDP hardware compares texel alpha against the SETBLENDCOLOR alpha
-    // register for G_AC_THRESHOLD (COPY-mode HUD sprite cutouts rely on this:
-    // e.g. F-Zero X sets blend_color.a and expects texel.a >= blend_color.a to
-    // pass). Backends must feed this into the o_alpha_threshold discard test
-    // instead of a fixed magic constant. Called every Flush() alongside
-    // SetCurrentPrimDepth, mirroring that mechanism.
+    // For G_AC_THRESHOLD the RDP compares texel alpha against the SETBLENDCOLOR alpha
+    // register, not a fixed constant; COPY-mode HUD sprite cutouts depend on it. Backends
+    // must route this into the alpha discard test. Pushed every Flush(), like prim depth.
     virtual void SetCurrentAlphaCompareThreshold(float threshold) = 0;
 
   protected:

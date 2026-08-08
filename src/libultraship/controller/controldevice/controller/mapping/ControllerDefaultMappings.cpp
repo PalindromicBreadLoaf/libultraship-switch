@@ -75,8 +75,8 @@ void ControllerDefaultMappings::SetDefaultSDLButtonToButtonMappings(
         { BTN_A, { SDL_CONTROLLER_BUTTON_A } },
         { BTN_B, { SDL_CONTROLLER_BUTTON_B } },
         { BTN_L, { SDL_CONTROLLER_BUTTON_LEFTSHOULDER } },
-        // F-Zero X default: L/R on the bumpers so both are always available for side-attacks,
-        // freeing the triggers for Z (see the axis map below).
+        // R on the bumper, not the trigger: side-attacks need L and R simultaneously available,
+        // which frees both triggers for Z (see the axis map below).
         { BTN_R, { SDL_CONTROLLER_BUTTON_RIGHTSHOULDER } },
         { BTN_START, { SDL_CONTROLLER_BUTTON_START } },
         { BTN_DUP, { SDL_CONTROLLER_BUTTON_DPAD_UP } },
@@ -96,9 +96,8 @@ void ControllerDefaultMappings::SetDefaultSDLAxisDirectionToButtonMappings(
     }
 
     Ship::ControllerDefaultMappings::SetDefaultSDLAxisDirectionToButtonMappings({
-        // F-Zero X gamepad default (owner request): Z on BOTH triggers (so R2/RT is Z, and L2/LT
-        // is Z too for comfort), and the C-buttons on the RIGHT analog stick. L/R live on the
-        // bumpers (see the button map above). Everything remains remappable in the Input Editor.
+        // Z on both triggers: L/R moved to the bumpers above, and boost is comfortable on either
+        // hand. Remappable in the Input Editor.
         { BTN_Z, { { SDL_CONTROLLER_AXIS_TRIGGERRIGHT, 1 }, { SDL_CONTROLLER_AXIS_TRIGGERLEFT, 1 } } },
         { BTN_CUP, { { SDL_CONTROLLER_AXIS_RIGHTY, -1 } } },
         { BTN_CDOWN, { { SDL_CONTROLLER_AXIS_RIGHTY, 1 } } },

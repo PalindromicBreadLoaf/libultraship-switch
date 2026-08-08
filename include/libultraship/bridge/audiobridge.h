@@ -16,13 +16,11 @@ API_EXPORT int32_t AudioPlayerBuffered();
 API_EXPORT int32_t AudioPlayerGetDesiredBuffered();
 
 /**
- * @brief Returns a short, stable name for the active audio backend.
+ * @brief Returns a short, stable name for the active audio backend ("SDL", "WASAPI",
+ * "CoreAudio", "Null"), or "None" when no player exists yet.
  *
- * Reflects the concrete AudioPlayer subclass currently in use ("SDL", "WASAPI",
- * "CoreAudio", "Null"). Returns "None" when no player exists yet. Use this instead of
- * SDL_GetCurrentAudioDriver() for status reporting: the latter returns "none" whenever a
- * non-SDL backend (e.g. WASAPI on Windows) is active, which is misleading. The returned
- * pointer is a static string literal owned by the backend and needs no freeing.
+ * Prefer this over SDL_GetCurrentAudioDriver() for status reporting: that reports "none"
+ * whenever a non-SDL backend is active. The pointer is a static literal; do not free it.
  */
 API_EXPORT const char* AudioPlayerBackendName();
 

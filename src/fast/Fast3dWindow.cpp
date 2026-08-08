@@ -195,36 +195,26 @@ bool Fast3dWindow::IsFrameReady() {
    the port always defines it. Called once per sub-frame render, before any blit or present. */
 extern "C" void gdx_gfx_post_run_capture(void);
 
-/* [GDX] Sub-frame present bypass.
+/* Sub-frame present bypass.
  *
- * The DXGI software limiter (gfx_dxgi.cpp IsFrameReady) is a rate limiter for a loop that presents
- * ONCE and then waits. Frame interpolation presents M sub-frames back-to-back per 60 Hz tick and
- * asks permission for each, which the limiter cannot express: `last_end` is "when the queued
- * presents retire", so each accepted present pushes it forward by one interval while each call
- * advances `desired` by one interval. Inside a burst the two move in LOCKSTEP, the decision sits on
- * the boundary, and noise grants roughly every other present. Measured: 51.8% accepted over 2100
- * calls at 144 calls/s -> ~75 presents/s, with refusal deltas clustered at -0.049, -0.097, +0.139 ms.
- * That ratio held regardless of VSync, of wall-clock spacing between passes, and of the vsync
- * interval estimate, which is why fixing each of those in turn changed nothing.
+ * The DXGI software limiter (gfx_dxgi.cpp IsFrameReady) paces a loop that presents once and then
+ * waits. Interpolation presents M sub-frames back to back and asks permission for each, which the
+ * limiter cannot express: inside a burst `last_end` and `desired` advance in lockstep, the
+ * decision sits on the boundary and noise grants roughly every other present (measured 51.8%,
+ * independent of VSync, pass spacing and the vsync interval estimate).
  *
- * The swapchain already provides the correct pacing: SwapBuffersEnd blocks on
- * WaitForSingleObject(mWaitableObject), which returns only when the swapchain can accept another
- * frame. That self-paces to the display without a software rate limiter second-guessing it.
- *
- * IsFrameReady is still CALLED while bypassed -- it advances the limiter's internal schedule and
- * maintains the present-statistics maps, so skipping it outright would leave that state stale for
- * the stock single-present path. Only its verdict is overridden, and only while the interpolation
- * loop is driving. */
+ * The swapchain already paces correctly -- SwapBuffersEnd blocks until it can accept another
+ * frame -- so only the limiter's verdict is overridden, and only while the interpolation loop is
+ * driving. IsFrameReady is still called: it advances the internal schedule and the present
+ * statistics that the stock single-present path depends on. */
 static bool gGdxSubframePresent = false;
 
 extern "C" void gdx_fast3d_set_subframe_present(int on) {
     gGdxSubframePresent = (on != 0);
 }
 
-// Sub-phase seams owned by the port (port/gdx_perf.h). Declared locally rather than including that
-// header, which lives outside libultraship — the same minimal-include idiom gdx_gfx_post_run_capture
-// above uses. Both are a cached-bool early return when GDX_PERF is off, so this costs nothing in a
-// normal run. The enum values must match GdxPerfSub; they are asserted against it in gdx_perf.cpp.
+// Declared rather than included: port/gdx_perf.h lives outside libultraship. The values must
+// match GdxPerfSub, and gdx_perf.cpp static-asserts that they do.
 extern "C" void gdx_perf_sub_begin(int id);
 extern "C" void gdx_perf_sub_end(int id);
 #define GDX_PERF_SUB_GUI_ID 3
@@ -256,13 +246,10 @@ bool Fast3dWindow::DrawAndRunGraphicsCommands(Gfx* commands, const std::unordere
     gdx_perf_sub_begin(GDX_PERF_SUB_IRUN_ID);
     mInterpreter->Run(commands, mtxReplacements);
     gdx_perf_sub_end(GDX_PERF_SUB_IRUN_ID);
-    // [interp-shot] The ONLY sound point to capture a sub-frame's rendered image. The swap chain is
-    // DXGI_SWAP_EFFECT_FLIP_DISCARD with BufferCount 3 (gfx_dxgi.cpp:1276-1284), so once EndFrame
-    // below presents, the back buffer's contents are explicitly UNDEFINED -- capturing after
-    // DrawAndRunGraphicsCommands returns compares buffers D3D was free to discard, which is exactly
-    // how an earlier attempt "measured" a 44% difference between two passes that were fed identical
-    // matrices. Here the game image still exists and nothing has been presented or blitted.
-    // No-op unless the port armed it; see gdx_gfx_post_run_capture in port/n64_gfx_bridge.cpp.
+    // The only sound point to capture a sub-frame's image. The swap chain is FLIP_DISCARD, so
+    // once EndFrame below presents, the back buffer contents are undefined -- capturing after
+    // DrawAndRunGraphicsCommands returns compares buffers D3D was free to discard, which once
+    // "measured" a 44% difference between two passes fed identical matrices.
     gdx_gfx_post_run_capture();
     // Renders the game frame buffer to the final window and finishes the GUI
     gdx_perf_sub_begin(GDX_PERF_SUB_GUI_ID);
@@ -402,11 +389,9 @@ const char* Fast3dWindow::GetKeyName(int32_t scancode) {
     return mWindowManagerApi->GetKeyName(scancode);
 }
 
-// These handlers are driven by the window backend's message pump, which ALSO runs
-// synchronously inside DestroyWindow during ~Fast3dWindow — i.e. while ~Context is
-// tearing the singleton down and Context::GetInstance() returns an empty shared_ptr.
-// Every handler must therefore tolerate a dead singleton (this was the Windows exit
-// crash: a queued key/mouse message during DestroyWindow dereferenced null->GetControlDeck()).
+// The window backend's message pump also runs synchronously inside DestroyWindow during
+// ~Fast3dWindow, when Context::GetInstance() is already empty, so every handler below must
+// tolerate a dead singleton. A queued key/mouse message there was the Windows exit crash.
 bool Fast3dWindow::KeyUp(int32_t scancode) {
     auto ctx = Ship::Context::GetInstance();
     if (ctx == nullptr) {

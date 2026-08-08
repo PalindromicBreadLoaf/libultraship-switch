@@ -288,23 +288,13 @@ static uint64_t previous_time;
 static HANDLE mTimer;
 #endif
 
-// Vsync-paced skip state: true when vsync is enabled and mTargetFps is within
-// tolerance of the display's detected refresh rate, meaning SDL_GL_SwapWindow in
-// SwapBuffersBegin already blocks on the hardware refresh. In that case
-// SyncFramerateWithTime's software wall-clock deadline wait would be a second,
-// independently-clocked pacer beating against the first (missed/duplicated vsync
-// slots -> judder/shimmer on high-frequency detail). Computed once per frame in
-// SwapBuffersBegin (which has member access to mWnd/mVsyncEnabled/mTargetFps) and
-// consumed by SyncFramerateWithTime (const, so it cannot recompute it itself).
+// True when SDL_GL_SwapWindow already blocks on the hardware refresh, so the software deadline
+// wait in SyncFramerateWithTime must be skipped rather than beat against it. File-scope because
+// SwapBuffersBegin has the member access to compute it and SyncFramerateWithTime is const.
 static bool sVsyncPaced = false;
-// Detected-refresh cache: SDL_GetCurrentDisplayMode is re-queried when the
-// window's display index changes, or at least once per second (a same-display
-// Hz change -- e.g. the user edits the OS refresh-rate setting, or a VRR
-// display renegotiates -- never moves the display index, so that check alone
-// cannot catch it). sLastRefreshRequeryTime100ns is compared against
-// previous_time, the frame timestamp SyncFramerateWithTime already computes
-// for the wall-clock pacer, so this costs a cheap subtract/compare and no
-// extra syscall beyond the periodic SDL_GetCurrentDisplayMode call itself.
+// Re-queried on a display-index change, and unconditionally once a second: a same-display Hz
+// change (OS refresh setting, VRR renegotiation) never moves the index. The timestamp reuses
+// previous_time from the wall-clock pacer, so the check itself costs no extra syscall.
 static int sCachedDisplayIndex = -1;
 static double sCachedRefreshHz = 0.0;
 static uint64_t sLastRefreshRequeryTime100ns = 0;
@@ -657,11 +647,9 @@ void GfxWindowBackendSDL2::HandleSingleEvent(SDL_Event& event) {
             mMouseWheelX = event.wheel.x;
             mMouseWheelY = event.wheel.y;
             break;
-        // Touchscreen -> ImGui: ImGui's SDL2 backend does not translate SDL_FINGER events, and SDL's
-        // touch->mouse synthesis is unreliable under Wayland (ROG Ally). Feed the primary finger to
-        // ImGui as a left-mouse pointer directly so taps/drags drive the menu. tfinger coordinates
-        // are normalized [0,1]; scale by the drawable size ImGui uses for io.DisplaySize. Only the
-        // first active finger acts as the pointer (menus are single-touch); extra fingers are ignored.
+        // ImGui's SDL2 backend does not translate SDL_FINGER events, and SDL's touch->mouse
+        // synthesis is unreliable under Wayland, so feed the primary finger in as a left-mouse
+        // pointer. tfinger coordinates are normalized, hence the scale by drawable size.
         case SDL_FINGERDOWN:
         case SDL_FINGERUP:
         case SDL_FINGERMOTION: {
@@ -785,11 +773,9 @@ void GfxWindowBackendSDL2::SyncFramerateWithTime() const {
             t = next;
         }
     }
-    // On the skip path, t is still the sample taken at function entry -- keeping
-    // previous_time near-now here (instead of leaving it stale) means that if the
-    // target fps later drifts away from the refresh rate and the software wait
-    // re-engages, it resumes from a sane deadline instead of producing a catch-up
-    // burst.
+    // On the skip path t is still the entry sample. Keeping previous_time near-now rather than
+    // stale means the software wait resumes from a sane deadline, instead of a catch-up burst,
+    // if the target fps later drifts off the refresh rate.
     previous_time = t;
 }
 
@@ -802,11 +788,9 @@ void GfxWindowBackendSDL2::SwapBuffersBegin() {
         SDL_RenderSetVSync(mRenderer, mVsyncEnabled ? 1 : 0);
     }
 
-    // Vsync-paced skip decision: when vsync is enabled and mTargetFps is within
-    // tolerance of the display's detected refresh rate, SDL_GL_SwapWindow below
-    // already blocks on the hardware refresh, so SyncFramerateWithTime's software
-    // wall-clock deadline wait is skipped (see sVsyncPaced above). Tolerance absorbs
-    // NTSC/VRR drift (59.94 vs 60, 143.86 vs 144): max(1.0 Hz, 1.5% of refresh).
+    // Two independently-clocked pacers beat against each other (judder, shimmer on
+    // high-frequency detail), so when SDL_GL_SwapWindow below is already blocking on the
+    // hardware refresh the software wait stands down. The tolerance absorbs NTSC/VRR drift.
     {
         int displayIndex = SDL_GetWindowDisplayIndex(mWnd);
         const bool displayChanged = displayIndex != sCachedDisplayIndex;

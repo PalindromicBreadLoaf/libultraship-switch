@@ -53,12 +53,9 @@ endif()
 #=================== STB ===================
 set(STB_DIR ${CMAKE_BINARY_DIR}/_deps/stb)
 
-# Unlike FetchContent, file(DOWNLOAD) does not fail the configure step when the transfer
-# fails -- it leaves whatever it managed to write (often a zero-byte file) on the include
-# path and carries on.  Compilation then dies much later with "stbi_load was not declared",
-# nowhere near the actual cause.  EXPECTED_HASH turns a bad transfer into a configure-time
-# error, and doubles as a cache check: CMake skips the download entirely when the file on
-# disk already matches, so this stops re-fetching on every configure.
+# file(DOWNLOAD) does not fail configure on a bad transfer; it leaves a truncated file on the
+# include path and compilation dies later with "stbi_load was not declared". EXPECTED_HASH turns
+# that into a configure error, and doubles as a cache check so configure stops re-fetching.
 set(STB_IMAGE_SHA256 c54b15a689e6a1f32c75e2ec23afa442e3e0e37e894b73c1974d08679b20dd5c)
 file(DOWNLOAD
     "https://github.com/nothings/stb/raw/0bc88af4de5fb022db643c2d8e549a0927749354/stb_image.h"

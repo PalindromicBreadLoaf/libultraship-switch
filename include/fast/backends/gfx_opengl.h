@@ -38,13 +38,10 @@ struct ShaderProgram {
     GLint noiseScaleLocation;
     GLint prim_depth_location;
     GLint alpha_compare_threshold_location;
-    /* Per-element locations for the texture_* array uniforms. GLSL compilers trim an
-       array uniform to its ACTIVE size: when a material's second texel is dead-stripped
-       (e.g. F-Zero X world materials whose combiner never reads texVal1), texture_width[2]
-       shrinks to one active element and a glUniform1iv(location, 2, ...) covering both
-       elements is rejected wholesale — element 0 silently stays 0, filter3point divides
-       by that zero size, and every sample goes NaN/black. Setting each element through
-       its own location survives trimming (inactive elements report -1 and are ignored). */
+    /* Per-element locations, not one location per array. GLSL compilers trim an array uniform
+       to its active size, so when a material's second texel is dead-stripped a two-element
+       glUniform1iv is rejected wholesale: element 0 stays 0, filter3point divides by that zero
+       size and every sample goes NaN/black. Inactive elements report -1 and are ignored. */
     GLint texture_width_locations[2];
     GLint texture_height_locations[2];
     GLint texture_filtering_locations[2];
@@ -149,10 +146,9 @@ class GfxRenderingAPIOGL final : public GfxRenderingAPI {
     GLuint mPixelDepthFb = 0;
     size_t mPixelDepthRbSize = 0;
 
-    // Survives across runs, unlike mShaderProgramPool: holds linked program binaries so a variant
-    // seen on a previous launch skips prism template expansion, glCompileShader and glLinkProgram.
-    // Sidecar only -- GL program binaries are specific to the vendor, GPU and driver version, so
-    // unlike D3D11's DXBC there is nothing here that could be shipped to another machine.
+    // Survives across runs, unlike mShaderProgramPool: a variant seen on a previous launch skips
+    // template expansion, glCompileShader and glLinkProgram. Sidecar only -- GL program binaries
+    // are specific to the vendor, GPU and driver version, so nothing here can be shipped.
     ShaderBlobCache mShaderCache;
 };
 

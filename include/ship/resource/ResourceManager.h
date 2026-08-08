@@ -280,10 +280,11 @@ class ResourceManager {
     void DirtyResources(const ResourceFilter& filter);
 
     /**
-     * @brief Blocks until every queued async resource task (loads, dirties, unloads) has
-     * finished. Callers that mutate the ArchiveManager (adding/removing archives at runtime)
-     * must quiesce the pool first: the async tasks iterate the archive manager's virtual file
-     * system, and mutating it under them is a use-after-free.
+     * @brief Blocks until every queued async resource task has finished.
+     *
+     * Callers that mount or unmount archives at runtime must quiesce the pool first: the
+     * async tasks iterate the archive manager's virtual file system, and mutating it under
+     * them is a use-after-free.
      */
     void WaitForAsyncTasks();
 

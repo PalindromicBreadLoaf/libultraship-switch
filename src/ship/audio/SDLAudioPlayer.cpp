@@ -54,15 +54,10 @@ int SDLAudioPlayer::Buffered() {
 }
 
 void SDLAudioPlayer::DoPlay(const uint8_t* buf, size_t len) {
-    // Backpressure: drop this submission once the device queue is already well past the
-    // configured target (GetDesiredBuffered() -- 4096 frames with the dedicated audio thread
-    // active, port/gdx_audio_thread.cpp; the struct default of 2480 otherwise). This was a hard,
-    // config-independent 6000-frame constant, which is harmless at a 2480 target but leaves barely
-    // 1900 frames of margin at 4096 -- and an over-full queue silently drops submissions. The
-    // margin below covers one extra production batch on top of the target so a producer slightly
-    // ahead of schedule isn't punished: one tick's batch is a few hundred frames (SAMPLES_HIGH in
-    // decomp/src/audio/disk/lib/thread.c's audioBufferParameters), so 1024 covers both the legacy
-    // fiber path's per-VI-tick batch and the dedicated thread's catch-up loop.
+    // Backpressure relative to the configured target, not the old fixed 6000-frame ceiling:
+    // that left barely 1900 frames of headroom once the dedicated audio thread raised
+    // DesiredBuffered to 4096, and an over-full queue drops submissions silently. The 1024
+    // margin is one production batch, so a producer slightly ahead of schedule is not punished.
     static const int32_t kBacklogMargin = 1024;
     if (Buffered() < GetDesiredBuffered() + kBacklogMargin) {
         SDL_QueueAudio(mDevice, buf, len);

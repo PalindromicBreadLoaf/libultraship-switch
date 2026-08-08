@@ -166,13 +166,11 @@
         return @{texture}(tex, uv);
     }
 
-    // Tile size comes from the bound texture itself (textureSize), matching the D3D11
-    // shader's GetDimensions(): the texture_width/height uniforms are CPU-supplied and a
-    // stale/zero element collapses the CLAMP bound below (0.5 / 0 -> Inf clamps every
-    // sample to one edge texel -> solid-black primitives; seen on Linux race backgrounds
-    // while D3D11 rendered the same scene correctly). The max(..., 1.0) floor guards the
-    // undefined size of an incomplete texture. The texture_width/height uniforms above
-    // stay declared; drivers trim the now-unused ones and the CPU setters no-op on -1.
+    // Size comes from the bound texture, like the D3D11 shader's GetDimensions(). The
+    // CPU-supplied texture_width/height uniforms can be stale or zero, and a zero collapses
+    // the CLAMP bound below (0.5 / 0 -> Inf), clamping every sample to one edge texel: solid
+    // black primitives on GL while D3D11 drew the same scene correctly. max(.., 1.0) covers
+    // an incomplete texture's undefined size.
 
     void main() {
         @for(i in 0..2)
@@ -216,22 +214,11 @@
             @end
         @end
 
-        // texel has to start out defined: the cycle-0 formula appended below is allowed to read it
-        // before anything has written it. shader_item_to_str emits "texel", "texel.rgb" and
-        // "texel.a" for SHADER_COMBINED without ever consulting first_cycle (gfx_opengl.cpp:144-145
-        // and :172-173), and Interpreter::GenerateCC maps mux slot value 0 (G_CCMUX_COMBINED,
-        // G_ACMUX_COMBINED) to SHADER_COMBINED for cycle 0 with no guard (interpreter.cpp:435-437,
-        // :476). The engine produces exactly that shape on its own: the COPY-mode texrect and
-        // FILL-rect fallbacks pass a literal 0 for the a/b/c slots (interpreter.cpp:4986, :5150),
-        // and raw mux 0 means COMBINED rather than the constant zero, so cycle 0 comes out as
-        // "texel = (texel - texel) * texel + texVal0". FXC rejects that read outright, which is why
-        // the D3D11 shader carries the same initializer (default.shader.hlsl:265-269) and resolves
-        // the expression to a clean (0 - 0) * 0 + d. GLSL compilers accept it silently and hand
-        // back whatever the register happened to hold, which varies with driver register allocation
-        // and with the previously shaded fragment; a NaN or Inf in there poisons the whole formula.
-        // Those two fallbacks are how menu and HUD rectangles reach the combiner, which is where
-        // the two backends visibly disagreed. The value itself is arbitrary - no RDP behavior is
-        // being modelled here - it is pinned to the D3D11 constant so both backends start level.
+        // Keep the initializer: the cycle-0 formula appended below may read texel before writing
+        // it. Mux slot 0 is G_CCMUX_COMBINED, so the COPY-mode texrect and FILL-rect fallbacks
+        // emit "texel = (texel - texel) * texel + texVal0". FXC rejects that read; GLSL accepts
+        // it and returns whatever the register held, so a stray NaN poisons the formula. The
+        // value is arbitrary and matches the D3D11 shader so both backends start level.
         @if(o_alpha) 
             vec4 texel = vec4(0.0, 0.0, 0.0, 1.0);
         @else 

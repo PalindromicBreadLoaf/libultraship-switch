@@ -11,38 +11,24 @@ namespace Fast {
 /*
  * Persistent store for backend-compiled shader payloads, keyed by the Fast3D combiner variant.
  *
- * WHY THIS EXISTS. Both backends build a shader from source the first time an unseen
- * (shader_id0, shader_id1) pair is drawn, synchronously, from inside the draw call. Measured on
- * F-Zero X the D3D11 runtime HLSL compile costs 9-15ms per variant, and variants arrive in
- * bursts as a venue introduces new materials: eleven compiles landed inside a single tick and
- * produced a 181ms stall -- 5.5fps instantaneous -- with game logic at 9ms. Across a whole
- * session it is 37 variants and 410ms, then nothing: a pure warm-up cost. Paying it once per
- * install instead of once per launch removes the stalls without touching the frame pacer.
+ * Both backends compile an unseen (shader_id0, shader_id1) pair synchronously from inside the
+ * draw call. On D3D11 that is 9-15ms per variant, and they arrive in bursts: eleven inside one
+ * tick produced a 181ms stall. The variant set is finite (~37 a session), so this turns a
+ * per-launch warm-up cost into a per-install one.
  *
- * WHAT IS STORED. An opaque per-variant payload the backend serializes for itself: DXBC vertex
- * and pixel bytecode on D3D11, a linked program binary on OpenGL. This class never interprets
- * it. Everything else a ShaderProgram needs (input layout, blend state, attribute and uniform
- * locations) is derived from cc_features or queried from the linked program, so it does not
- * need storing -- with one exception per backend, numFloats, which is a side effect of source
- * generation rather than a function of cc_features and therefore has to ride along inside the
- * payload.
+ * The payload is opaque here -- DXBC blobs on D3D11, a linked program binary on OpenGL.
+ * Everything else a ShaderProgram needs derives from cc_features; numFloats is the exception,
+ * since it falls out of source generation and a cache hit skips that, so it rides in the payload.
  *
- * WHY A FINGERPRINT. A stored blob is only valid for the exact source text its generator would
- * emit today. Edit an emitter or a .glsl template and every stored blob becomes silently wrong:
- * wrong pixels, or a driver rejecting the binary, on a user's machine, with nothing pointing
- * back here. GDX_SHADER_CACHE_FINGERPRINT is a configure-time hash of those generator inputs
- * (see libultraship/src/fast/CMakeLists.txt), so a mismatched store is discarded automatically.
- * A build that did not receive one refuses to use the cache at all rather than guess.
+ * A blob is only valid for the source its generator emits today, so every store carries
+ * GDX_SHADER_CACHE_FINGERPRINT (see src/fast/CMakeLists.txt) and a mismatch discards the file.
+ * A build without a fingerprint refuses to cache at all rather than guess.
  *
- * TWO SOURCES, ONE FORMAT. Entries come from a read-only seed shipped inside the port archive
- * and from a writable sidecar next to the executable. The seed makes a fresh install clean on
- * its very first run; the sidecar covers whatever the seed missed and is the only mechanism
- * available on OpenGL, whose program binaries are specific to the vendor, GPU and driver version
- * and therefore cannot be shipped to anyone. A miss on both is not an error -- it compiles as it
- * always did and records the result.
+ * Entries come from a read-only seed in the port archive and a writable sidecar next to the
+ * executable. GL program binaries are vendor/GPU/driver specific, so only the sidecar can work
+ * there. A miss on both is not an error.
  *
- * THREADING. Touched only from the render thread (Init and the CreateAndLoadNewShader miss
- * path), so there is no lock. Do not call it from anywhere else without adding one.
+ * Render thread only (Init and the CreateAndLoadNewShader miss path); there is no lock.
  */
 
 /** @brief Backend tag written into the store header; a mismatch rejects the whole file. */
@@ -123,9 +109,7 @@ class ShaderBlobCache {
     bool mEnabled = false;
     bool mSidecarWritable = false;
 
-    // Reported in the one-line boot summary. A run's hit/miss split needs no separate counter:
-    // every miss prints a [shader-compile] line, so "entries held at boot, and no compile lines
-    // afterwards" is the whole story a bug report needs.
+    // Boot summary only. Hit/miss needs no counter: every miss already prints a compile line.
     size_t mSeedEntries = 0;
     size_t mSidecarEntries = 0;
 };
@@ -133,9 +117,8 @@ class ShaderBlobCache {
 /**
  * @brief True unless the user turned the cache off.
  *
- * Reads the persisted CVar and lets GDX_SHADER_CACHE override it for a single run, matching the
- * Bucket-D gate convention the port uses elsewhere (see port/port_log.h). Exposed so a backend
- * can skip Init entirely rather than construct a disabled store.
+ * Persisted CVar, with GDX_SHADER_CACHE overriding it for a single run (the same gate convention
+ * as port/port_log.h). Exposed so a backend can skip Init rather than build a disabled store.
  */
 bool ShaderCacheUserEnabled();
 

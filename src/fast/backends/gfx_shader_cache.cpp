@@ -29,10 +29,9 @@ namespace Fast {
  *   20   4     payload size
  *   24   ..    payload
  *
- * Append-only is deliberate. Each compile is durable the instant it happens, so a crash mid-
- * session still leaves the session's work behind, and there is no shutdown hook to forget to
- * call. A torn final entry (power loss during the write) is detected by the length check in
- * ParseImage and silently dropped -- the variant simply recompiles once more.
+ * Append-only so each compile is durable the instant it happens: no shutdown hook to forget,
+ * and a crash keeps the session's work. ParseImage's length check drops a torn final entry, at
+ * the cost of recompiling that one variant.
  */
 static const uint8_t kMagic[8] = { 'G', 'D', 'X', 'S', 'H', 'C', 0x00, 0x01 };
 static constexpr size_t kHeaderSize = 24;
@@ -42,9 +41,8 @@ static constexpr size_t kEntryHeaderSize = 24;
 static constexpr uint32_t kMaxPayloadSize = 4u * 1024u * 1024u;
 
 #ifndef GDX_SHADER_CACHE_FINGERPRINT
-// No configure-time hash reached this translation unit. Treated as "refuse to cache" rather
-// than "cache with an unknown fingerprint": a wrong blob is far more expensive to diagnose
-// than a compile we already know how to pay for. Init() says so in the log.
+// No configure-time hash reached this translation unit. Refuse to cache rather than cache
+// under an unknown fingerprint: a wrong blob costs far more to diagnose than a recompile.
 #define GDX_SHADER_CACHE_FINGERPRINT 0ull
 #endif
 
@@ -62,7 +60,7 @@ static uint64_t ReadU64(const uint8_t* p) {
 
 bool ShaderCacheUserEnabled() {
     // Env wins for a single run and is never written back; the CVar is the persisted preference.
-    // Same precedence the port's Bucket-D logging gates use, so one mental model covers both.
+    // Same precedence as the port's logging gates.
     const char* env = getenv("GDX_SHADER_CACHE");
     if (env != nullptr && env[0] != '\0') {
         return strcmp(env, "0") != 0;
@@ -102,9 +100,8 @@ size_t ShaderBlobCache::ParseImage(const uint8_t* data, size_t size, bool fromSe
         }
 
         const uint8_t* payload = data + off + kEntryHeaderSize;
-        // emplace, not insert_or_assign: if the seed and the sidecar both carry a variant they
-        // hold the same bytes, and the seed was read first, so the first writer wins and no
-        // work is redone.
+        // emplace, not insert_or_assign: seed and sidecar copies of a variant hold the same
+        // bytes, and the seed was read first, so first-writer-wins costs nothing.
         mEntries.emplace(Key{ id0, id1, flags }, std::vector<uint8_t>(payload, payload + payloadSize));
 
         ++accepted;
@@ -122,7 +119,6 @@ size_t ShaderBlobCache::ParseImage(const uint8_t* data, size_t size, bool fromSe
 void ShaderBlobCache::OpenSidecar(const std::string& path) {
     mSidecarPath = path;
 
-    // Read whatever is already there before deciding whether to keep or replace it.
     std::vector<uint8_t> image;
     bool headerOk = false;
     if (FILE* rf = fopen(path.c_str(), "rb")) {
@@ -144,8 +140,7 @@ void ShaderBlobCache::OpenSidecar(const std::string& path) {
         mSidecarHandle = fopen(path.c_str(), "ab");
     } else {
         // Absent, empty, or written by a build whose shader generators have since changed.
-        // Truncate and re-header: keeping stale blobs around to be skipped forever would just
-        // grow a file nothing can read.
+        // Truncate and re-header rather than grow a file nothing can read.
         FILE* wf = fopen(path.c_str(), "wb");
         if (wf != nullptr) {
             uint8_t header[kHeaderSize];
@@ -164,9 +159,8 @@ void ShaderBlobCache::OpenSidecar(const std::string& path) {
 
     mSidecarWritable = mSidecarHandle != nullptr;
     if (!mSidecarWritable) {
-        // Packaged installs can put the program directory on read-only media. Not fatal: the
-        // shipped seed still works, and the session behaves exactly as it did before the cache
-        // existed. Say so once so a bug report explains itself.
+        // Packaged installs can put the program directory on read-only media. Not fatal -- the
+        // shipped seed still works and the run behaves as it did before the cache existed.
         SPDLOG_WARN("[shader-cache] sidecar not writable at '{}'; cache is read-only this run", path);
     }
 }
@@ -190,10 +184,8 @@ void ShaderBlobCache::Init(uint32_t backendTag, uint64_t backendFingerprint, con
         return;
     }
     if (!ShaderCacheUserEnabled()) {
-        // WARN, not INFO, and the same for the ready line below. Release builds initialise the
-        // logger at spdlog::level::warn (Context.h InitLogging default, taken by port/main.cpp),
-        // so SPDLOG_INFO is discarded entirely -- a whole log family that looks instrumented and
-        // emits nothing. Verified against a real run: zero [info] lines in logs/G-Diffuser.log.
+        // WARN, not INFO, here and on the ready line below: Release builds initialise the logger
+        // at spdlog::level::warn (Context.h InitLogging default), so INFO is discarded entirely.
         SPDLOG_WARN("[shader-cache] disabled by gDevTools.ShaderCache / GDX_SHADER_CACHE");
         return;
     }
@@ -202,8 +194,8 @@ void ShaderBlobCache::Init(uint32_t backendTag, uint64_t backendFingerprint, con
     mFingerprint = buildFingerprint ^ backendFingerprint;
     mEnabled = true;
 
-    // Seed first: it is read-only and authoritative for a fresh install, and reading it before
-    // the sidecar is what makes the emplace-wins-first rule above pick the shipped copy.
+    // Seed before sidecar: it is read-only and authoritative, and the emplace-wins-first rule
+    // above depends on this order.
     if (seedResourcePath != nullptr) {
         try {
             auto file = Ship::Context::GetInstance()->GetResourceManager()->LoadFileProcess(
@@ -215,9 +207,8 @@ void ShaderBlobCache::Init(uint32_t backendTag, uint64_t backendFingerprint, con
                 const uint8_t* base = (const uint8_t*)file->Buffer->data() + file->BufferOffset;
                 const size_t n = ParseImage(base, usable, true);
                 if (n == 0 && usable >= kHeaderSize) {
-                    // Present but unusable: almost always a seed recorded before someone edited
-                    // a shader generator. Worth naming, because the symptom is otherwise just
-                    // "the first run still stutters".
+                    // Present but unusable: almost always a seed recorded before a shader
+                    // generator was edited. Worth naming; the symptom is only "first run stutters".
                     SPDLOG_WARN("[shader-cache] seed '{}' rejected (fingerprint or backend mismatch)",
                                 seedResourcePath);
                 }
@@ -273,8 +264,8 @@ void ShaderBlobCache::Store(uint64_t shaderId0, uint64_t shaderId1, uint32_t fla
     const bool wroteHeader = fwrite(header, 1, sizeof(header), f) == sizeof(header);
     const bool wrotePayload = wroteHeader && fwrite(bytes, 1, size, f) == size;
     if (wrotePayload) {
-        // Flush per entry rather than at exit: compiles are rare (tens per install) and a
-        // half-written store is worth less than the microseconds this costs.
+        // Flush per entry, not at exit: compiles are rare (tens per install), and there is no
+        // shutdown hook that could be trusted to run.
         fflush(f);
     } else {
         SPDLOG_WARN("[shader-cache] append failed for id0={:016X} id1={:016X}; disabling writes",

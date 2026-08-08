@@ -139,9 +139,9 @@ void CrashHandler::PrintRegisters(ucontext_t* ctx) {
 }
 
 static void ErrorHandler(int sig, siginfo_t* sigInfo, void* data) {
-    // A signal during ~Context finds GetInstance() empty; dereferencing it here nested a
-    // second fault inside the handler. With no live handler, fall straight through to the
-    // default disposition so the kernel still produces a core.
+    // Context may already be gone when the signal lands; dereferencing an empty GetInstance()
+    // nests a second fault inside the handler. Fall through to the default disposition so the
+    // kernel still produces a core.
     auto instance = Context::GetInstance();
     std::shared_ptr<CrashHandler> crashHandler = (instance != nullptr) ? instance->GetCrashHandler() : nullptr;
     if (crashHandler == nullptr) {
@@ -210,11 +210,9 @@ static void ErrorHandler(int sig, siginfo_t* sigInfo, void* data) {
         instance->GetLogger()->flush();
     }
     spdlog::shutdown();
-    // Re-raise with the default disposition instead of exit(1): exit() discards the
-    // kernel/systemd-coredump capture, and the in-process backtrace above is
-    // unreliable on fiber stacks — several crashes were undiagnosable because the
-    // only artifact was this handler's truncated trace. Restoring the default
-    // handler and re-raising preserves the log AND produces a real core.
+    // Not exit(1): that discards the kernel/systemd-coredump capture, and the in-process
+    // backtrace above is unreliable on fiber stacks. Re-raising keeps the log and still
+    // produces a real core.
     signal(sig, SIG_DFL);
     raise(sig);
 }
@@ -413,9 +411,8 @@ void CrashHandler::PrintStack(CONTEXT* ctx) {
 }
 
 extern "C" LONG WINAPI seh_filter(PEXCEPTION_POINTERS ex) {
-    // Record the raw fault before touching Context or any shared_ptr: if the
-    // crash corrupted the heap, the fancy path below can itself fault and the
-    // original address is lost (observed as _Incref on the CrashHandler ptr).
+    // Record the raw fault before touching Context or any shared_ptr: heap corruption makes
+    // the path below fault too, losing the original address (seen as _Incref on the handler).
     {
         HMODULE mainModule = GetModuleHandleA(nullptr);
         const uintptr_t pc = ex->ContextRecord != nullptr ? ex->ContextRecord->Rip : 0;
@@ -436,10 +433,8 @@ extern "C" LONG WINAPI seh_filter(PEXCEPTION_POINTERS ex) {
     }
 
     char exceptionString[20];
-    // The crash may fire during ~Context (e.g. a message pumped by DestroyWindow), when
-    // GetInstance() returns an empty shared_ptr — dereferencing it here turned every
-    // teardown fault into a nested crash-in-crash. Degrade to the raw stderr/file line
-    // already written above instead.
+    // Same dead-singleton case as ErrorHandler: a fault during ~Context (e.g. a message pumped
+    // by DestroyWindow) leaves only the raw line written above.
     auto ctx = Context::GetInstance();
     std::shared_ptr<CrashHandler> crashHandler = (ctx != nullptr) ? ctx->GetCrashHandler() : nullptr;
     if (crashHandler == nullptr) {

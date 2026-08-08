@@ -195,20 +195,13 @@ struct TextureCacheKey {
     uint8_t masks;
     uint8_t maskt;
     bool force_opaque_alpha = false;
-    // Content hash of the tile's emulated-TMEM span for TMEM-decoded textures.
-    // The same source address can coexist with different TMEM contents across
-    // a frame's load ordering; keying on content prevents a stale cache hit
-    // from bypassing the TMEM decode.
+    // The same source address can hold different TMEM contents across a frame's load ordering,
+    // so an address-only key serves a stale decode.
     uint32_t tmem_content_hash = 0;
 
-    // Content hash of the CI palette (TLUT) currently bound for this draw.
-    // The CI key already carries palette_addrs (the DRAM source ADDRESS), which
-    // distinguishes the same texture drawn with different palettes -- but a menu
-    // fade rewrites the palette CONTENT in place at the SAME address every frame,
-    // so an address-only key returns the stale decode and the fade freezes.
-    // Hashing the bound palette content makes an in-place fade miss the cache and
-    // re-decode. Left 0 (disabled) unless GDX_CI_PALETTE_HASH is set, so the
-    // proven default path is untouched until this is validated.
+    // palette_addrs distinguishes the same texture drawn with different palettes, but a menu
+    // fade rewrites the palette content in place at one address, so an address-only key freezes
+    // the fade. Left 0 unless GDX_CI_PALETTE_HASH is set, pending validation.
     uint32_t palette_content_hash = 0;
 
     bool operator==(const TextureCacheKey&) const noexcept = default;
@@ -232,13 +225,10 @@ struct TextureCacheValue {
     uint64_t rgba16_transparent_pixels = 0;
     uint64_t rgba16_forced_opaque_pixels = 0;
 
-    // Set once UploadTexture has actually run for this entry's texture_id. A
-    // TextureCacheLookup() insert only reserves the slot (NewTexture()/SelectTexture());
-    // the real GPU resource is created by UploadTexture, which some decode paths can
-    // bail out of before reaching (e.g. a transiently-null CI palette slot, or a
-    // zero-sized load). Defense-in-depth: TextureCacheLookup treats a hit on an entry
-    // with uploaded == false as a miss so the decode is retried instead of serving a
-    // texture that was never actually created.
+    // A TextureCacheLookup insert only reserves the slot; UploadTexture creates the GPU
+    // resource, and some decode paths bail out before reaching it (a transiently-null CI palette
+    // slot, a zero-sized load). Lookup treats an unuploaded hit as a miss and retries the decode
+    // rather than serving a texture that was never created.
     bool uploaded = false;
 
     std::list<struct TextureCacheMapIter>::iterator lru_location;
@@ -314,7 +304,6 @@ struct RSP {
 
     uint8_t dmem[4096];
     uint16_t dma_io_dmem;
-    // True once the current RSP task has loaded data into DMEM via G_DMA_IO.
     // DMEM does not persist across tasks, so SpReset() clears this per Run().
     bool dma_io_loaded;
     float f3dflx_alpha_light[3];
@@ -337,14 +326,11 @@ struct RDP {
         uint32_t tex_flags;
         struct RawTexMetadata raw_tex_metadata;
     } texture_to_load;
-    // One entry per 64-bit TMEM word address. Multiple render tiles can point
-    // at independent texture loads within the same 4 KiB TMEM image.
+    // One entry per 64-bit TMEM word address: multiple render tiles can point at independent
+    // loads within the same 4 KiB image.
     LoadedTexture loaded_texture[512];
-    // Emulated 4 KiB TMEM. Load commands copy source bytes here; texture
-    // import decodes from this buffer using only tile-descriptor state
-    // (tmem address, line, fmt/siz, masks), exactly like hardware. This makes
-    // slot-reuse-heavy games (F-Zero X: course pass -> machines -> course
-    // pass per frame) immune to stale per-slot load bookkeeping.
+    // Emulated 4 KiB TMEM. Import decodes from here using only tile-descriptor state, like
+    // hardware, which makes slot-reuse-heavy frames immune to stale per-slot load bookkeeping.
     uint8_t tmem[4096];
     // Bumped on every TMEM write so the texture cache can key on content.
     uint32_t tmem_generation;
@@ -449,15 +435,12 @@ struct GeometryDiagnostics {
     float maxNdcY = 0.0f;
     float minNdcZ = 0.0f;
     float maxNdcZ = 0.0f;
-    // [interp-geo] Content fingerprints for sub-frame replay comparison. Replaying one tick's
-    // display list with the interpolation fraction pinned must be idempotent; measured, it is not
-    // -- pass 0 clip-rejects ~15 fewer triangles than every later pass, and passes 1..M-1 are bit
-    // identical to each other. Triangle counters say geometry is lost but not why, because
-    // clip_rej is derived from the TRANSFORMED position: identical vertex COUNTS say nothing about
-    // vertex CONTENT. These two split the remaining space. vertexHash accumulates every transformed
-    // vertex and its clip flags, so it answers "did the transform change at all"; mpFirstHash
-    // captures MP_matrix at the pass's first vertex, so it answers "was it already different before
-    // the walk started, or did it drift during it".
+    // Content fingerprints for sub-frame replay comparison. Replaying a tick's display list with
+    // the interpolation fraction pinned should be idempotent and is not: pass 0 clip-rejects ~15
+    // fewer triangles than every later pass. Triangle counters cannot say why, since clip_rej
+    // derives from the transformed position. vertexHash covers every transformed vertex and its
+    // clip flags; mpFirstHash captures MP_matrix at the pass's first vertex, separating "already
+    // different before the walk" from "drifted during it".
     uint64_t vertexHash = 0;
     uint64_t mpFirstHash = 0;
     uint64_t trianglesSubmitted = 0;
@@ -465,8 +448,8 @@ struct GeometryDiagnostics {
     uint64_t trianglesCullRejected = 0;
     uint64_t trianglesInvisible = 0;
     uint64_t trianglesEmitted = 0;
-    // Oversized triangles that survived Reject-variant screening (screen extent
-    // beyond ~0.9 NDC). The first one per frame is captured for diagnostics.
+    // Survived Reject-variant screening with a screen extent beyond ~0.9 NDC. The first per
+    // frame is captured below.
     uint64_t bigTriangles = 0;
     float bigTriX[3] = {};
     float bigTriY[3] = {};
@@ -560,8 +543,8 @@ enum class F3dex2Variant : uint8_t {
     FZeroFlxReject,
 };
 
-// Host-side payload used with F3DEX2_G_LOAD_UCODE after the port translates
-// physical N64 microcode addresses into a semantic variant switch.
+// Host-side payload for F3DEX2_G_LOAD_UCODE, after the port translates physical N64 microcode
+// addresses into a semantic variant switch.
 constexpr uintptr_t F3DEX2_VARIANT_SWITCH_MARKER = 0x47445800u;
 
 class Interpreter {
@@ -581,12 +564,9 @@ class Interpreter {
     void Run(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtx_replacements);
     void EndFrame();
 
-    // PORT (G-Diffuser): optional hook invoked inside Run() immediately after the
-    // per-frame framebuffer clear and viewport/scissor reset, BEFORE the task's
-    // commands execute. The port's graphics bridge uses it to seed the boot-logo
-    // CPU framebuffer as a background under the task's content (framebuffer
-    // coherence, campaign-soak-fix-4). Default null => a single branch per frame,
-    // zero cost when unregistered.
+    // Invoked inside Run() after the per-frame clear and viewport/scissor reset, before the
+    // task's commands execute. The port's graphics bridge uses it to seed the boot-logo CPU
+    // framebuffer underneath the task's content.
     static void SetPortAfterClearHook(void (*hook)(Interpreter*));
     static void (*sPortAfterClearHook)(Interpreter*);
     void HandleWindowEvents();
@@ -626,16 +606,13 @@ class Interpreter {
     ColorCombiner* LookupOrCreateColorCombiner(const ColorCombinerKey& key);
     void ShaderCacheClear();
     void TextureCacheClear();
-    // G-Diffuser Workshop W0: dump the just-decoded RGBA32 texture (port/gdx_workshop.cpp). No-op
-    // unless gEnhancements.Workshop.TextureDump is on. Off the hot path (gated inside).
+    // Implemented in port/gdx_workshop.cpp; gated inside on gEnhancements.Workshop.TextureDump.
     void GdxDumpDecodedRgba32(int tile, const uint8_t* rgba32, uint32_t width, uint32_t height);
     bool TextureCacheLookup(int i, const TextureCacheKey& key);
     void TextureCacheDelete(const uint8_t* origAddr);
-    // Palette-keyed companion to TextureCacheDelete. A CI4/CI8 cache entry is keyed on
-    // {index-data address, palette DRAM address}: refreshing the palette CONTENT at an
-    // unchanged address leaves every decode keyed against it stale. Erases the entries
-    // whose key.palette_addrs[] names this address. Cheap no-op unless the address was
-    // actually seen as a TLUT source (see mSeenPaletteAddrs).
+    // Palette-keyed companion to TextureCacheDelete. CI entries are keyed on {index address,
+    // palette address}, so rewriting palette content at an unchanged address leaves every decode
+    // keyed against it stale. No-op unless the address was seen as a TLUT source.
     void TextureCacheDeletePalette(const uint8_t* paletteAddr);
     void ImportTextureRgba16(int textureUnit, int tile, bool importReplacement, bool forceOpaqueAlpha);
     void ImportTextureRgba32(int tile, bool importReplacement);
@@ -720,11 +697,10 @@ class Interpreter {
     RenderingState mRenderingState{};
 
     GfxTextureCache mTextureCache{};
-    // Every DRAM address GfxDpLoadTlut has ever bound as a TLUT source. TextureCacheDeletePalette
-    // has to scan the whole cache (the map is bucketed by texture_addr, not by palette), so this
-    // set is the O(1) gate that keeps the common case -- a plain texture-buffer refresh, which is
-    // never a palette -- from paying for that scan. Bounded in practice: F-Zero X binds a few tens
-    // of distinct TLUT sources per session (asset palettes plus the two per-pool staging slots).
+    // TextureCacheDeletePalette has to scan the whole cache, since the map is bucketed by
+    // texture_addr rather than by palette, so this set gates the common case -- a plain
+    // texture-buffer refresh, never a palette -- out of that scan. A few tens of entries in
+    // practice.
     std::unordered_set<const uint8_t*> mSeenPaletteAddrs;
     std::map<ColorCombinerKey, ColorCombiner> mColorCombinerPool; // color_combiner_pool;
     std::map<ColorCombinerKey, ColorCombiner>::iterator mPrevCombiner = mColorCombinerPool.end();
@@ -753,12 +729,17 @@ class Interpreter {
 
     bool mFbActive{};
     bool mRendersToFb{}; // game_renders_to_framebuffer;
-    // Per-frame caches of the widescreen CVars, latched in StartFrame. AdjXForAspectRatio
-    // runs per vertex and GfxDrawRectangle per rect; a CVarGetInteger string-hash lookup on
-    // those paths cost ~2 lookups/vertex. One-frame toggle latency is imperceptible.
+    // Latched in StartFrame: AdjXForAspectRatio runs per vertex and GfxDrawRectangle per rect,
+    // and a CVarGetInteger string-hash lookup on those paths cost ~2 lookups per vertex.
     bool mWidescreenEnabledCache = true;
     bool mForceFixedAspectCache = false;
     bool mWidescreenUiCache = false;
+    // Gates the game-side cull widening (gdx_get_ultrawide_cull_xscale) so 16:9-and-below output
+    // stays byte-identical with the CVar off. HudMaxAspect optionally confines ANCHOR-scoped HUD
+    // elements to a centred band instead of the true corners; see the StartFrame latch.
+    bool mUltrawideCache = false;
+    bool mRemoveBordersCache = false;
+    float mHudMaxAspectCache = 1000.0f;
     std::map<int, FBInfo>::iterator mActiveFrameBuffer;
     std::map<int, FBInfo> mFrameBuffers;
 

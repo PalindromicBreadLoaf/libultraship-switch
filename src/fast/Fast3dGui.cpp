@@ -37,8 +37,7 @@
 IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
 #endif
 
-// G-Diffuser runtime fixed-aspect flag (defined in interpreter.cpp; published by the game at
-// mode flips). Read live in DrawGame's pillarbox decision.
+// Defined in interpreter.cpp; the game publishes it at mode flips.
 extern "C" int gdx_get_force_fixed_aspect(void);
 
 namespace Fast {
@@ -51,8 +50,8 @@ Fast3dGui::Fast3dGui(std::vector<std::shared_ptr<Ship::GuiWindow>> guiWindows) :
 
 void Fast3dGui::Init(GuiWindowInitData windowImpl) {
     mImpl = windowImpl;
-    // Capture the backend while the Context singleton is alive: the ImGui shutdown
-    // methods run during ~Context and must not re-fetch it (see mCachedBackend).
+    // Capture while the Context singleton is alive; the ImGui shutdown methods run during
+    // ~Context and must not re-fetch it (see mCachedBackend).
     mCachedBackend = Ship::Context::GetInstance()->GetWindow()->GetWindowBackend();
     Gui::Init();
 }
@@ -128,11 +127,10 @@ void Fast3dGui::ImGuiWMInit() {
 }
 
 void Fast3dGui::ImGuiWMShutdown() {
-    // Runs from ~Context (mWindow reset -> ~Fast3dWindow -> ~Window -> ShutDownImGui), when
-    // Context::GetInstance() already returns an empty shared_ptr. Never re-fetch the
-    // singleton here: switch on the backend captured at Init so the platform backend is
-    // ALWAYS shut down (an earlier null-guard skipped it and ImGui::DestroyContext asserted
-    // "Forgot to shutdown Platform backend?").
+    // Reached from ~Context, when Context::GetInstance() is already empty. Switch on the
+    // backend captured at Init instead of re-fetching: an earlier null-guard skipped the
+    // shutdown entirely and ImGui::DestroyContext asserted "Forgot to shutdown Platform
+    // backend?".
     switch (mCachedBackend) {
 #ifdef ENABLE_OPENGL
         case WindowBackend::FAST3D_SDL_OPENGL:
@@ -405,30 +403,20 @@ void Fast3dGui::DrawGame() {
     } else if (Ship::Context::GetInstance()->GetConsoleVariables()->GetInteger("gEnhancements.Graphics.Widescreen",
                                                                                1) == 0 ||
                gdx_get_force_fixed_aspect() != 0) {
-        // 4:3 pillarbox (gEnhancements.Graphics.Widescreen == 0, or the game published the
-        // fixed-aspect runtime flag for a mode that must render stock 4:3 -- the Expansion Kit
-        // editors; see G-Diffuser input_bridge.c gdx_fixed_aspect_publish and the flag's
-        // definition in interpreter.cpp). Read live: the flag can change at the mode-flip
-        // mid-dispatch and this composite decision must track it within the same frame.
+        // 4:3 pillarbox, either from the Widescreen setting or from the runtime flag the game
+        // publishes for modes that must render stock 4:3 (the Expansion Kit editors). The flag
+        // is read live because it can flip mid-dispatch and this decision has to track it within
+        // the same frame.
         //
-        // This branch MUST precede the Advanced Resolution branch below. Advanced Resolution is
-        // how the port renders above native res (e.g. an HD 1920x1080 internal target), and its
-        // non-pixel-perfect fit sizes the composite from mCurDimensions' aspect -- which is
-        // widescreen (16:9+) for a normal HD profile. When it ran first it blitted the game
-        // framebuffer full-window, so the native-proportion content this fixed-aspect frame
-        // produced (Interpreter::AdjXForAspectRatio returns x unchanged, filling the full FB
-        // width) was shown stretched to 16:9 with no pillarbox even though StartFrame had forced
-        // the offscreen render target (renders_fb=1). Checking the fixed-aspect condition first
-        // makes the forced-4:3 and Widescreen==0 frames pillarbox regardless of the Advanced
-        // Resolution aspect, matching the stock Widescreen==0 pillarbox exactly. Normal play
-        // (Widescreen==1 && !forceFixed) fails this condition and falls through to the Advanced
-        // Resolution branch unchanged, so PixelPerfect / IgnoreAspectCorrection are preserved.
+        // This branch must precede the Advanced Resolution branch below. That branch sizes the
+        // composite from mCurDimensions' aspect, which is widescreen for a normal HD profile, so
+        // running it first blitted the framebuffer full-window and stretched native-proportion
+        // content to 16:9 with no pillarbox. Normal play fails this condition and falls through
+        // unchanged, so PixelPerfect / IgnoreAspectCorrection are preserved.
         //
-        // The game framebuffer holds native-proportion content stretched to the FB's (window)
-        // aspect. Drawing that full-width framebuffer into a centred 4:3 rect compresses it back
-        // to native proportions; the cleared window background then forms the side bars. Falls
-        // back to letterbox if the window is narrower than 4:3. Interpreter::StartFrame forces the
-        // offscreen render target this relies on.
+        // The framebuffer holds native-proportion content stretched to the window aspect, so
+        // drawing it into a centred 4:3 rect compresses it back and the cleared background forms
+        // the bars. Interpreter::StartFrame forces the offscreen render target this relies on.
         const float targetAspect = 4.0f / 3.0f;
         float sWdth = size.y * targetAspect;
         float sHght = size.y;

@@ -333,9 +333,7 @@ PSOutput PSMain(PSInput input, float4 screenSpace : SV_Position) {
 
     @if(o_alpha)
         @if(o_alpha_threshold)
-            // Real RDP G_AC_THRESHOLD rejects texels whose alpha is below the
-            // SETBLENDCOLOR alpha register (a fixed magic constant here would
-            // ignore the game's actual threshold, e.g. F-Zero X HUD cutouts).
+            // G_AC_THRESHOLD compares against the SETBLENDCOLOR alpha register, not a constant.
             if (texel.a < alpha_compare_threshold) discard;
         @end
         @if(o_invisible)
