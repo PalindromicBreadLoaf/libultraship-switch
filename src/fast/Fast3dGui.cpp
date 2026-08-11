@@ -98,7 +98,14 @@ void Fast3dGui::ImGuiWMInit() {
 
     switch (window->GetWindowBackend()) {
         case WindowBackend::FAST3D_SDL_OPENGL:
-            SDL_SetHint(SDL_HINT_TOUCH_MOUSE_EVENTS, "1");
+            // Touch reaches ImGui through the SDL_FINGER translation in gfx_sdl2.cpp, so SDL's
+            // own touch-to-mouse synthesis has to stay off: with both, every tap arrives twice.
+            // ImGui de-duplicates the button but not the position, and its trickle queue then
+            // applies the press on a frame carrying the other feed's coordinates -- the widget
+            // highlights and never activates. Only reproducible against real SDL2; sdl2-compat
+            // implements SDL2 on SDL3 and ignores this hint, which is why a dev machine running
+            // it sees working touch while every user on stock SDL2 does not.
+            SDL_SetHint(SDL_HINT_TOUCH_MOUSE_EVENTS, "0");
             if (Ship::Context::GetInstance()->GetConsoleVariables()->GetInteger(CVAR_ALLOW_BACKGROUND_INPUTS, 1)) {
                 SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
             }
@@ -106,7 +113,7 @@ void Fast3dGui::ImGuiWMInit() {
             break;
 #if __APPLE__
         case WindowBackend::FAST3D_SDL_METAL:
-            SDL_SetHint(SDL_HINT_TOUCH_MOUSE_EVENTS, "1");
+            SDL_SetHint(SDL_HINT_TOUCH_MOUSE_EVENTS, "0");
             if (Ship::Context::GetInstance()->GetConsoleVariables()->GetInteger(CVAR_ALLOW_BACKGROUND_INPUTS, 1)) {
                 SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
             }

@@ -649,7 +649,8 @@ void GfxWindowBackendSDL2::HandleSingleEvent(SDL_Event& event) {
             break;
         // ImGui's SDL2 backend does not translate SDL_FINGER events, and SDL's touch->mouse
         // synthesis is unreliable under Wayland, so feed the primary finger in as a left-mouse
-        // pointer. tfinger coordinates are normalized, hence the scale by drawable size.
+        // pointer. This is the only touch feed ImGui gets: the synthesis hint is off in
+        // Fast3dGui::ImGuiWMInit, because running both delivers every tap twice.
         case SDL_FINGERDOWN:
         case SDL_FINGERUP:
         case SDL_FINGERMOTION: {
@@ -659,9 +660,15 @@ void GfxWindowBackendSDL2::HandleSingleEvent(SDL_Event& event) {
             if (event.type != SDL_FINGERDOWN && (!mPrimaryFingerActive || event.tfinger.fingerId != mPrimaryFingerId)) {
                 break; // not the pointer finger
             }
+            // tfinger coordinates are normalized. Scale them by the window rather than by
+            // mWindowWidth/mWindowHeight, which hold the drawable size: ImGui's SDL2 backend
+            // takes DisplaySize from SDL_GetWindowSize and carries the drawable ratio separately
+            // in DisplayFramebufferScale, so the two only agree where nothing is scaled.
+            int windowW = 0, windowH = 0;
+            SDL_GetWindowSize(mWnd, &windowW, &windowH);
             ImGuiIO& io = ImGui::GetIO();
-            io.AddMousePosEvent(event.tfinger.x * static_cast<float>(mWindowWidth),
-                                event.tfinger.y * static_cast<float>(mWindowHeight));
+            io.AddMousePosEvent(event.tfinger.x * static_cast<float>(windowW),
+                                event.tfinger.y * static_cast<float>(windowH));
             if (event.type == SDL_FINGERDOWN) {
                 mPrimaryFingerActive = true;
                 mPrimaryFingerId = event.tfinger.fingerId;
