@@ -66,8 +66,16 @@ class GfxWindowBackendSDL2 final : public GfxWindowBackend {
     int mWindowWidth = 640;
     int mWindowHeight = 480;
     // Touchscreen -> ImGui pointer. Menus are single-touch, so only one finger acts as the mouse.
-    bool mPrimaryFingerActive = false;
+    //
+    // Who owns the gesture in progress. Some platforms emulate a pointer from the same touch and
+    // deliver a complete click of their own; pressing on FINGERDOWN there lands the press at the
+    // raw finger position and their release lands somewhere else, so the widget never activates.
+    // Holding the press for one event separates the two cases without giving up finger drags.
+    enum class TouchGesture { None, Pending, OwnedByFinger, OwnedByPlatform };
+    TouchGesture mTouchGesture = TouchGesture::None;
     int64_t mPrimaryFingerId = 0; // SDL_FingerID
+    float mPendingFingerX = 0.0f; // where the finger landed, so a drag presses from there
+    float mPendingFingerY = 0.0f;
     void (*mOnAllKeysUp)();
 };
 } // namespace Fast

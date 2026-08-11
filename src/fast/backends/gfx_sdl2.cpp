@@ -50,6 +50,34 @@
 #define GFX_BACKEND_NAME "SDL"
 #define _100NANOSECONDS_IN_SECOND 10000000
 
+// Temporary instrumentation for the touchscreen bug in the enhancement menu: taps highlight a
+// widget but never activate it on real SDL2 under Wayland, while the same code works against
+// sdl2-compat. Two guesses at the cause were wrong, so this traces what actually arrives instead.
+// Set GDX_DIAG_TOUCH=1 to enable; the check is one cached read, and nothing prints otherwise.
+//
+//   GDX_DIAG_TOUCH=1 ./G-Diffuser baserom.us.rev0.z64 > touch.log 2>&1
+//
+// Logging the ImGui state alongside each event is the point: it shows whether a press ever
+// reaches a widget (active=1) or is discarded because the pointer sat somewhere else.
+static bool GdxTouchDiagEnabled() {
+    static const bool enabled = []() {
+        const char* value = SDL_getenv("GDX_DIAG_TOUCH");
+        return value != nullptr && value[0] != '\0' && value[0] != '0';
+    }();
+    return enabled;
+}
+
+static void GdxTracePointer(const char* what, float x, float y, int which, const char* note = "") {
+    // The context check matters: input events can arrive before Gui::Init has created one.
+    if (!GdxTouchDiagEnabled() || ImGui::GetCurrentContext() == nullptr) {
+        return;
+    }
+    const ImGuiIO& io = ImGui::GetIO();
+    SDL_Log("[touch] %-16s (%7.1f,%7.1f) which=%-6d | io.pos=(%7.1f,%7.1f) down=%d hovered=%d active=%d %s",
+            what, x, y, which, io.MousePos.x, io.MousePos.y, io.MouseDown[0] ? 1 : 0,
+            ImGui::IsAnyItemHovered() ? 1 : 0, ImGui::IsAnyItemActive() ? 1 : 0, note);
+}
+
 #ifdef _WIN32
 LONG_PTR SDL_WndProc;
 #endif
@@ -637,45 +665,112 @@ void GfxWindowBackendSDL2::HandleSingleEvent(SDL_Event& event) {
         case SDL_KEYUP:
             OnKeyup(event.key.keysym.scancode);
             break;
+        case SDL_MOUSEMOTION:
+            // Nothing to do here, but tracing it answers whether SDL is still synthesising
+            // pointer motion from touch behind the finger feed: which == SDL_TOUCH_MOUSEID.
+            GdxTracePointer("MOUSEMOTION", static_cast<float>(event.motion.x),
+                            static_cast<float>(event.motion.y), static_cast<int>(event.motion.which));
+            break;
         case SDL_MOUSEBUTTONDOWN:
+            GdxTracePointer("MOUSEBUTTONDOWN", static_cast<float>(event.button.x),
+                            static_cast<float>(event.button.y), static_cast<int>(event.button.which));
+            if (event.button.which != SDL_TOUCH_MOUSEID && mTouchGesture == TouchGesture::Pending) {
+                // The platform is emulating a pointer from the touch we were still holding a press
+                // for. It owns this gesture: it will click and release coherently on its own, and
+                // anything from us would only land the press somewhere its release is not.
+                mTouchGesture = TouchGesture::OwnedByPlatform;
+            }
             OnMouseButtonDown(event.button.button - 1);
             break;
         case SDL_MOUSEBUTTONUP:
+            GdxTracePointer("MOUSEBUTTONUP", static_cast<float>(event.button.x),
+                            static_cast<float>(event.button.y), static_cast<int>(event.button.which));
+            if (event.button.which != SDL_TOUCH_MOUSEID && mTouchGesture != TouchGesture::None) {
+                if (mTouchGesture == TouchGesture::OwnedByFinger && ImGui::GetCurrentContext() != nullptr) {
+                    // Both channels reported one tap. Lift our press, or it stays held and swallows
+                    // every later click, since ImGui already sees the button down.
+                    ImGui::GetIO().AddMouseButtonEvent(0, false);
+                }
+                // Ends the gesture whoever owned it: platforms that emulate a pointer often stop
+                // sending FINGERUP, and without this the next touch is discarded as a second finger.
+                mTouchGesture = TouchGesture::None;
+            }
             OnMouseButtonUp(event.button.button - 1);
             break;
         case SDL_MOUSEWHEEL:
             mMouseWheelX = event.wheel.x;
             mMouseWheelY = event.wheel.y;
             break;
-        // ImGui's SDL2 backend does not translate SDL_FINGER events, and SDL's touch->mouse
-        // synthesis is unreliable under Wayland, so feed the primary finger in as a left-mouse
-        // pointer. This is the only touch feed ImGui gets: the synthesis hint is off in
-        // Fast3dGui::ImGuiWMInit, because running both delivers every tap twice.
+        // ImGui's SDL2 backend does not translate SDL_FINGER events, so the primary finger is fed
+        // in as a left-mouse pointer -- but the press is held back one event first.
+        //
+        // Some platforms emulate a pointer from the same touch. There the sequence is FINGERDOWN,
+        // then pointer motion to a slightly different place, then a full click there, and pressing
+        // on FINGERDOWN puts our press at the raw finger position while their release arrives tens
+        // of pixels away, so the widget never activates and taps appear to need several tries.
+        // Which behaviour a machine shows is not fixed: the same binary on the same device has
+        // produced 58 FINGERUPs and 2 pointer clicks in one session, and 1 and 42 in the next.
+        // So the decision is per gesture rather than per run, and one event of delay is enough to
+        // make it: a pointer click means the platform owns this touch, anything else means we do.
+        // Holding the press rather than suppressing it keeps finger drags working, since the press
+        // is replayed at the point the finger landed. GDX_DIAG_TOUCH=1 traces the whole sequence.
         case SDL_FINGERDOWN:
         case SDL_FINGERUP:
         case SDL_FINGERMOTION: {
-            if (event.type == SDL_FINGERDOWN && mPrimaryFingerActive) {
-                break; // a finger is already acting as the pointer
-            }
-            if (event.type != SDL_FINGERDOWN && (!mPrimaryFingerActive || event.tfinger.fingerId != mPrimaryFingerId)) {
-                break; // not the pointer finger
-            }
             // tfinger coordinates are normalized. Scale them by the window rather than by
             // mWindowWidth/mWindowHeight, which hold the drawable size: ImGui's SDL2 backend
             // takes DisplaySize from SDL_GetWindowSize and carries the drawable ratio separately
             // in DisplayFramebufferScale, so the two only agree where nothing is scaled.
             int windowW = 0, windowH = 0;
             SDL_GetWindowSize(mWnd, &windowW, &windowH);
-            ImGuiIO& io = ImGui::GetIO();
-            io.AddMousePosEvent(event.tfinger.x * static_cast<float>(windowW),
-                                event.tfinger.y * static_cast<float>(windowH));
+            const float fingerX = event.tfinger.x * static_cast<float>(windowW);
+            const float fingerY = event.tfinger.y * static_cast<float>(windowH);
+            const char* traced = (event.type == SDL_FINGERDOWN)   ? "FINGERDOWN"
+                                 : (event.type == SDL_FINGERUP)   ? "FINGERUP"
+                                                                  : "FINGERMOTION";
+            const char* skipped = "";
             if (event.type == SDL_FINGERDOWN) {
-                mPrimaryFingerActive = true;
+                if (mTouchGesture != TouchGesture::None) {
+                    skipped = "| dropped: a gesture is already in progress";
+                }
+            } else if (mTouchGesture == TouchGesture::None ||
+                       event.tfinger.fingerId != mPrimaryFingerId) {
+                skipped = "| dropped: not the pointer finger";
+            } else if (mTouchGesture == TouchGesture::OwnedByPlatform) {
+                skipped = "| not fed: the platform is driving this gesture";
+            }
+            // Traced before it is acted on, so a dropped event still appears: silently discarding
+            // them is what left the first reading of this trace ambiguous.
+            GdxTracePointer(traced, fingerX, fingerY, static_cast<int>(event.tfinger.fingerId), skipped);
+            if (skipped[0] != '\0') {
+                if (event.type == SDL_FINGERUP && event.tfinger.fingerId == mPrimaryFingerId) {
+                    mTouchGesture = TouchGesture::None; // a platform-driven gesture ends here too
+                }
+                break;
+            }
+
+            ImGuiIO& io = ImGui::GetIO();
+            if (event.type == SDL_FINGERDOWN) {
                 mPrimaryFingerId = event.tfinger.fingerId;
+                mPendingFingerX = fingerX;
+                mPendingFingerY = fingerY;
+                mTouchGesture = TouchGesture::Pending;
+                // Position only. The press waits for the next event, which is what says whether
+                // the platform is going to deliver its own click for this same touch.
+                io.AddMousePosEvent(fingerX, fingerY);
+                break;
+            }
+            if (mTouchGesture == TouchGesture::Pending) {
+                // Nothing claimed the gesture, so it is ours. Press where the finger landed rather
+                // than where it is now, so a drag starts from the point that was touched.
+                io.AddMousePosEvent(mPendingFingerX, mPendingFingerY);
                 io.AddMouseButtonEvent(0, true);
-            } else if (event.type == SDL_FINGERUP) {
+                mTouchGesture = TouchGesture::OwnedByFinger;
+            }
+            io.AddMousePosEvent(fingerX, fingerY);
+            if (event.type == SDL_FINGERUP) {
                 io.AddMouseButtonEvent(0, false);
-                mPrimaryFingerActive = false;
+                mTouchGesture = TouchGesture::None;
             }
             break;
         }
